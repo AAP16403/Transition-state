@@ -1,130 +1,114 @@
 [
   {
-    "rxn_id": "rxn014286",
-    "n_atoms": 15,
-    "Ea_true_kcal": 64.8091,
-    "Ea_pred_kcal": 66.6715,
-    "Ea_error_kcal": 1.8624,
-    "dist_MAE_angstrom": 0.2805
-  },
-  {
-    "rxn_id": "rxn011863",
-    "n_atoms": 15,
-    "Ea_true_kcal": 42.1162,
-    "Ea_pred_kcal": 44.3589,
-    "Ea_error_kcal": 2.2427,
-    "dist_MAE_angstrom": 0.143
-  },
-  {
-    "rxn_id": "rxn016312",
-    "n_atoms": 17,
-    "Ea_true_kcal": 14.1991,
-    "Ea_pred_kcal": 14.5105,
-    "Ea_error_kcal": 0.3115,
-    "dist_MAE_angstrom": 0.1231
-  },
-  {
-    "rxn_id": "rxn001671",
-    "n_atoms": 11,
-    "Ea_true_kcal": 29.8837,
-    "Ea_pred_kcal": 30.9617,
-    "Ea_error_kcal": 1.078,
-    "dist_MAE_angstrom": 0.4096
-  },
-  {
-    "rxn_id": "rxn003264",
-    "n_atoms": 17,
-    "Ea_true_kcal": 23.8238,
-    "Ea_pred_kcal": 24.8768,
-    "Ea_error_kcal": 1.053,
-    "dist_MAE_angstrom": 0.2627
-  },
-  {
-    "rxn_id": "rxn015345",
-    "n_atoms": 16,
-    "Ea_true_kcal": 17.7632,
-    "Ea_pred_kcal": 18.3991,
-    "Ea_error_kcal": 0.6358,
-    "dist_MAE_angstrom": 0.1701
-  },
-  {
-    "rxn_id": "rxn009959",
-    "n_atoms": 13,
-    "Ea_true_kcal": 53.3615,
-    "Ea_pred_kcal": 56.1424,
-    "Ea_error_kcal": 2.781,
-    "dist_MAE_angstrom": 0.493
+    "rxn_id": "rxn000389",
+    "Ea_true": 67.03453826904297,
+    "Ea_pred": 68.06066131591797,
+    "Ea_error": 1.026123046875,
+    "dist_MAE": 0.4717910587787628
   },
   {
     "rxn_id": "rxn000920",
-    "n_atoms": 13,
-    "Ea_true_kcal": 70.1172,
-    "Ea_pred_kcal": 71.5206,
-    "Ea_error_kcal": 1.4034,
-    "dist_MAE_angstrom": 0.3548
+    "Ea_true": 70.11714935302734,
+    "Ea_pred": 71.09178161621094,
+    "Ea_error": 0.9746322631835938,
+    "dist_MAE": 0.3455421030521393
   },
   {
-    "rxn_id": "rxn000389",
-    "n_atoms": 11,
-    "Ea_true_kcal": 67.0346,
-    "Ea_pred_kcal": 68.6567,
-    "Ea_error_kcal": 1.6221,
-    "dist_MAE_angstrom": 0.4799
-  },
-  {
-    "rxn_id": "rxn009742",
-    "n_atoms": 11,
-    "Ea_true_kcal": 53.5603,
-    "Ea_pred_kcal": 56.1196,
-    "Ea_error_kcal": 2.5593,
-    "dist_MAE_angstrom": 0.124
-  },
-  {
-    "rxn_id": "rxn008195",
-    "n_atoms": 13,
-    "Ea_true_kcal": 7.7226,
-    "Ea_pred_kcal": 8.0267,
-    "Ea_error_kcal": 0.3041,
-    "dist_MAE_angstrom": 0.1364
-  },
-  {
-    "rxn_id": "rxn011123",
-    "n_atoms": 14,
-    "Ea_true_kcal": 63.0202,
-    "Ea_pred_kcal": 65.3686,
-    "Ea_error_kcal": 2.3484,
-    "dist_MAE_angstrom": 0.2744
-  },
-  {
-    "rxn_id": "rxn008404",
-    "n_atoms": 13,
-    "Ea_true_kcal": 15.448,
-    "Ea_pred_kcal": 15.9541,
-    "Ea_error_kcal": 0.5061,
-    "dist_MAE_angstrom": 0.1148
+    "rxn_id": "rxn001671",
+    "Ea_true": 29.883642196655273,
+    "Ea_pred": 29.499683380126953,
+    "Ea_error": 0.3839588165283203,
+    "dist_MAE": 0.41091275215148926
   },
   {
     "rxn_id": "rxn001727",
-    "n_atoms": 15,
-    "Ea_true_kcal": 31.9702,
-    "Ea_pred_kcal": 33.5133,
-    "Ea_error_kcal": 1.5431,
-    "dist_MAE_angstrom": 0.0937
+    "Ea_true": 31.970165252685547,
+    "Ea_pred": 31.689098358154297,
+    "Ea_error": 0.28106689453125,
+    "dist_MAE": 0.10054561495780945
   },
   {
-    "rxn_id": "rxn013079",
-    "n_atoms": 17,
-    "Ea_true_kcal": 20.0961,
-    "Ea_pred_kcal": 20.8772,
-    "Ea_error_kcal": 0.7811,
-    "dist_MAE_angstrom": 0.0663
+    "rxn_id": "rxn003264",
+    "Ea_true": 23.82381248474121,
+    "Ea_pred": 22.95917320251465,
+    "Ea_error": 0.8646392822265625,
+    "dist_MAE": 0.2591015100479126
   },
   {
     "rxn_id": "rxn007149",
-    "n_atoms": 11,
-    "Ea_true_kcal": 54.892,
-    "Ea_pred_kcal": 56.6208,
-    "Ea_error_kcal": 1.7288,
-    "dist_MAE_angstrom": 0.1024
+    "Ea_true": 54.89196014404297,
+    "Ea_pred": 55.672950744628906,
+    "Ea_error": 0.7809906005859375,
+    "dist_MAE": 0.11198636889457703
+  },
+  {
+    "rxn_id": "rxn008195",
+    "Ea_true": 7.722625255584717,
+    "Ea_pred": 6.252593994140625,
+    "Ea_error": 1.4700312614440918,
+    "dist_MAE": 0.1318630576133728
+  },
+  {
+    "rxn_id": "rxn008404",
+    "Ea_true": 15.448026657104492,
+    "Ea_pred": 14.340816497802734,
+    "Ea_error": 1.1072101593017578,
+    "dist_MAE": 0.1155354455113411
+  },
+  {
+    "rxn_id": "rxn009742",
+    "Ea_true": 53.56023025512695,
+    "Ea_pred": 54.23918914794922,
+    "Ea_error": 0.6789588928222656,
+    "dist_MAE": 0.13077817857265472
+  },
+  {
+    "rxn_id": "rxn009959",
+    "Ea_true": 53.361412048339844,
+    "Ea_pred": 53.878440856933594,
+    "Ea_error": 0.51702880859375,
+    "dist_MAE": 0.48889434337615967
+  },
+  {
+    "rxn_id": "rxn011123",
+    "Ea_true": 63.020164489746094,
+    "Ea_pred": 63.914817810058594,
+    "Ea_error": 0.8946533203125,
+    "dist_MAE": 0.2784852683544159
+  },
+  {
+    "rxn_id": "rxn011863",
+    "Ea_true": 42.11616516113281,
+    "Ea_pred": 42.390926361083984,
+    "Ea_error": 0.2747611999511719,
+    "dist_MAE": 0.15110865235328674
+  },
+  {
+    "rxn_id": "rxn013079",
+    "Ea_true": 20.096084594726562,
+    "Ea_pred": 19.12639617919922,
+    "Ea_error": 0.9696884155273438,
+    "dist_MAE": 0.06547468155622482
+  },
+  {
+    "rxn_id": "rxn014286",
+    "Ea_true": 64.80899810791016,
+    "Ea_pred": 65.75312805175781,
+    "Ea_error": 0.9441299438476562,
+    "dist_MAE": 0.2799352705478668
+  },
+  {
+    "rxn_id": "rxn015345",
+    "Ea_true": 17.76322364807129,
+    "Ea_pred": 16.6315975189209,
+    "Ea_error": 1.1316261291503906,
+    "dist_MAE": 0.17089855670928955
+  },
+  {
+    "rxn_id": "rxn016312",
+    "Ea_true": 14.199043273925781,
+    "Ea_pred": 12.911006927490234,
+    "Ea_error": 1.2880363464355469,
+    "dist_MAE": 0.12306531518697739
   }
 ]
