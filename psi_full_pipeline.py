@@ -138,6 +138,7 @@ class ReactionDataset(Dataset):
             reactions[rxn_id][role] = entry
 
         self.samples = []
+        self.atom_types_map = {} # New lookup map
         for rxn_id, roles in sorted(reactions.items()):
             if "r" in roles and "p" in roles and "ts" in roles:
                 # Basic info
@@ -168,6 +169,7 @@ class ReactionDataset(Dataset):
                 # Energy: Ea = E_TS - max(E_R, E_P)
                 ea = (ts_e["energy"] - max(r_e["energy"], p_e["energy"])) * config["hartree_to_kcal"]
 
+                self.atom_types_map[rxn_id] = [a["atom"] for a in ts_e["atoms"]]
                 self.samples.append({
                     "rxn_id": rxn_id, "n_atoms": n,
                     "D_R": torch.from_numpy(D_R), "D_I": torch.from_numpy(D_I), "D_P": torch.from_numpy(D_P),
@@ -370,12 +372,25 @@ def train_pipeline(config):
             p_DTS, p_ea = model(DR, DI, DP, mask)
             
             for i in range(len(batch["rxn_id"])):
+                rxn_id = batch["rxn_id"][i]
                 n = int(mask[i].sum().item())
-                d_mae = torch.abs(p_DTS[i, :n, :n] - DTS[i, :n, :n]).mean().item()
+                di = DI[i, :n, :n].cpu().numpy()
+                dp = p_DTS[i, :n, :n].cpu().numpy()
+                dt = DTS[i, :n, :n].cpu().numpy()
+                
+                d_mae = np.abs(dp - dt).mean().item()
                 e_err = abs(p_ea[i].item() - true_ea[i].item())
+                
+                # Fetch atom types from dataset map
+                atom_types = loader.dataset.atom_types_map.get(rxn_id, [])
+                
                 results.append({
-                    "rxn_id": batch["rxn_id"][i], "Ea_true": true_ea[i].item(), "Ea_pred": p_ea[i].item(),
-                    "Ea_error": e_err, "dist_MAE": d_mae
+                    "rxn_id": rxn_id, 
+                    "Ea_true": true_ea[i].item(), "Ea_pred": p_ea[i].item(),
+                    "Ea_error": e_err, "dist_MAE": d_mae,
+                    "n_atoms": n,
+                    "atom_types": atom_types, 
+                    "D_I": di.tolist(), "D_pred": dp.tolist(), "D_true": dt.tolist()
                 })
 
     print(f"{'Reaction':<15} {'Ea True':>10} {'Ea Pred':>10} {'Ea Err':>10} {'Dist MAE':>10}")
@@ -383,7 +398,7 @@ def train_pipeline(config):
         print(f"{r['rxn_id']:<15} {r['Ea_true']:10.2f} {r['Ea_pred']:10.2f} {r['Ea_error']:10.2f} {r['dist_MAE']:10.4f}")
     
     # Save predictions
-    output_path = os.path.join(config["save_dir"], "predictions_basic-1.json")
+    output_path = os.path.join(config["save_dir"], "detailed_analysis.json")
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2)
     torch.save(model.state_dict(), os.path.join(config["save_dir"], "psi_final.pt"))
