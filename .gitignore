@@ -1,0 +1,24 @@
+# Large dataset archives
+*.tar.gz
+
+# Model checkpoints
+*.pt
+
+# Temp extraction folders
+temp_extract/
+
+# Full predictions (large distance matrices)
+predictions_basic-1_full.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,130 @@
+[
+  {
+    "rxn_id": "rxn014286",
+    "n_atoms": 15,
+    "Ea_true_kcal": 64.8091,
+    "Ea_pred_kcal": 66.6715,
+    "Ea_error_kcal": 1.8624,
+    "dist_MAE_angstrom": 0.2805
+  },
+  {
+    "rxn_id": "rxn011863",
+    "n_atoms": 15,
+    "Ea_true_kcal": 42.1162,
+    "Ea_pred_kcal": 44.3589,
+    "Ea_error_kcal": 2.2427,
+    "dist_MAE_angstrom": 0.143
+  },
+  {
+    "rxn_id": "rxn016312",
+    "n_atoms": 17,
+    "Ea_true_kcal": 14.1991,
+    "Ea_pred_kcal": 14.5105,
+    "Ea_error_kcal": 0.3115,
+    "dist_MAE_angstrom": 0.1231
+  },
+  {
+    "rxn_id": "rxn001671",
+    "n_atoms": 11,
+    "Ea_true_kcal": 29.8837,
+    "Ea_pred_kcal": 30.9617,
+    "Ea_error_kcal": 1.078,
+    "dist_MAE_angstrom": 0.4096
+  },
+  {
+    "rxn_id": "rxn003264",
+    "n_atoms": 17,
+    "Ea_true_kcal": 23.8238,
+    "Ea_pred_kcal": 24.8768,
+    "Ea_error_kcal": 1.053,
+    "dist_MAE_angstrom": 0.2627
+  },
+  {
+    "rxn_id": "rxn015345",
+    "n_atoms": 16,
+    "Ea_true_kcal": 17.7632,
+    "Ea_pred_kcal": 18.3991,
+    "Ea_error_kcal": 0.6358,
+    "dist_MAE_angstrom": 0.1701
+  },
+  {
+    "rxn_id": "rxn009959",
+    "n_atoms": 13,
+    "Ea_true_kcal": 53.3615,
+    "Ea_pred_kcal": 56.1424,
+    "Ea_error_kcal": 2.781,
+    "dist_MAE_angstrom": 0.493
+  },
+  {
+    "rxn_id": "rxn000920",
+    "n_atoms": 13,
+    "Ea_true_kcal": 70.1172,
+    "Ea_pred_kcal": 71.5206,
+    "Ea_error_kcal": 1.4034,
+    "dist_MAE_angstrom": 0.3548
+  },
+  {
+    "rxn_id": "rxn000389",
+    "n_atoms": 11,
+    "Ea_true_kcal": 67.0346,
+    "Ea_pred_kcal": 68.6567,
+    "Ea_error_kcal": 1.6221,
+    "dist_MAE_angstrom": 0.4799
+  },
+  {
+    "rxn_id": "rxn009742",
+    "n_atoms": 11,
+    "Ea_true_kcal": 53.5603,
+    "Ea_pred_kcal": 56.1196,
+    "Ea_error_kcal": 2.5593,
+    "dist_MAE_angstrom": 0.124
+  },
+  {
+    "rxn_id": "rxn008195",
+    "n_atoms": 13,
+    "Ea_true_kcal": 7.7226,
+    "Ea_pred_kcal": 8.0267,
+    "Ea_error_kcal": 0.3041,
+    "dist_MAE_angstrom": 0.1364
+  },
+  {
+    "rxn_id": "rxn011123",
+    "n_atoms": 14,
+    "Ea_true_kcal": 63.0202,
+    "Ea_pred_kcal": 65.3686,
+    "Ea_error_kcal": 2.3484,
+    "dist_MAE_angstrom": 0.2744
+  },
+  {
+    "rxn_id": "rxn008404",
+    "n_atoms": 13,
+    "Ea_true_kcal": 15.448,
+    "Ea_pred_kcal": 15.9541,
+    "Ea_error_kcal": 0.5061,
+    "dist_MAE_angstrom": 0.1148
+  },
+  {
+    "rxn_id": "rxn001727",
+    "n_atoms": 15,
+    "Ea_true_kcal": 31.9702,
+    "Ea_pred_kcal": 33.5133,
+    "Ea_error_kcal": 1.5431,
+    "dist_MAE_angstrom": 0.0937
+  },
+  {
+    "rxn_id": "rxn013079",
+    "n_atoms": 17,
+    "Ea_true_kcal": 20.0961,
+    "Ea_pred_kcal": 20.8772,
+    "Ea_error_kcal": 0.7811,
+    "dist_MAE_angstrom": 0.0663
+  },
+  {
+    "rxn_id": "rxn007149",
+    "n_atoms": 11,
+    "Ea_true_kcal": 54.892,
+    "Ea_pred_kcal": 56.6208,
+    "Ea_error_kcal": 1.7288,
+    "dist_MAE_angstrom": 0.1024
+  }
+]
