@@ -1,15 +1,14 @@
 """
 PSI Full Pipeline: From Tarball to Transition State Prediction
 ==============================================================
-Self-contained script implementing the 5-step PSI architecture with 
-Data-Driven Smart Initialization.
+Self-contained script implementing the 5-step PSI architecture.
 """
 
 import os
 import sys
 import json
 import tarfile
-import math
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -29,8 +28,9 @@ CONFIG = {
     "tar_path": r"d:\Transition state\b97d3.tar.gz",
     "dataset_json": r"d:\Transition state\extracted_dataset.json",
     "save_dir": r"d:\Transition state",
-    "extraction_limit": 50,    # Number of log files to extract
-    "max_atoms": 17,           # Standard molecule size padding
+    "extraction_limit": 1500,  # Number of log files to extract
+    "force_extract": False,    # Rebuild dataset_json instead of reusing stale data
+    "max_atoms": 30,           # Standard molecule size padding
     "n_gaussians": 32,         # K basis functions
     "gauss_start": 0.5,
     "gauss_stop": 5.0,
@@ -42,6 +42,7 @@ CONFIG = {
     "energy_weight": 10.0,     # λ loss scale
     "lr": 1e-3,
     "weight_decay": 1e-4,      # Regularization
+    "batch_size": 16,
     "epochs": 500,
     "print_every": 50,
     "hartree_to_kcal": 627.509,
@@ -82,7 +83,7 @@ def parse_log_content(file_content):
 
 def extract_raw_data(config):
     """Parses tarball and saves results to a JSON file."""
-    if os.path.exists(config["dataset_json"]):
+    if os.path.exists(config["dataset_json"]) and not config.get("force_extract", False):
         print(f"Dataset found at {config['dataset_json']}, skipping extraction.")
         return
     
@@ -118,6 +119,50 @@ def compute_distance_matrix(coords):
     diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
     dist = np.sqrt(np.sum(diff ** 2, axis=-1) + 1e-8)
     return dist.astype(np.float32)
+
+def mds(D, dim=3):
+    """Reconstruct approximate coordinates from a distance matrix."""
+    n = D.shape[0]
+    H = np.eye(n) - np.ones((n, n)) / n
+    B = -0.5 * H @ (D ** 2) @ H
+    evals, evecs = np.linalg.eigh(B)
+    idx = np.argsort(evals)[::-1]
+    evals = evals[idx]
+    evecs = evecs[:, idx]
+    return evecs[:, :dim] @ np.diag(np.sqrt(np.maximum(evals[:dim], 0)))
+
+def kabsch(P, Q):
+    """Align coordinates P onto Q."""
+    P_centered = P - P.mean(axis=0)
+    Q_centered = Q - Q.mean(axis=0)
+    C = P_centered.T @ Q_centered
+    V, _, W = np.linalg.svd(C)
+    d = np.linalg.det(V @ W)
+    E = np.eye(3)
+    if d < 0:
+        E[2, 2] = -1
+    R = V @ E @ W
+    return P_centered @ R + Q.mean(axis=0)
+
+def padded_coords(atoms, max_atoms):
+    coords = np.zeros((max_atoms, 3), dtype=np.float32)
+    for i, atom in enumerate(atoms):
+        coords[i] = [atom["x"], atom["y"], atom["z"]]
+    return coords
+
+def load_log_file(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        parsed = parse_log_content(f.read())
+    if not parsed["atoms"]:
+        raise ValueError(f"No atoms found in {path}")
+    return parsed
+
+def write_xyz(path, atom_types, coords, comment):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{len(atom_types)}\n")
+        f.write(f"{comment}\n")
+        for atom, (x, y, z) in zip(atom_types, coords):
+            f.write(f"{atom:<2} {x: .8f} {y: .8f} {z: .8f}\n")
 
 class ReactionDataset(Dataset):
     def __init__(self, config):
@@ -181,25 +226,6 @@ class ReactionDataset(Dataset):
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx): return self.samples[idx]
 
-def calculate_dataset_stats(samples):
-    """Compute mean Ea and average geometry scaling factor (alpha)."""
-    eas = [s["Ea"].item() for s in samples]
-    mean_ea = sum(eas) / len(eas)
-    
-    alphas = []
-    for s in samples:
-        n = s["n_atoms"]
-        di = s["D_I"][:n, :n].numpy()
-        dts = s["D_TS"][:n, :n].numpy()
-        mask = di > 0.1 # Ignore diagonal
-        alphas.extend((dts[mask] / di[mask]).flatten())
-    mean_alpha = sum(alphas) / len(alphas)
-    
-    print(f"Dataset Statistics:")
-    print(f"  Mean Activation Energy: {mean_ea:.4f} kcal/mol")
-    print(f"  Mean Geometry Scaling:  {mean_alpha:.4f}")
-    return {"mean_ea": mean_ea, "mean_alpha": mean_alpha}
-
 # ============================================================================
 # 3. Gaussian Embedding (Step 2)
 # ============================================================================
@@ -261,42 +287,41 @@ class PSICore(nn.Module):
 # ============================================================================
 
 class GeometryHead(nn.Module):
-    def __init__(self, d_model, mean_alpha):
+    def __init__(self, d_model):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(d_model*2, 256), nn.GELU(), nn.Linear(256, 1))
-        
-        # Smart Init: set bias so softplus(bias) = mean_alpha
-        target_b = math.log(math.exp(mean_alpha) - 1.0)
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.constant_(self.net[-1].bias, target_b)
+        self.net = nn.Sequential(
+            nn.Linear(d_model * 2 + 3, 256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 1),
+        )
 
-    def forward(self, features, D_I):
+    def forward(self, features, D_R, D_I, D_P, mask):
         B, N, D = features.shape
         fi = features.unsqueeze(2).expand(B, N, N, D)
         fj = features.unsqueeze(1).expand(B, N, N, D)
-        pair = torch.cat([fi, fj], dim=-1)
-        # Use softplus(x) to ensure alpha > 0
-        alpha = F.softplus(self.net(pair).squeeze(-1))
-        D_TS_pred = (alpha * D_I)
-        return (D_TS_pred + D_TS_pred.transpose(1, 2)) / 2.0
+        pair_dist = torch.stack([D_R, D_I, D_P], dim=-1)
+        pair = torch.cat([fi, fj, pair_dist], dim=-1)
+        delta = self.net(pair).squeeze(-1)
+        D_TS_pred = torch.clamp(D_I + delta, min=0.0)
+        D_TS_pred = (D_TS_pred + D_TS_pred.transpose(1, 2)) / 2.0
+        eye = torch.eye(N, device=D_TS_pred.device, dtype=D_TS_pred.dtype).unsqueeze(0)
+        valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+        return D_TS_pred * (1.0 - eye) * valid
 
 class EnergyHead(nn.Module):
-    def __init__(self, d_model, mean_ea):
+    def __init__(self, d_model):
         super().__init__()
-        # Stability: Added LayerNorm at the interface
         self.ln = nn.LayerNorm(d_model)
         self.net = nn.Sequential(
             nn.Linear(d_model, 128), nn.GELU(), 
             nn.Linear(128, 64), nn.GELU(), 
             nn.Linear(64, 1)
         )
-        
-        # Smart Init: set final bias to the global Ea average structure
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.constant_(self.net[-1].bias, mean_ea)
 
     def forward(self, features, mask):
-        # Stability: Prep features
         features = self.ln(features)
         
         # Masked mean pool
@@ -309,19 +334,97 @@ class EnergyHead(nn.Module):
 # ============================================================================
 
 class PSI(nn.Module):
-    def __init__(self, config, stats):
+    def __init__(self, config):
         super().__init__()
         d_model = config["gru_hidden"] * 2
         self.core = PSICore(config)
-        self.geom_head = GeometryHead(d_model, stats["mean_alpha"])
-        self.ener_head = EnergyHead(d_model, stats["mean_ea"])
+        self.geom_head = GeometryHead(d_model)
+        self.ener_head = EnergyHead(d_model)
 
     def forward(self, D_R, D_I, D_P, mask):
         f = self.core(D_R, D_I, D_P, mask)
-        return self.geom_head(f, D_I), self.ener_head(f, mask)
+        return self.geom_head(f, D_R, D_I, D_P, mask), self.ener_head(f, mask)
+
+def predict_transition_state(config, reactant_path, product_path, model_path, output_path, xyz_path=None):
+    """Predict a transition-state distance matrix and approximate coordinates."""
+    reactant = load_log_file(reactant_path)
+    product = load_log_file(product_path)
+
+    r_atoms = reactant["atoms"]
+    p_atoms = product["atoms"]
+    if len(r_atoms) != len(p_atoms):
+        raise ValueError("Reactant and product must have the same number of atoms in the same order.")
+    if len(r_atoms) > config["max_atoms"]:
+        raise ValueError(f"Prediction has {len(r_atoms)} atoms, but max_atoms is {config['max_atoms']}.")
+
+    r_types = [a["atom"] for a in r_atoms]
+    p_types = [a["atom"] for a in p_atoms]
+    if r_types != p_types:
+        raise ValueError("Reactant and product atom ordering/types differ. Align atom order before prediction.")
+
+    n = len(r_atoms)
+    c_R = padded_coords(r_atoms, config["max_atoms"])
+    c_P = padded_coords(p_atoms, config["max_atoms"])
+    c_I = (c_R + c_P) / 2.0
+
+    D_R = compute_distance_matrix(c_R)
+    D_P = compute_distance_matrix(c_P)
+    D_I = compute_distance_matrix(c_I)
+    mask = np.zeros(config["max_atoms"], dtype=np.float32)
+    mask[:n] = 1.0
+
+    model = PSI(config).to(DEVICE)
+    try:
+        state = torch.load(model_path, map_location=DEVICE, weights_only=True)
+    except TypeError:
+        state = torch.load(model_path, map_location=DEVICE)
+    model.load_state_dict(state)
+    model.eval()
+
+    with torch.no_grad():
+        t_DR = torch.from_numpy(D_R).unsqueeze(0).to(DEVICE)
+        t_DI = torch.from_numpy(D_I).unsqueeze(0).to(DEVICE)
+        t_DP = torch.from_numpy(D_P).unsqueeze(0).to(DEVICE)
+        t_mask = torch.from_numpy(mask).unsqueeze(0).to(DEVICE)
+        p_DTS, p_ea = model(t_DR, t_DI, t_DP, t_mask)
+
+    pred_dist = p_DTS[0, :n, :n].cpu().numpy()
+    pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
+    np.fill_diagonal(pred_dist, 0.0)
+
+    interp_coords = c_I[:n]
+    pred_coords = kabsch(mds(pred_dist), interp_coords)
+    energy_pred = float(p_ea.item())
+
+    result = {
+        "reactant_path": reactant_path,
+        "product_path": product_path,
+        "model_path": model_path,
+        "n_atoms": n,
+        "atom_types": r_types,
+        "Ea_pred": energy_pred,
+        "D_I": D_I[:n, :n].tolist(),
+        "D_pred": pred_dist.tolist(),
+        "coords_pred": pred_coords.tolist(),
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    if xyz_path:
+        write_xyz(xyz_path, r_types, pred_coords, f"PSI predicted TS, Ea={energy_pred:.4f} kcal/mol")
+
+    print("\n" + "="*70)
+    print(" PREDICTION RESULT ")
+    print("="*70)
+    print(f"Atoms: {n}")
+    print(f"Predicted activation energy: {energy_pred:.4f} kcal/mol")
+    print(f"Prediction JSON saved to: {output_path}")
+    if xyz_path:
+        print(f"Predicted TS XYZ saved to: {xyz_path}")
 
 def train_pipeline(config):
-    print("="*70); print(" PSI FULL PIPELINE (DATA-DRIVEN INIT) "); print("="*70)
+    print("="*70); print(" PSI FULL PIPELINE "); print("="*70)
     
     # 1. & 2. Data
     extract_raw_data(config)
@@ -329,13 +432,11 @@ def train_pipeline(config):
     if len(dataset) == 0:
         print("Error: No complete reaction triplets found."); return
         
-    # GLOBAL STRUCTURE ANALYSIS
-    stats = calculate_dataset_stats(dataset.samples)
+    loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True)
+    eval_loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=False)
     
-    loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
-    
-    # 3-6. Model with Smart Initialization
-    model = PSI(config, stats).to(DEVICE)
+    # 3-6. Model
+    model = PSI(config).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=50, factor=0.5)
     
@@ -366,7 +467,7 @@ def train_pipeline(config):
     model.eval()
     results = []
     with torch.no_grad():
-        for batch in loader:
+        for batch in eval_loader:
             DR, DI, DP = batch["D_R"].to(DEVICE), batch["D_I"].to(DEVICE), batch["D_P"].to(DEVICE)
             DTS, mask, true_ea = batch["D_TS"].to(DEVICE), batch["mask"].to(DEVICE), batch["Ea"].to(DEVICE)
             p_DTS, p_ea = model(DR, DI, DP, mask)
@@ -382,7 +483,7 @@ def train_pipeline(config):
                 e_err = abs(p_ea[i].item() - true_ea[i].item())
                 
                 # Fetch atom types from dataset map
-                atom_types = loader.dataset.atom_types_map.get(rxn_id, [])
+                atom_types = dataset.atom_types_map.get(rxn_id, [])
                 
                 results.append({
                     "rxn_id": rxn_id, 
@@ -405,4 +506,29 @@ def train_pipeline(config):
     print(f"\nModel and predictions saved to {config['save_dir']}")
 
 if __name__ == "__main__":
-    train_pipeline(CONFIG)
+    parser = argparse.ArgumentParser(description="PSI transition-state training and prediction")
+    subparsers = parser.add_subparsers(dest="command")
+
+    train_parser = subparsers.add_parser("train", help="Train the PSI model and evaluate known triplets")
+    train_parser.add_argument("--extract-limit", type=int, default=CONFIG["extraction_limit"], help="Number of log files to parse from the tarball")
+    train_parser.add_argument("--force-extract", action="store_true", help="Rebuild extracted_dataset.json instead of reusing it")
+    train_parser.add_argument("--epochs", type=int, default=CONFIG["epochs"], help="Training epochs")
+    train_parser.add_argument("--batch-size", type=int, default=CONFIG["batch_size"], help="Training batch size")
+
+    predict_parser = subparsers.add_parser("predict", help="Predict a transition state from reactant/product logs")
+    predict_parser.add_argument("--reactant", "-r", required=True, help="Path to reactant .log file")
+    predict_parser.add_argument("--product", "-p", required=True, help="Path to product .log file")
+    predict_parser.add_argument("--model", default=os.path.join(CONFIG["save_dir"], "psi_final.pt"), help="Path to psi_final.pt")
+    predict_parser.add_argument("--output", "-o", default=os.path.join(CONFIG["save_dir"], "psi_prediction.json"), help="Output JSON path")
+    predict_parser.add_argument("--xyz", default=os.path.join(CONFIG["save_dir"], "psi_predicted_ts.xyz"), help="Output XYZ path")
+
+    args = parser.parse_args()
+    if args.command == "predict":
+        predict_transition_state(CONFIG, args.reactant, args.product, args.model, args.output, args.xyz)
+    else:
+        if args.command == "train":
+            CONFIG["extraction_limit"] = args.extract_limit
+            CONFIG["force_extract"] = args.force_extract
+            CONFIG["epochs"] = args.epochs
+            CONFIG["batch_size"] = args.batch_size
+        train_pipeline(CONFIG)
