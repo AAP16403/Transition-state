@@ -1,22 +1,8 @@
-"""
-PSI Interactive Dashboard Generator
-====================================
-Generates a premium, interactive, self-contained HTML dashboard for PSI results.
-Features:
-- Global stats cards (Ea MAE, Ea R correlation, Geometry MAE).
-- True vs Pred Ea scatter plot with training/validation splits.
-- Initial guess vs AI geometry MAE distribution histograms.
-- Lightweight 3D Molecular viewer overlay (Actual, Predicted, Guess) with a dropdown
-  to select from 15 representative reactions (Best 5, Median 5, Worst 5).
-- Worst 10 reactions table for debugging.
-"""
-
 import os
 import json
 import numpy as np
 
 def mds(D, dim=3):
-    """Classical Multidimensional Scaling (MDS)"""
     N = D.shape[0]
     H = np.eye(N) - np.ones((N, N))/N
     B = -0.5 * H @ (D**2) @ H
@@ -28,7 +14,6 @@ def mds(D, dim=3):
     return X
 
 def kabsch(P, Q):
-    """Aligns P to Q using Kabsch algorithm, resolving chirality mismatch from MDS if needed."""
     P_centered = P - P.mean(axis=0); Q_centered = Q - Q.mean(axis=0)
     C = P_centered.T @ Q_centered
     V, _, W = np.linalg.svd(C)
@@ -41,17 +26,14 @@ def kabsch(P, Q):
     return P_centered @ R + Q.mean(axis=0)
 
 def get_bonds(coords, atom_types):
-    """Computes basic bonds based on covalent distance thresholds"""
     bonds = []
     n = len(coords)
-    # Covalent radii heuristic: C=0.76, H=0.31, N=0.71, O=0.66, F=0.57, S=1.05, Cl=1.02, Br=1.20, P=1.07
     radii = {'H': 0.31, 'C': 0.76, 'N': 0.71, 'O': 0.66, 'F': 0.57, 'S': 1.05, 'Cl': 1.02, 'P': 1.07}
     for i in range(n):
         for j in range(i+1, n):
-            r_i = radii.get(atom_types[i], 0.70)
-            r_j = radii.get(atom_types[j], 0.70)
+            r_i = radii[atom_types[i]]
+            r_j = radii[atom_types[j]]
             dist = np.linalg.norm(coords[i] - coords[j])
-            # Allow up to 45% tolerance above sum of covalent radii for stretched/active transition bonds
             if dist < 1.45 * (r_i + r_j):
                 bonds.append((i, j))
     return bonds
@@ -64,16 +46,13 @@ def create_dashboard(data_path, save_dir):
     with open(data_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    # Sort data by rxn_id
     data = sorted(data, key=lambda x: x["rxn_id"])
 
-    # Compute overall stats
     ea_trues = np.array([r["Ea_true"] for r in data])
     ea_preds = np.array([r["Ea_pred"] for r in data])
     ea_errors = np.abs(ea_preds - ea_trues)
     dist_maes = np.array([r["dist_MAE"] for r in data])
 
-    # Compute initial guess MAE (D_I vs D_true)
     guess_maes = []
     for r in data:
         di = np.array(r["D_I"])
@@ -83,7 +62,6 @@ def create_dashboard(data_path, save_dir):
 
     ea_corr = np.corrcoef(ea_trues, ea_preds)[0, 1] if len(ea_trues) > 1 else 0.0
 
-    # Training vs Validation Stats
     train_data = [r for r in data if r["split"] == "train"]
     val_data = [r for r in data if r["split"] == "val"]
 
@@ -95,7 +73,6 @@ def create_dashboard(data_path, save_dir):
     train_corr = np.corrcoef([r["Ea_true"] for r in train_data], [r["Ea_pred"] for r in train_data])[0, 1] if len(train_data) > 1 else 0.0
     val_corr = np.corrcoef([r["Ea_true"] for r in val_data], [r["Ea_pred"] for r in val_data])[0, 1] if len(val_data) > 1 else 0.0
 
-    # Pick representative reactions for the 3D Molecular viewer (5 best, 5 median, 5 worst by geometry error)
     sorted_by_geom = sorted(data, key=lambda x: x["dist_MAE"])
     n_rxns = len(sorted_by_geom)
     
@@ -113,29 +90,24 @@ def create_dashboard(data_path, save_dir):
         di = np.array(r["D_I"])
         atoms = r["atom_types"]
 
-        # Run MDS and align coordinates
-        try:
-            X_true = mds(dt)
-            X_pred = kabsch(mds(dp), X_true)
-            X_guess = kabsch(mds(di), X_true)
+        X_true = mds(dt)
+        X_pred = kabsch(mds(dp), X_true)
+        X_guess = kabsch(mds(di), X_true)
 
-            representative_data[rid] = {
-                "rxn_id": rid,
-                "atom_types": atoms,
-                "coords_true": X_true.tolist(),
-                "coords_pred": X_pred.tolist(),
-                "coords_guess": X_guess.tolist(),
-                "bonds_true": get_bonds(X_true, atoms),
-                "bonds_pred": get_bonds(X_pred, atoms),
-                "bonds_guess": get_bonds(X_guess, atoms),
-                "dist_MAE": r["dist_MAE"],
-                "Ea_error": r["Ea_error"],
-                "tier": "Best" if r in best_5 else "Median" if r in median_5 else "Worst"
-            }
-        except Exception as e:
-            print(f"Warning: MDS failed for reaction {rid}: {e}")
+        representative_data[rid] = {
+            "rxn_id": rid,
+            "atom_types": atoms,
+            "coords_true": X_true.tolist(),
+            "coords_pred": X_pred.tolist(),
+            "coords_guess": X_guess.tolist(),
+            "bonds_true": get_bonds(X_true, atoms),
+            "bonds_pred": get_bonds(X_pred, atoms),
+            "bonds_guess": get_bonds(X_guess, atoms),
+            "dist_MAE": r["dist_MAE"],
+            "Ea_error": r["Ea_error"],
+            "tier": "Best" if r in best_5 else "Median" if r in median_5 else "Worst"
+        }
 
-    # Build lightweight reaction summary array for JS charts and tables
     summary_list = []
     for r in data:
         summary_list.append({
@@ -149,10 +121,8 @@ def create_dashboard(data_path, save_dir):
             "n_atoms": r["n_atoms"]
         })
 
-    # Find worst 10 by geometry error for table
     worst_10_geom = sorted(summary_list, key=lambda x: x["dist_MAE"], reverse=True)[:10]
 
-    # Generate HTML content
     html_template = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -389,7 +359,6 @@ def create_dashboard(data_path, save_dir):
       </div>
     </header>
 
-    <!-- Stat Cards -->
     <div class="stats-grid">
       <div class="card stat-card">
         <div class="stat-label">Total Triplets</div>
@@ -409,7 +378,6 @@ def create_dashboard(data_path, save_dir):
       </div>
     </div>
 
-    <!-- Charts Grid -->
     <div class="charts-grid">
       <div class="card">
         <div class="chart-title">Ea: Actual vs. Predicted</div>
@@ -421,14 +389,12 @@ def create_dashboard(data_path, save_dir):
       </div>
     </div>
 
-    <!-- Interactive 3D molecular viewer -->
     <div class="card molecular-viewer-card">
       <div class="viewer-header">
         <div class="chart-title" style="margin-bottom: 0;">Interactive 3D Transition State Alignment</div>
         <div class="dropdown-container">
           <label for="rxn-select">Select Reaction Case Study:</label>
           <select id="rxn-select" onchange="updateViewer()">
-            <!-- Dropdown options populated by JS -->
           </select>
         </div>
       </div>
@@ -476,7 +442,6 @@ def create_dashboard(data_path, save_dir):
       </div>
     </div>
 
-    <!-- Worst 10 Table for Diagnostics -->
     <div class="card">
       <div class="chart-title">Worst 10 Geometry Predictions (Diagnostics)</div>
       <div class="table-container">
@@ -494,7 +459,6 @@ def create_dashboard(data_path, save_dir):
             </tr>
           </thead>
           <tbody id="worst-table-body">
-            <!-- Table rows populated by JS -->
           </tbody>
         </table>
       </div>
@@ -502,12 +466,10 @@ def create_dashboard(data_path, save_dir):
   </div>
 
   <script>
-    // Embedded JSON data from Python
     const reactions = {json.dumps(summary_list)};
     const repData = {json.dumps(representative_data)};
     const worst10 = {json.dumps(worst_10_geom)};
 
-    // --- 1. Ea SCATTER PLOT ---
     const trainScatter = {{
       x: [], y: [], text: [], mode: 'markers',
       name: 'Train Set',
@@ -532,7 +494,6 @@ def create_dashboard(data_path, save_dir):
       }}
     }}
 
-    // Line y=x
     const minEa = Math.min(...reactions.map(r => r.Ea_true));
     const maxEa = Math.max(...reactions.map(r => r.Ea_true));
     const refLine = {{
@@ -552,8 +513,6 @@ def create_dashboard(data_path, save_dir):
     }};
     Plotly.newPlot('ea-scatter', [trainScatter, valScatter, refLine], scatterLayout);
 
-
-    // --- 2. GEOMETRY IMPROVEMENT HISTOGRAM ---
     const guessHist = {{
       x: reactions.map(r => r.guess_MAE),
       type: 'histogram', name: 'Initial Guess MAE',
@@ -578,9 +537,6 @@ def create_dashboard(data_path, save_dir):
     }};
     Plotly.newPlot('geom-histogram', [guessHist, aiHist], histLayout);
 
-
-    // --- 3. 3D MOLECULAR VIEWER ---
-    // Populate dropdown
     const select = document.getElementById('rxn-select');
     for (let rid in repData) {{
       let opt = document.createElement('option');
@@ -602,11 +558,9 @@ def create_dashboard(data_path, save_dir):
       tierBadge.className = `badge badge-tier ${{r.tier}}`;
       tierBadge.innerText = r.tier;
 
-      // Draw traces
       const traces = [];
 
       function addStructure(coords, bonds, color, name, size, opacity) {{
-        // Atoms
         traces.push({{
           x: coords.map(c => c[0]),
           y: coords.map(c => c[1]),
@@ -620,7 +574,6 @@ def create_dashboard(data_path, save_dir):
           hoverinfo: 'name+text'
         }});
 
-        // Bonds
         let bx = [], by = [], bz = [];
         for (let b of bonds) {{
           bx.push(coords[b[0]][0], coords[b[1]][0], null);
@@ -637,7 +590,6 @@ def create_dashboard(data_path, save_dir):
         }});
       }}
 
-      // Add R/P/TS structures
       addStructure(r.coords_true, r.bonds_true, '#10b981', 'Ground Truth TS', 7, 0.95);
       addStructure(r.coords_pred, r.bonds_pred, '#3b82f6', 'AI Predicted TS', 5.5, 0.85);
       addStructure(r.coords_guess, r.bonds_guess, '#ef4444', 'Interpolated Guess', 3.5, 0.35);
@@ -661,13 +613,10 @@ def create_dashboard(data_path, save_dir):
       Plotly.newPlot('mol-viewer', traces, viewerLayout);
     }}
 
-    // Initial viewer call
     if (select.options.length > 0) {{
       updateViewer();
     }}
 
-
-    // --- 4. DIAGNOSTICS TABLE ---
     const tableBody = document.getElementById('worst-table-body');
     for (let r of worst10) {{
       let tr = document.createElement('tr');
