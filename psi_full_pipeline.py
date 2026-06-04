@@ -91,6 +91,10 @@ CONFIG = {
     # Data augmentation
     "coord_noise_std": 0.005,  # Smaller noise (was 0.01 — too much for small molecules)
 
+    # TS physical rules
+    "spectator_threshold": 0.15,  # Å change below which a bond is considered a spectator
+    "spectator_tol": 0.05,         # ±fraction allowed deviation for spectator bonds
+
     "hartree_to_kcal": 627.509,
 }
 
@@ -227,6 +231,199 @@ def kabsch(P, Q):
         E[2, 2] = -1
     R = V @ E @ W
     return P_centered @ R + Q.mean(axis=0)
+
+
+# ============================================================================
+# Transition State Physical Rules
+# ============================================================================
+
+# Standard covalent radii (Å) used for steric-collision detection.
+# Source: Alvarez 2008 / Pyykkö & Atsumi 2009 consensus values.
+COVALENT_RADII = {
+    'H': 0.31, 'C': 0.76, 'N': 0.71, 'O': 0.66, 'F': 0.57,
+    'S': 1.05, 'Cl': 1.02, 'Br': 1.20, 'I': 1.39, 'P': 1.07,
+    'Si': 1.11, 'B': 0.84,
+}
+
+
+def kabsch_align_reactant(c_R, c_P, n):
+    """Return a copy of c_R whose first n rows are aligned onto c_P[:n].
+
+    This ensures that the midpoint interpolation c_I = (c_R_aligned + c_P) / 2
+    is in a consistent reference frame, avoiding collapsed or inverted geometries
+    caused by mixing coordinates from different rotational frames.
+    """
+    c_R_aligned = c_R.copy()
+    c_R_aligned[:n] = kabsch(c_R[:n], c_P[:n])
+    return c_R_aligned
+
+
+def clamp_steric_collisions(pred_dist, atom_types):
+    """Raise any predicted distance that falls below the physical steric floor.
+
+    The minimum allowed pairwise distance is 85 % of the sum of covalent radii.
+    Distances shorter than this represent nuclear overlap and are physically
+    impossible — the model must not produce them.
+
+    Args:
+        pred_dist: (n, n) symmetric distance matrix (modified in-place).
+        atom_types: list of element symbols, length n.
+
+    Returns:
+        Modified pred_dist.
+    """
+    n = len(atom_types)
+    for i in range(n):
+        for j in range(i + 1, n):
+            r_i = COVALENT_RADII.get(atom_types[i], 0.70)
+            r_j = COVALENT_RADII.get(atom_types[j], 0.70)
+            min_d = 0.85 * (r_i + r_j)
+            if pred_dist[i, j] < min_d:
+                pred_dist[i, j] = min_d
+                pred_dist[j, i] = min_d
+    return pred_dist
+
+
+def classify_bonds(D_R, D_P, n, threshold=0.15):
+    """Classify atom pairs into active bonds and spectator bonds.
+
+    Active bonds change length by more than `threshold` Å between R and P
+    (breaking or forming bonds on the reaction path).  Spectator bonds are
+    structural bonds that should be preserved at their equilibrium length.
+
+    Args:
+        D_R: (n, n) reactant distance matrix.
+        D_P: (n, n) product  distance matrix.
+        n:   number of real atoms (ignoring padding).
+        threshold: Å change considered chemically significant.
+
+    Returns:
+        (active, spectator) — each a list of (i, j) index tuples, i < j.
+    """
+    active, spectator = [], []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if abs(D_R[i, j] - D_P[i, j]) > threshold:
+                active.append((i, j))
+            else:
+                spectator.append((i, j))
+    return active, spectator
+
+
+def apply_spectator_constraints(pred_dist, D_R, D_P, n,
+                                threshold=0.15, tol=0.05):
+    """Constrain spectator-bond distances within a tolerance band.
+
+    Pairs that do not participate in the reaction should have the same bond
+    length in the TS as in R/P (within ±tol).  This prevents the model from
+    distorting stable ring systems, spectator C–H bonds, etc.
+
+    Args:
+        pred_dist: (n, n) predicted distance matrix (modified in-place).
+        D_R: (n, n) reactant distance matrix.
+        D_P: (n, n) product  distance matrix.
+        n:   number of real atoms.
+        threshold: Å change threshold for bond classification.
+        tol: fractional tolerance around the R/P reference distance.
+
+    Returns:
+        Modified pred_dist.
+    """
+    _, spectator = classify_bonds(D_R, D_P, n, threshold)
+    for (i, j) in spectator:
+        d_ref = (D_R[i, j] + D_P[i, j]) / 2.0
+        lo = d_ref * (1.0 - tol)
+        hi = d_ref * (1.0 + tol)
+        clamped = float(np.clip(pred_dist[i, j], lo, hi))
+        pred_dist[i, j] = clamped
+        pred_dist[j, i] = clamped
+    return pred_dist
+
+
+def enforce_triangle_inequality(D):
+    """Ensure the distance matrix satisfies the triangle inequality.
+
+    MDS reconstruction requires the matrix to be a valid semi-metric.
+    Pairs that violate  D[i,j] <= D[i,k] + D[k,j]  produce imaginary
+    eigenvalues that collapse or distort the 3-D reconstruction.
+
+    Uses the Floyd-Warshall relaxation, which is O(n^3) but n <= 30 here.
+
+    Args:
+        D: (n, n) distance matrix.
+
+    Returns:
+        New, triangle-inequality-consistent distance matrix.
+    """
+    D = D.copy()
+    n = D.shape[0]
+    for k in range(n):
+        for i in range(n):
+            for j in range(n):
+                if D[i, j] > D[i, k] + D[k, j]:
+                    D[i, j] = D[j, i] = D[i, k] + D[k, j]
+    return D
+
+
+def validate_ts_geometry(pred_dist, D_R, D_P, atom_types, n,
+                         spectator_threshold=0.15):
+    """Run all physical checks on the predicted TS distance matrix and report.
+
+    Checks performed:
+      1. Steric collisions (distances < 85 % of summed covalent radii).
+      2. Active-bond out-of-bounds (predicted length outside the R-to-P range
+         with a 0.3 Å buffer in each direction).
+
+    Args:
+        pred_dist: (n, n) predicted distance matrix.
+        D_R: (n, n) reactant distance matrix.
+        D_P: (n, n) product  distance matrix.
+        atom_types: list of element symbols, length n.
+        n:   number of real atoms.
+        spectator_threshold: threshold forwarded to classify_bonds.
+
+    Returns:
+        True if all checks pass, False if any violation is found.
+    """
+    issues = []
+
+    # Check 1: steric collisions
+    for i in range(n):
+        for j in range(i + 1, n):
+            r_i = COVALENT_RADII.get(atom_types[i], 0.70)
+            r_j = COVALENT_RADII.get(atom_types[j], 0.70)
+            min_d = 0.85 * (r_i + r_j)
+            if pred_dist[i, j] < min_d:
+                issues.append(
+                    f"  STERIC   {atom_types[i]}{i}-{atom_types[j]}{j}: "
+                    f"{pred_dist[i,j]:.3f} Å < floor {min_d:.3f} Å"
+                )
+
+    # Check 2: active bonds out of R→P range
+    active, _ = classify_bonds(D_R, D_P, n, spectator_threshold)
+    for (i, j) in active:
+        d_lo = min(D_R[i, j], D_P[i, j]) - 0.30
+        d_hi = max(D_R[i, j], D_P[i, j]) + 0.30
+        if not (d_lo <= pred_dist[i, j] <= d_hi):
+            issues.append(
+                f"  ACT_OOB  {atom_types[i]}{i}-{atom_types[j]}{j}: "
+                f"pred={pred_dist[i,j]:.3f} Å  "
+                f"(R={D_R[i,j]:.3f}, P={D_P[i,j]:.3f})"
+            )
+
+    if issues:
+        print(f"[TS Validation] {len(issues)} issue(s) detected:")
+        for iss in issues:
+            print(iss)
+    else:
+        print("[TS Validation] Geometry passed all physical checks.")
+
+    return len(issues) == 0
+
+
+# ============================================================================
+# End of Transition State Physical Rules
+# ============================================================================
 
 def padded_coords(atoms, max_atoms):
     coords = np.zeros((max_atoms, 3), dtype=np.float32)
@@ -390,8 +587,14 @@ class ReactionDataset(Dataset):
             c_P[:n] += noise_P
             # Note: c_TS is NOT augmented — it's the target
 
-        # Interpolation
-        c_I = (c_R + c_P) / 2.0
+        # Kabsch-align reactant onto product frame before interpolation.
+        # This ensures c_R and c_P share the same rotational frame so that
+        # the midpoint c_I is a chemically sensible TS guess rather than an
+        # average of coordinates from two different orientations.
+        n = s["n_atoms"]
+        c_R_aligned = kabsch_align_reactant(c_R, c_P, n)
+        c_I = np.zeros_like(c_R)
+        c_I[:n] = (c_R_aligned[:n] + c_P[:n]) / 2.0
 
         # Distance matrices
         D_R = compute_distance_matrix(c_R)
@@ -1084,9 +1287,40 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
     np.fill_diagonal(pred_dist, 0.0)
 
-    interp_coords = c_I[:n]
-    pred_coords = kabsch(mds(pred_dist), interp_coords)
-    
+    # -----------------------------------------------------------------------
+    # Apply TS physical rules to remove impossible geometries
+    # -----------------------------------------------------------------------
+
+    # Rule 0: Kabsch-align reactant → correct reference frame for interpolation
+    c_R_aligned = kabsch_align_reactant(c_R, c_P, n)
+    c_I_real = (c_R_aligned[:n] + c_P[:n]) / 2.0  # chemically valid midpoint
+
+    # Rule 1: Clamp steric collisions (nuclear overlap prevention)
+    pred_dist = clamp_steric_collisions(pred_dist, r_types[:n])
+
+    # Rule 2: Lock spectator bonds within ±tol of their R/P reference value
+    pred_dist = apply_spectator_constraints(
+        pred_dist,
+        D_R[:n, :n], D_P[:n, :n], n,
+        threshold=config.get("spectator_threshold", 0.15),
+        tol=config.get("spectator_tol", 0.05),
+    )
+
+    # Rule 3: Enforce triangle inequality so MDS produces a valid 3-D geometry
+    pred_dist = enforce_triangle_inequality(pred_dist)
+
+    # Rule 4: Validate and report any remaining physical violations
+    validate_ts_geometry(
+        pred_dist, D_R[:n, :n], D_P[:n, :n], r_types[:n], n,
+        spectator_threshold=config.get("spectator_threshold", 0.15),
+    )
+
+    # -----------------------------------------------------------------------
+    # Reconstruct 3-D coordinates from the corrected distance matrix
+    # Use the Kabsch-corrected midpoint as the alignment reference
+    # -----------------------------------------------------------------------
+    pred_coords = kabsch(mds(pred_dist), c_I_real)
+
     # Denormalize energy prediction
     energy_pred = float(p_ea_norm.item()) * ea_std + ea_mean
 
