@@ -14,7 +14,7 @@ CONFIG = {
     "tar_path": r"d:\Transition state\b97d3.tar.gz",
     "dataset_json": r"d:\Transition state\extracted_dataset.json",
     "save_dir": r"d:\Transition state",
-    "extraction_limit": 1500,
+    "extraction_limit": 6000,
     "force_extract": False,
     "max_atoms": 30,
     "n_gaussians": 32,
@@ -23,16 +23,16 @@ CONFIG = {
     "atom_embed_dim": 32,
     "gru_hidden": 128,
     "gru_layers": 2,
-    "gru_dropout": 0.1,
+    "gru_dropout": 0.2,
     "attn_heads": 8,
     "attn_layers": 3,
     "ff_dim": 512,
-    "dropout": 0.1,
-    "energy_weight_start": 5.0,
-    "energy_weight_end": 15.0,
+    "dropout": 0.25,
+    "energy_weight_start": 2.0,
+    "energy_weight_end": 5.0,
     "energy_ramp_epochs": 150,
     "lr": 5e-4,
-    "weight_decay": 5e-4,
+    "weight_decay": 2e-3,
     "warmup_epochs": 15,
     "grad_clip": 1.0,
     "batch_size": 32,
@@ -45,8 +45,8 @@ CONFIG = {
     "print_every": 25,
     "val_split": 0.2,
     "split_seed": 42,
-    "patience": 150,
-    "coord_noise_std": 0.005,
+    "patience": 60,
+    "coord_noise_std": 0.03,
     "spectator_threshold": 0.15,
     "spectator_tol": 0.05,
     "hartree_to_kcal": 627.509,
@@ -466,15 +466,16 @@ class PSICore(nn.Module):
         return self.final_norm(x)
 
 class GeometryHead(nn.Module):
-    def __init__(self, d_model, atom_embed_dim):
+    def __init__(self, d_model, atom_embed_dim, dropout=0.25):
         super().__init__()
         pair_dim = d_model * 2 + atom_embed_dim * 2 + 3
         self.net = nn.Sequential(
             nn.Linear(pair_dim, 256),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(256, 128),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(128, 1),
         )
         nn.init.zeros_(self.net[-1].weight)
@@ -497,24 +498,23 @@ class GeometryHead(nn.Module):
         return D_TS_pred * (1.0 - eye) * valid
 
 class EnergyHead(nn.Module):
-    def __init__(self, d_model, n_energy_feats=5):
+    def __init__(self, d_model, n_energy_feats=5, dropout=0.25):
         super().__init__()
         self.ln = nn.LayerNorm(d_model)
         self.attn_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.attn_proj_k = nn.Linear(d_model, d_model)
         self.attn_proj_v = nn.Linear(d_model, d_model)
         self.attn_scale = d_model ** 0.5
+        self.attn_drop = nn.Dropout(dropout)
         self.efeat_proj = nn.Sequential(
-            nn.Linear(n_energy_feats, 64),
+            nn.Linear(n_energy_feats, 32),
             nn.GELU(),
-            nn.Linear(64, 64),
+            nn.Dropout(dropout),
         )
         self.net = nn.Sequential(
-            nn.Linear(d_model + 64, 128),
+            nn.Linear(d_model + 32, 64),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 64),
-            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(64, 1),
         )
 
@@ -527,7 +527,7 @@ class EnergyHead(nn.Module):
         scores = torch.bmm(Q, K.transpose(1, 2)) / self.attn_scale
         pad_mask = (mask == 0).unsqueeze(1)
         scores = scores.masked_fill(pad_mask, float('-inf'))
-        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.attn_drop(F.softmax(scores, dim=-1))
         pooled = torch.bmm(attn_weights, V).squeeze(1)
         efeat = self.efeat_proj(energy_feats)
         combined = torch.cat([pooled, efeat], dim=-1)
@@ -538,9 +538,10 @@ class PSI(nn.Module):
         super().__init__()
         d_model = config["gru_hidden"] * 2
         atom_dim = config["atom_embed_dim"]
+        drop = config["dropout"]
         self.core = PSICore(config, num_atom_types)
-        self.geom_head = GeometryHead(d_model, atom_dim)
-        self.ener_head = EnergyHead(d_model, n_energy_feats)
+        self.geom_head = GeometryHead(d_model, atom_dim, drop)
+        self.ener_head = EnergyHead(d_model, n_energy_feats, drop)
 
     def forward(self, D_R, D_I, D_P, mask, atom_ids, energy_feats):
         f = self.core(D_R, D_I, D_P, mask, atom_ids)

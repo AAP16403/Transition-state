@@ -22,3 +22,11 @@ __pycache__/
 # OS
 Thumbs.db
 .DS_Store
+
+# Virtual Environment
+.venv/
+
+# Large dataset and result files
+*.json
+*.xyz
+*.html
