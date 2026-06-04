@@ -220,17 +220,24 @@ def mds(D, dim=3):
     return evecs[:, :dim] @ np.diag(np.sqrt(np.maximum(evals[:dim], 0)))
 
 def kabsch(P, Q):
-    """Align coordinates P onto Q."""
+    """Align coordinates P onto Q, resolving chirality mismatch from MDS if needed."""
     P_centered = P - P.mean(axis=0)
     Q_centered = Q - Q.mean(axis=0)
     C = P_centered.T @ Q_centered
     V, _, W = np.linalg.svd(C)
-    d = np.linalg.det(V @ W)
-    E = np.eye(3)
-    if d < 0:
-        E[2, 2] = -1
-    R = V @ E @ W
+    
+    # If determinant of covariance matrix product is negative, P and Q have
+    # opposite chirality (MDS has a 50% chance of mirroring the coordinates).
+    # We flip one coordinate axis of P to match the chirality of Q.
+    if np.linalg.det(V @ W) < 0.0:
+        P_centered = P_centered.copy()
+        P_centered[:, 2] *= -1.0
+        C = P_centered.T @ Q_centered
+        V, _, W = np.linalg.svd(C)
+        
+    R = V @ W
     return P_centered @ R + Q.mean(axis=0)
+
 
 
 # ============================================================================

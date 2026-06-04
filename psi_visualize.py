@@ -28,16 +28,16 @@ def mds(D, dim=3):
     return X
 
 def kabsch(P, Q):
-    """Aligns P to Q using Kabsch algorithm (Procrustes Analysis)"""
-    P_centered = P - P.mean(axis=0)
-    Q_centered = Q - Q.mean(axis=0)
+    """Aligns P to Q using Kabsch algorithm, resolving chirality mismatch from MDS if needed."""
+    P_centered = P - P.mean(axis=0); Q_centered = Q - Q.mean(axis=0)
     C = P_centered.T @ Q_centered
-    V, S, W = np.linalg.svd(C)
-    d = np.linalg.det(V @ W)
-    E = np.eye(3)
-    if d < 0:
-        E[2, 2] = -1
-    R = V @ E @ W
+    V, _, W = np.linalg.svd(C)
+    if np.linalg.det(V @ W) < 0.0:
+        P_centered = P_centered.copy()
+        P_centered[:, 2] *= -1.0
+        C = P_centered.T @ Q_centered
+        V, _, W = np.linalg.svd(C)
+    R = V @ W
     return P_centered @ R + Q.mean(axis=0)
 
 def get_bonds(coords, atom_types):
@@ -672,14 +672,14 @@ def create_dashboard(data_path, save_dir):
     for (let r of worst10) {{
       let tr = document.createElement('tr');
       tr.innerHTML = `
-        <td style="font-weight: 600; color: #ffffff;">\${{r.rxn_id}}</td>
-        <td><span class="badge badge-\${{r.split}}">\${{r.split.toUpperCase()}}</span></td>
-        <td>\${{r.n_atoms}}</td>
-        <td>\${{r.guess_MAE.toFixed(4)}}</td>
-        <td style="color: #f87171; font-weight: 600;">\${{r.dist_MAE.toFixed(4)}}</td>
-        <td>\${{r.Ea_true.toFixed(2)}}</td>
-        <td>\${{r.Ea_pred.toFixed(2)}}</td>
-        <td style="font-weight: 600;">\${{r.Ea_error.toFixed(2)}}</td>
+        <td style="font-weight: 600; color: #ffffff;">${{r.rxn_id}}</td>
+        <td><span class="badge badge-${{r.split}}">${{r.split.toUpperCase()}}</span></td>
+        <td>${{r.n_atoms}}</td>
+        <td>${{r.guess_MAE.toFixed(4)}}</td>
+        <td style="color: #f87171; font-weight: 600;">${{r.dist_MAE.toFixed(4)}}</td>
+        <td>${{r.Ea_true.toFixed(2)}}</td>
+        <td>${{r.Ea_pred.toFixed(2)}}</td>
+        <td style="font-weight: 600;">${{r.Ea_error.toFixed(2)}}</td>
       `;
       tableBody.appendChild(tr);
     }}
