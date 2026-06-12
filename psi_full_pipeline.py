@@ -309,7 +309,8 @@ class ReactionDataset(Dataset):
                 e_r = r_e["energy"] * config["hartree_to_kcal"]
                 e_p = p_e["energy"] * config["hartree_to_kcal"]
                 de_rxn = abs(e_r - e_p)
-                diff = c_R[:n] - c_P[:n]
+                c_R_aligned_init = kabsch_align_reactant(c_R, c_P, n)
+                diff = c_R_aligned_init[:n] - c_P[:n]
                 diff_norms = np.linalg.norm(diff, axis=1)
                 energy_feats = np.array([
                     de_rxn, diff_norms.mean(), diff_norms.std(), diff_norms.max(), float(n),
@@ -791,10 +792,15 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     n = len(r_atoms)
     c_R = padded_coords(r_atoms, config["max_atoms"])
     c_P = padded_coords(p_atoms, config["max_atoms"])
-    c_I = (c_R + c_P) / 2.0
+    
+    c_R_aligned = kabsch_align_reactant(c_R, c_P, n)
+    c_I = np.zeros_like(c_R)
+    c_I[:n] = (c_R_aligned[:n] + c_P[:n]) / 2.0
+    
     D_R = compute_distance_matrix(c_R)
     D_P = compute_distance_matrix(c_P)
     D_I = compute_distance_matrix(c_I)
+    
     mask = np.zeros(config["max_atoms"], dtype=np.float32)
     mask[:n] = 1.0
     atom_ids = np.zeros(config["max_atoms"], dtype=np.int64)
@@ -803,7 +809,7 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     e_r = reactant["energy"] * config["hartree_to_kcal"]
     e_p = product["energy"] * config["hartree_to_kcal"]
     de_rxn = abs(e_r - e_p)
-    diff = c_R[:n] - c_P[:n]
+    diff = c_R_aligned[:n] - c_P[:n]
     diff_norms = np.linalg.norm(diff, axis=1)
     energy_feats = np.array([
         de_rxn, diff_norms.mean(), diff_norms.std(), diff_norms.max(), float(n)
@@ -823,8 +829,7 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     pred_dist = p_DTS[0, :n, :n].cpu().numpy()
     pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
     np.fill_diagonal(pred_dist, 0.0)
-    c_R_aligned = kabsch_align_reactant(c_R, c_P, n)
-    c_I_real = (c_R_aligned[:n] + c_P[:n]) / 2.0
+    c_I_real = c_I[:n]
     pred_dist = clamp_steric_collisions(pred_dist, r_types[:n])
     pred_dist = apply_spectator_constraints(
         pred_dist,
