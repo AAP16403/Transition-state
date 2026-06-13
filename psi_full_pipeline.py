@@ -28,12 +28,15 @@ CONFIG = {
     "attn_layers": 3,
     "ff_dim": 512,
     "dropout": 0.25,
-    "energy_weight_start": 2.0,
-    "energy_weight_end": 5.0,
-    "energy_ramp_epochs": 150,
-    "lr": 5e-4,
+    "energy_dropout": 0.45,
+    "delta_clamp": 3.0,
+    "energy_weight_start": 0.5,
+    "energy_weight_end": 3.0,
+    "energy_ramp_epochs": 200,
+    "lr": 1.5e-4,
     "weight_decay": 2e-3,
-    "warmup_epochs": 15,
+    "energy_weight_decay": 1e-2,
+    "warmup_epochs": 40,
     "grad_clip": 1.0,
     "batch_size": 32,
     "num_workers": 0,
@@ -45,10 +48,11 @@ CONFIG = {
     "print_every": 25,
     "val_split": 0.2,
     "split_seed": 42,
-    "patience": 60,
+    "patience": 120,
     "coord_noise_std": 0.03,
     "spectator_threshold": 0.15,
     "spectator_tol": 0.05,
+    "fragment_bond_scale": 1.45,
     "hartree_to_kcal": 627.509,
 }
 
@@ -77,6 +81,7 @@ def move_batch_to_device(batch, device):
         batch["D_P"].to(device, non_blocking=True),
         batch["D_TS"].to(device, non_blocking=True),
         batch["mask"].to(device, non_blocking=True),
+        batch["geom_mask"].to(device, non_blocking=True),
         batch["Ea"].to(device, non_blocking=True),
         batch["atom_ids"].to(device, non_blocking=True),
         batch["energy_feats"].to(device, non_blocking=True),
@@ -148,7 +153,11 @@ def mds(D, dim=3):
     idx = np.argsort(evals)[::-1]
     evals = evals[idx]
     evecs = evecs[:, idx]
-    return evecs[:, :dim] @ np.diag(np.sqrt(np.maximum(evals[:dim], 0)))
+    n_dims = min(dim, n)
+    X = evecs[:, :n_dims] @ np.diag(np.sqrt(np.maximum(evals[:n_dims], 0)))
+    if n_dims < dim:
+        X = np.pad(X, ((0, 0), (0, dim - n_dims)))
+    return X
 
 def kabsch(P, Q):
     P_centered = P - P.mean(axis=0)
@@ -169,18 +178,127 @@ COVALENT_RADII = {
     'Si': 1.11, 'B': 0.84,
 }
 
+def covalent_radius(atom_type):
+    return COVALENT_RADII.get(atom_type, 0.76)
+
+def find_fragments_from_coords(coords, atom_types, n, bond_scale=1.45):
+    adjacency = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
+            if np.linalg.norm(coords[i] - coords[j]) <= cutoff:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+    return connected_components(adjacency)
+
+def find_fragments_from_distances(D, atom_types, bond_scale=1.45):
+    n = len(atom_types)
+    adjacency = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
+            if D[i, j] <= cutoff:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+    return connected_components(adjacency)
+
+def connected_components(adjacency):
+    seen = set()
+    fragments = []
+    for start in range(len(adjacency)):
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        frag = []
+        while stack:
+            node = stack.pop()
+            frag.append(node)
+            for nbr in adjacency[node]:
+                if nbr not in seen:
+                    seen.add(nbr)
+                    stack.append(nbr)
+        fragments.append(sorted(frag))
+    return sorted(fragments, key=lambda frag: (frag[0], len(frag)))
+
+def geometry_pair_mask_from_fragments(fragments, max_atoms, include_diagonal=False):
+    geom_mask = np.zeros((max_atoms, max_atoms), dtype=np.float32)
+    for frag in fragments:
+        idx = np.array(frag, dtype=np.int64)
+        geom_mask[np.ix_(idx, idx)] = 1.0
+    if not include_diagonal:
+        np.fill_diagonal(geom_mask, 0.0)
+    return geom_mask
+
+def choose_alignment_fragments(c_R, c_P, atom_types, n, bond_scale=1.45):
+    frags_R = find_fragments_from_coords(c_R, atom_types, n, bond_scale)
+    frags_P = find_fragments_from_coords(c_P, atom_types, n, bond_scale)
+    if len(frags_P) > len(frags_R):
+        return frags_P
+    if len(frags_R) > len(frags_P):
+        return frags_R
+    return frags_R
+
 def kabsch_align_reactant(c_R, c_P, n):
     c_R_aligned = c_R.copy()
     c_R_aligned[:n] = kabsch(c_R[:n], c_P[:n])
     return c_R_aligned
 
-def clamp_steric_collisions(pred_dist, atom_types):
+def kabsch_align_reactant_fragments(c_R, c_P, atom_types, n, bond_scale=1.45):
+    c_R_aligned = c_R.copy()
+    fragments = choose_alignment_fragments(c_R, c_P, atom_types, n, bond_scale)
+    for frag in fragments:
+        idx = np.array(frag, dtype=np.int64)
+        if len(idx) >= 2:
+            c_R_aligned[idx] = kabsch(c_R[idx], c_P[idx])
+        else:
+            c_R_aligned[idx] = c_P[idx]
+    return c_R_aligned
+
+def mds_by_fragments(D, atom_types=None, fragments=None, reference_coords=None, dim=3, bond_scale=1.45):
+    n = D.shape[0]
+    if fragments is None:
+        if atom_types is None:
+            fragments = [list(range(n))]
+        else:
+            fragments = find_fragments_from_distances(D, atom_types, bond_scale)
+    X = np.zeros((n, dim), dtype=np.float64)
+    cursor = 0.0
+    for frag in fragments:
+        idx = np.array(frag, dtype=np.int64)
+        if len(idx) >= 2:
+            frag_coords = mds(D[np.ix_(idx, idx)], dim=dim)
+        else:
+            frag_coords = np.zeros((1, dim), dtype=np.float64)
+        if reference_coords is not None:
+            ref = reference_coords[idx]
+            if len(idx) >= 2:
+                frag_coords = kabsch(frag_coords, ref)
+            else:
+                frag_coords[0] = ref[0]
+        else:
+            frag_coords = frag_coords - frag_coords.mean(axis=0)
+            span = np.ptp(frag_coords[:, 0]) if len(idx) > 1 else 0.0
+            frag_coords[:, 0] += cursor - frag_coords[:, 0].min()
+            cursor += max(span, 1.5) + 3.0
+        X[idx] = frag_coords
+    return X.astype(np.float32)
+
+# Steric floor as a fraction of (r_i + r_j). The covalent-radius sum is itself the
+# *bonded* distance, and transition states legitimately compress forming/breaking
+# bonds well below it: the tightest true pair in the training set sits at 0.787.
+# A floor of 0.85 therefore pushed 184 predicted pairs ABOVE their true distance
+# (net-degrading 127 reactions). 0.75 sits below every observed true distance, so
+# it only fires on genuinely non-physical overlaps.
+STERIC_FLOOR_FRAC = 0.75
+
+def clamp_steric_collisions(pred_dist, atom_types, floor_frac=STERIC_FLOOR_FRAC):
     n = len(atom_types)
     for i in range(n):
         for j in range(i + 1, n):
-            r_i = COVALENT_RADII[atom_types[i]]
-            r_j = COVALENT_RADII[atom_types[j]]
-            min_d = 0.85 * (r_i + r_j)
+            r_i = covalent_radius(atom_types[i])
+            r_j = covalent_radius(atom_types[j])
+            min_d = floor_frac * (r_i + r_j)
             if pred_dist[i, j] < min_d:
                 pred_dist[i, j] = min_d
                 pred_dist[j, i] = min_d
@@ -196,9 +314,11 @@ def classify_bonds(D_R, D_P, n, threshold=0.15):
                 spectator.append((i, j))
     return active, spectator
 
-def apply_spectator_constraints(pred_dist, D_R, D_P, n, threshold=0.15, tol=0.05):
+def apply_spectator_constraints(pred_dist, D_R, D_P, n, threshold=0.15, tol=0.05, pair_mask=None):
     _, spectator = classify_bonds(D_R, D_P, n, threshold)
     for (i, j) in spectator:
+        if pair_mask is not None and pair_mask[i, j] <= 0:
+            continue
         d_ref = (D_R[i, j] + D_P[i, j]) / 2.0
         lo = d_ref * (1.0 - tol)
         hi = d_ref * (1.0 + tol)
@@ -207,23 +327,42 @@ def apply_spectator_constraints(pred_dist, D_R, D_P, n, threshold=0.15, tol=0.05
         pred_dist[j, i] = clamped
     return pred_dist
 
-def enforce_triangle_inequality(D):
+def enforce_triangle_inequality(D, fragments=None, tol=0.05):
+    """Repair only genuine metric violations.
+
+    Floyd-Warshall over the full matrix monotonically shrinks distances and, run
+    globally, rewrites well-predicted within-fragment pairs by routing shortcuts
+    through atoms in *other* fragments (whose mutual distances the model never
+    learned). That degrades good predictions. We instead run the relaxation
+    independently inside each fragment block and only commit a tightening when it
+    exceeds `tol` Angstrom, leaving already-consistent distances untouched.
+    """
     D = D.copy()
     n = D.shape[0]
-    for k in range(n):
-        for i in range(n):
-            for j in range(n):
-                if D[i, j] > D[i, k] + D[k, j]:
-                    D[i, j] = D[j, i] = D[i, k] + D[k, j]
+    if fragments is None:
+        fragments = [list(range(n))]
+    for frag in fragments:
+        idx = np.array(frag, dtype=np.int64)
+        if len(idx) < 3:
+            continue
+        sub = D[np.ix_(idx, idx)].copy()
+        m = len(idx)
+        for k in range(m):
+            for i in range(m):
+                for j in range(m):
+                    shortcut = sub[i, k] + sub[k, j]
+                    if sub[i, j] - shortcut > tol:
+                        sub[i, j] = sub[j, i] = shortcut
+        D[np.ix_(idx, idx)] = sub
     return D
 
 def validate_ts_geometry(pred_dist, D_R, D_P, atom_types, n, spectator_threshold=0.15):
     issues = []
     for i in range(n):
         for j in range(i + 1, n):
-            r_i = COVALENT_RADII[atom_types[i]]
-            r_j = COVALENT_RADII[atom_types[j]]
-            min_d = 0.85 * (r_i + r_j)
+            r_i = covalent_radius(atom_types[i])
+            r_j = covalent_radius(atom_types[j])
+            min_d = STERIC_FLOOR_FRAC * (r_i + r_j)
             if pred_dist[i, j] < min_d:
                 issues.append(f"  STERIC   {atom_types[i]}{i}-{atom_types[j]}{j}: {pred_dist[i,j]:.3f} Å < floor {min_d:.3f} Å")
     active, _ = classify_bonds(D_R, D_P, n, spectator_threshold)
@@ -309,16 +448,20 @@ class ReactionDataset(Dataset):
                 e_r = r_e["energy"] * config["hartree_to_kcal"]
                 e_p = p_e["energy"] * config["hartree_to_kcal"]
                 de_rxn = abs(e_r - e_p)
-                c_R_aligned_init = kabsch_align_reactant(c_R, c_P, n)
+                atom_types = [a["atom"] for a in ts_e["atoms"]]
+                c_R_aligned_init = kabsch_align_reactant_fragments(
+                    c_R, c_P, atom_types, n, config.get("fragment_bond_scale", 1.45)
+                )
                 diff = c_R_aligned_init[:n] - c_P[:n]
                 diff_norms = np.linalg.norm(diff, axis=1)
                 energy_feats = np.array([
                     de_rxn, diff_norms.mean(), diff_norms.std(), diff_norms.max(), float(n),
                 ], dtype=np.float32)
-                self.atom_types_map[rxn_id] = [a["atom"] for a in ts_e["atoms"]]
+                self.atom_types_map[rxn_id] = atom_types
                 self.samples.append({
                     "rxn_id": rxn_id, "n_atoms": n,
                     "c_R": c_R, "c_P": c_P, "c_TS": c_TS,
+                    "atom_types": atom_types,
                     "atom_ids": torch.from_numpy(atom_ids),
                     "mask": torch.from_numpy(mask),
                     "Ea_raw": ea,
@@ -358,13 +501,17 @@ class ReactionDataset(Dataset):
             c_R[:n] += noise_R
             c_P[:n] += noise_P
         n = s["n_atoms"]
-        c_R_aligned = kabsch_align_reactant(c_R, c_P, n)
-        c_I = np.zeros_like(c_R)
-        c_I[:n] = (c_R_aligned[:n] + c_P[:n]) / 2.0
+        c_R_aligned = kabsch_align_reactant_fragments(
+            c_R, c_P, s["atom_types"], n, self.config.get("fragment_bond_scale", 1.45)
+        )
         D_R = compute_distance_matrix(c_R)
         D_P = compute_distance_matrix(c_P)
-        D_I = compute_distance_matrix(c_I)
+        D_I = (D_R + D_P) / 2.0
         D_TS = compute_distance_matrix(c_TS)
+        ts_fragments = find_fragments_from_coords(
+            c_TS, s["atom_types"], n, self.config.get("fragment_bond_scale", 1.45)
+        )
+        geom_mask = geometry_pair_mask_from_fragments(ts_fragments, self.config["max_atoms"])
         return {
             "rxn_id": s["rxn_id"],
             "n_atoms": s["n_atoms"],
@@ -373,6 +520,7 @@ class ReactionDataset(Dataset):
             "D_P": torch.from_numpy(D_P),
             "D_TS": torch.from_numpy(D_TS),
             "mask": s["mask"],
+            "geom_mask": torch.from_numpy(geom_mask),
             "Ea": s["Ea"],
             "atom_ids": s["atom_ids"],
             "energy_feats": s["energy_feats"],
@@ -467,8 +615,9 @@ class PSICore(nn.Module):
         return self.final_norm(x)
 
 class GeometryHead(nn.Module):
-    def __init__(self, d_model, atom_embed_dim, dropout=0.25):
+    def __init__(self, d_model, atom_embed_dim, dropout=0.25, delta_clamp=3.0):
         super().__init__()
+        self.delta_clamp = delta_clamp
         pair_dim = d_model * 2 + atom_embed_dim * 2 + 3
         self.net = nn.Sequential(
             nn.Linear(pair_dim, 256),
@@ -477,8 +626,9 @@ class GeometryHead(nn.Module):
             nn.Linear(256, 128),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(128, 1),
+            nn.Linear(128, 2),
         )
+        # Initialize: alpha_logit=0 → sigmoid=0.5 (starts at midpoint), delta=0
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
@@ -491,15 +641,18 @@ class GeometryHead(nn.Module):
         aj = atom_emb.unsqueeze(1).expand(B, N, N, atom_dim)
         pair_dist = torch.stack([D_R, D_I, D_P], dim=-1)
         pair = torch.cat([fi, fj, ai, aj, pair_dist], dim=-1)
-        delta = self.net(pair).squeeze(-1)
-        D_TS_pred = torch.clamp(D_I + delta, min=0.0)
+        out = self.net(pair)
+        alpha = torch.sigmoid(out[..., 0])
+        delta = torch.clamp(out[..., 1], min=-self.delta_clamp, max=self.delta_clamp)
+        D_base = alpha * D_R + (1.0 - alpha) * D_P
+        D_TS_pred = torch.clamp(D_base + delta, min=0.0)
         D_TS_pred = (D_TS_pred + D_TS_pred.transpose(1, 2)) / 2.0
         eye = torch.eye(N, device=D_TS_pred.device, dtype=D_TS_pred.dtype).unsqueeze(0)
         valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         return D_TS_pred * (1.0 - eye) * valid
 
 class EnergyHead(nn.Module):
-    def __init__(self, d_model, n_energy_feats=5, dropout=0.25):
+    def __init__(self, d_model, n_energy_feats=5, dropout=0.45):
         super().__init__()
         self.ln = nn.LayerNorm(d_model)
         self.attn_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
@@ -507,16 +660,17 @@ class EnergyHead(nn.Module):
         self.attn_proj_v = nn.Linear(d_model, d_model)
         self.attn_scale = d_model ** 0.5
         self.attn_drop = nn.Dropout(dropout)
+        self.feature_drop = nn.Dropout(dropout)
         self.efeat_proj = nn.Sequential(
             nn.Linear(n_energy_feats, 32),
             nn.GELU(),
             nn.Dropout(dropout),
         )
         self.net = nn.Sequential(
-            nn.Linear(d_model + 32, 64),
+            nn.Linear(d_model + 32, 32),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 1),
+            nn.Linear(32, 1),
         )
 
     def forward(self, features, mask, energy_feats):
@@ -530,6 +684,7 @@ class EnergyHead(nn.Module):
         scores = scores.masked_fill(pad_mask, float('-inf'))
         attn_weights = self.attn_drop(F.softmax(scores, dim=-1))
         pooled = torch.bmm(attn_weights, V).squeeze(1)
+        pooled = self.feature_drop(pooled)
         efeat = self.efeat_proj(energy_feats)
         combined = torch.cat([pooled, efeat], dim=-1)
         return self.net(combined).squeeze(-1)
@@ -540,9 +695,11 @@ class PSI(nn.Module):
         d_model = config["gru_hidden"] * 2
         atom_dim = config["atom_embed_dim"]
         drop = config["dropout"]
+        energy_drop = config.get("energy_dropout", 0.45)
+        delta_clamp = config.get("delta_clamp", 2.0)
         self.core = PSICore(config, num_atom_types)
-        self.geom_head = GeometryHead(d_model, atom_dim, drop)
-        self.ener_head = EnergyHead(d_model, n_energy_feats, drop)
+        self.geom_head = GeometryHead(d_model, atom_dim, drop, delta_clamp)
+        self.ener_head = EnergyHead(d_model, n_energy_feats, energy_drop)
 
     def forward(self, D_R, D_I, D_P, mask, atom_ids, energy_feats):
         f = self.core(D_R, D_I, D_P, mask, atom_ids)
@@ -586,12 +743,15 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
         for batch in loader:
-            DR, DI, DP, DTS, mask, true_ea, atom_ids, energy_feats = move_batch_to_device(batch, device)
+            DR, DI, DP, DTS, mask, geom_mask, true_ea, atom_ids, energy_feats = move_batch_to_device(batch, device)
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 p_DTS, p_ea = model(DR, DI, DP, mask, atom_ids, energy_feats)
-                m2d = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+                B, N, _ = DR.shape
+                valid_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+                eye = torch.eye(N, device=mask.device, dtype=mask.dtype).unsqueeze(0)
+                m2d = valid_mask * (1.0 - eye)
                 l_geom = F.huber_loss(p_DTS * m2d, DTS * m2d, reduction='sum', delta=0.5) / m2d.sum().clamp(min=1)
                 l_ener = F.mse_loss(p_ea, true_ea)
                 loss = l_geom + energy_w * l_ener
@@ -646,7 +806,12 @@ def train_pipeline(config):
     model = PSI(config, num_atom_types, n_energy_feats).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
+    core_params = list(model.core.parameters()) + list(model.geom_head.parameters())
+    energy_params = list(model.ener_head.parameters())
+    optimizer = torch.optim.AdamW([
+        {"params": core_params, "lr": config["lr"], "weight_decay": config["weight_decay"]},
+        {"params": energy_params, "lr": config["lr"], "weight_decay": config.get("energy_weight_decay", 1e-2)},
+    ])
     scheduler = CosineAnnealingWarmup(optimizer, warmup_epochs=config["warmup_epochs"], total_epochs=config["epochs"])
     use_amp = config["amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -708,9 +873,10 @@ def train_pipeline(config):
     results = []
     ea_mean = dataset.ea_mean
     ea_std = dataset.ea_std
+    val_rxn_ids = {dataset.samples[vi]["rxn_id"] for vi in val_indices}
     with torch.no_grad():
         for batch in eval_loader:
-            DR, DI, DP, DTS, mask, true_ea_norm, atom_ids, energy_feats = move_batch_to_device(batch, device)
+            DR, DI, DP, DTS, mask, geom_mask, true_ea_norm, atom_ids, energy_feats = move_batch_to_device(batch, device)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 p_DTS, p_ea_norm = model(DR, DI, DP, mask, atom_ids, energy_feats)
             true_ea_real = true_ea_norm * ea_std + ea_mean
@@ -721,19 +887,24 @@ def train_pipeline(config):
                 di = DI[i, :n, :n].cpu().numpy()
                 dp = p_DTS[i, :n, :n].cpu().numpy()
                 dt = DTS[i, :n, :n].cpu().numpy()
-                d_mae = np.abs(dp - dt).mean().item()
+                gm = geom_mask[i, :n, :n].cpu().numpy()
+                d_abs = np.abs(dp - dt)
+                d_mae = (d_abs * gm).sum().item() / max(float(gm.sum()), 1.0)
+                d_mae_all = d_abs.mean().item()
                 ea_true = true_ea_real[i].item()
                 ea_pred = p_ea_real[i].item()
                 e_err = abs(ea_pred - ea_true)
-                split = "val" if batch["rxn_id"][i] in [dataset.samples[vi]["rxn_id"] for vi in val_indices] else "train"
+                split = "val" if batch["rxn_id"][i] in val_rxn_ids else "train"
                 atom_types = dataset.atom_types_map.get(rxn_id, [])
                 results.append({
                     "rxn_id": rxn_id,
                     "split": split,
                     "Ea_true": ea_true, "Ea_pred": ea_pred,
                     "Ea_error": e_err, "dist_MAE": d_mae,
+                    "dist_MAE_all": d_mae_all,
                     "n_atoms": n,
                     "atom_types": atom_types,
+                    "geom_mask": gm.tolist(),
                     "D_I": di.tolist(), "D_pred": dp.tolist(), "D_true": dt.tolist()
                 })
     train_results = [r for r in results if r["split"] == "train"]
@@ -793,13 +964,19 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     c_R = padded_coords(r_atoms, config["max_atoms"])
     c_P = padded_coords(p_atoms, config["max_atoms"])
     
-    c_R_aligned = kabsch_align_reactant(c_R, c_P, n)
+    c_R_aligned = kabsch_align_reactant_fragments(
+        c_R, c_P, r_types, n, config.get("fragment_bond_scale", 1.45)
+    )
     c_I = np.zeros_like(c_R)
     c_I[:n] = (c_R_aligned[:n] + c_P[:n]) / 2.0
     
     D_R = compute_distance_matrix(c_R)
     D_P = compute_distance_matrix(c_P)
-    D_I = compute_distance_matrix(c_I)
+    D_I = (D_R + D_P) / 2.0
+    align_fragments = choose_alignment_fragments(
+        c_R, c_P, r_types, n, config.get("fragment_bond_scale", 1.45)
+    )
+    geom_mask = geometry_pair_mask_from_fragments(align_fragments, config["max_atoms"])
     
     mask = np.zeros(config["max_atoms"], dtype=np.float32)
     mask[:n] = 1.0
@@ -836,13 +1013,22 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         D_R[:n, :n], D_P[:n, :n], n,
         threshold=config["spectator_threshold"],
         tol=config["spectator_tol"],
+        pair_mask=geom_mask[:n, :n],
     )
-    pred_dist = enforce_triangle_inequality(pred_dist)
+    pred_dist = enforce_triangle_inequality(
+        pred_dist, fragments=[f for f in align_fragments if max(f) < n]
+    )
     validate_ts_geometry(
         pred_dist, D_R[:n, :n], D_P[:n, :n], r_types[:n], n,
         spectator_threshold=config.get("spectator_threshold", 0.15),
     )
-    pred_coords = kabsch(mds(pred_dist), c_I_real)
+    pred_coords = mds_by_fragments(
+        pred_dist,
+        atom_types=r_types[:n],
+        fragments=align_fragments,
+        reference_coords=c_I_real,
+        bond_scale=config.get("fragment_bond_scale", 1.45),
+    )
     energy_pred = float(p_ea_norm.item()) * ea_std + ea_mean
     result = {
         "reactant_path": reactant_path,
@@ -853,6 +1039,7 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         "Ea_pred": energy_pred,
         "D_I": D_I[:n, :n].tolist(),
         "D_pred": pred_dist.tolist(),
+        "geom_mask": geom_mask[:n, :n].tolist(),
         "coords_pred": pred_coords.tolist(),
     }
     with open(output_path, "w", encoding="utf-8") as f:

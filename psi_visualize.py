@@ -10,8 +10,20 @@ def mds(D, dim=3):
     idx = np.argsort(evals)[::-1]
     evals = evals[idx]
     evecs = evecs[:, idx]
-    X = evecs[:, :dim] @ np.diag(np.sqrt(np.maximum(evals[:dim], 0)))
+    n_dims = min(dim, N)
+    X = evecs[:, :n_dims] @ np.diag(np.sqrt(np.maximum(evals[:n_dims], 0)))
+    if n_dims < dim:
+        X = np.pad(X, ((0, 0), (0, dim - n_dims)))
     return X
+
+RADIUS = {
+    'H': 0.31, 'C': 0.76, 'N': 0.71, 'O': 0.66, 'F': 0.57,
+    'S': 1.05, 'Cl': 1.02, 'Br': 1.20, 'I': 1.39, 'P': 1.07,
+    'Si': 1.11, 'B': 0.84,
+}
+
+def covalent_radius(atom_type):
+    return RADIUS.get(atom_type, 0.76)
 
 def kabsch(P, Q):
     P_centered = P - P.mean(axis=0); Q_centered = Q - Q.mean(axis=0)
@@ -25,16 +37,93 @@ def kabsch(P, Q):
     R = V @ W
     return P_centered @ R + Q.mean(axis=0)
 
-def get_bonds(coords, atom_types):
+def connected_components(adjacency):
+    seen = set()
+    fragments = []
+    for start in range(len(adjacency)):
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        frag = []
+        while stack:
+            node = stack.pop()
+            frag.append(node)
+            for nbr in adjacency[node]:
+                if nbr not in seen:
+                    seen.add(nbr)
+                    stack.append(nbr)
+        fragments.append(sorted(frag))
+    return sorted(fragments, key=lambda frag: (frag[0], len(frag)))
+
+def fragments_from_distances(D, atom_types, bond_scale=1.45):
+    n = len(atom_types)
+    adjacency = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
+            if D[i, j] <= cutoff:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+    return connected_components(adjacency)
+
+def fragments_from_mask(mask):
+    mask = np.array(mask)
+    n = mask.shape[0]
+    adjacency = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mask[i, j] > 0:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+    return connected_components(adjacency)
+
+def mds_by_fragments(D, atom_types, fragments=None, reference_coords=None):
+    if fragments is None:
+        fragments = fragments_from_distances(D, atom_types)
+    X = np.zeros((D.shape[0], 3), dtype=np.float64)
+    cursor = 0.0
+    for frag in fragments:
+        idx = np.array(frag, dtype=np.int64)
+        if len(idx) >= 2:
+            frag_coords = mds(D[np.ix_(idx, idx)])
+        else:
+            frag_coords = np.zeros((1, 3), dtype=np.float64)
+        if reference_coords is not None:
+            ref = reference_coords[idx]
+            frag_coords = kabsch(frag_coords, ref) if len(idx) >= 2 else ref.copy()
+        else:
+            frag_coords = frag_coords - frag_coords.mean(axis=0)
+            span = np.ptp(frag_coords[:, 0]) if len(idx) > 1 else 0.0
+            frag_coords[:, 0] += cursor - frag_coords[:, 0].min()
+            cursor += max(span, 1.5) + 3.0
+        X[idx] = frag_coords
+    return X
+
+def masked_mae(A, B, mask=None):
+    diff = np.abs(np.array(A) - np.array(B))
+    if mask is None:
+        return float(diff.mean())
+    mask = np.array(mask, dtype=np.float64)
+    return float((diff * mask).sum() / max(mask.sum(), 1.0))
+
+def get_bonds_from_distances(D, atom_types, fragments=None, bond_scale=1.45):
     bonds = []
-    n = len(coords)
-    radii = {'H': 0.31, 'C': 0.76, 'N': 0.71, 'O': 0.66, 'F': 0.57, 'S': 1.05, 'Cl': 1.02, 'P': 1.07}
+    n = len(atom_types)
+    allowed = np.zeros((n, n), dtype=bool)
+    if fragments is None:
+        allowed[:, :] = True
+    else:
+        for frag in fragments:
+            idx = np.array(frag, dtype=np.int64)
+            allowed[np.ix_(idx, idx)] = True
     for i in range(n):
         for j in range(i+1, n):
-            r_i = radii[atom_types[i]]
-            r_j = radii[atom_types[j]]
-            dist = np.linalg.norm(coords[i] - coords[j])
-            if dist < 1.45 * (r_i + r_j):
+            if not allowed[i, j]:
+                continue
+            r_i = covalent_radius(atom_types[i])
+            r_j = covalent_radius(atom_types[j])
+            if D[i, j] < bond_scale * (r_i + r_j):
                 bonds.append((i, j))
     return bonds
 
@@ -57,7 +146,7 @@ def create_dashboard(data_path, save_dir):
     for r in data:
         di = np.array(r["D_I"])
         dt = np.array(r["D_true"])
-        guess_maes.append(np.mean(np.abs(di - dt)))
+        guess_maes.append(masked_mae(di, dt, r.get("geom_mask")))
     guess_maes = np.array(guess_maes)
 
     ea_corr = np.corrcoef(ea_trues, ea_preds)[0, 1] if len(ea_trues) > 1 else 0.0
@@ -89,10 +178,17 @@ def create_dashboard(data_path, save_dir):
         dp = np.array(r["D_pred"])
         di = np.array(r["D_I"])
         atoms = r["atom_types"]
+        fragments = fragments_from_mask(r["geom_mask"]) if "geom_mask" in r else fragments_from_distances(dt, atoms)
 
+        # The true TS distance matrix is globally metric, so a single MDS reproduces
+        # it faithfully. Using per-fragment MDS here would scatter forming/breaking-bond
+        # fragments along an arbitrary cursor axis and "explode" the real structure.
         X_true = mds(dt)
-        X_pred = kabsch(mds(dp), X_true)
-        X_guess = kabsch(mds(di), X_true)
+        # The model is only supervised on within-fragment (geom_mask) pairs, so the
+        # predicted/interpolated inter-fragment distances are untrained. Rebuild each
+        # fragment rigidly from its own block, then Kabsch-align it onto the true frame.
+        X_pred = mds_by_fragments(dp, atoms, fragments=fragments, reference_coords=X_true)
+        X_guess = mds_by_fragments(di, atoms, fragments=fragments, reference_coords=X_true)
 
         representative_data[rid] = {
             "rxn_id": rid,
@@ -100,9 +196,9 @@ def create_dashboard(data_path, save_dir):
             "coords_true": X_true.tolist(),
             "coords_pred": X_pred.tolist(),
             "coords_guess": X_guess.tolist(),
-            "bonds_true": get_bonds(X_true, atoms),
-            "bonds_pred": get_bonds(X_pred, atoms),
-            "bonds_guess": get_bonds(X_guess, atoms),
+            "bonds_true": get_bonds_from_distances(dt, atoms, fragments=fragments),
+            "bonds_pred": get_bonds_from_distances(dp, atoms, fragments=fragments),
+            "bonds_guess": get_bonds_from_distances(di, atoms, fragments=fragments),
             "dist_MAE": r["dist_MAE"],
             "Ea_error": r["Ea_error"],
             "tier": "Best" if r in best_5 else "Median" if r in median_5 else "Worst"
@@ -117,7 +213,7 @@ def create_dashboard(data_path, save_dir):
             "Ea_pred": round(r["Ea_pred"], 2),
             "Ea_error": round(r["Ea_error"], 2),
             "dist_MAE": round(r["dist_MAE"], 4),
-            "guess_MAE": round(np.mean(np.abs(np.array(r["D_I"]) - np.array(r["D_true"]))), 4),
+            "guess_MAE": round(masked_mae(r["D_I"], r["D_true"], r.get("geom_mask")), 4),
             "n_atoms": r["n_atoms"]
         })
 
