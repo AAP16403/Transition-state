@@ -114,7 +114,7 @@ def parse_log_content(file_content):
     return {"energy": energy, "atoms": atoms}
 
 def extract_raw_data(config):
-    if os.path.exists(config["dataset_json"]) and not config.get("force_extract", False):
+    if os.path.exists(config["dataset_json"]) and not config["force_extract"]:
         print(f"Dataset found at {config['dataset_json']}, skipping extraction.")
         return
     print(f"Extracting {config['extraction_limit']} logs from {config['tar_path']}...")
@@ -179,7 +179,9 @@ COVALENT_RADII = {
 }
 
 def covalent_radius(atom_type):
-    return COVALENT_RADII.get(atom_type, 0.76)
+    if atom_type not in COVALENT_RADII:
+        raise KeyError(f"No covalent radius for atom type '{atom_type}'. Add it to COVALENT_RADII.")
+    return COVALENT_RADII[atom_type]
 
 def find_fragments_from_coords(coords, atom_types, n, bond_scale=1.45):
     adjacency = [[] for _ in range(n)]
@@ -440,7 +442,7 @@ class ReactionDataset(Dataset):
                 c_TS = padded_coords(ts_e["atoms"], config["max_atoms"])
                 atom_ids = np.zeros(config["max_atoms"], dtype=np.int64)
                 for i, a in enumerate(ts_e["atoms"]):
-                    atom_ids[i] = self.atom_vocab.get(a["atom"], 0)
+                    atom_ids[i] = self.atom_vocab[a["atom"]]
                 mask = np.zeros(config["max_atoms"], dtype=np.float32)
                 mask[:n] = 1.0
                 ea = (ts_e["energy"] - max(r_e["energy"], p_e["energy"])) * config["hartree_to_kcal"]
@@ -450,7 +452,7 @@ class ReactionDataset(Dataset):
                 de_rxn = abs(e_r - e_p)
                 atom_types = [a["atom"] for a in ts_e["atoms"]]
                 c_R_aligned_init = kabsch_align_reactant_fragments(
-                    c_R, c_P, atom_types, n, config.get("fragment_bond_scale", 1.45)
+                    c_R, c_P, atom_types, n, config["fragment_bond_scale"]
                 )
                 diff = c_R_aligned_init[:n] - c_P[:n]
                 diff_norms = np.linalg.norm(diff, axis=1)
@@ -502,14 +504,14 @@ class ReactionDataset(Dataset):
             c_P[:n] += noise_P
         n = s["n_atoms"]
         c_R_aligned = kabsch_align_reactant_fragments(
-            c_R, c_P, s["atom_types"], n, self.config.get("fragment_bond_scale", 1.45)
+            c_R, c_P, s["atom_types"], n, self.config["fragment_bond_scale"]
         )
         D_R = compute_distance_matrix(c_R)
         D_P = compute_distance_matrix(c_P)
         D_I = (D_R + D_P) / 2.0
         D_TS = compute_distance_matrix(c_TS)
         ts_fragments = find_fragments_from_coords(
-            c_TS, s["atom_types"], n, self.config.get("fragment_bond_scale", 1.45)
+            c_TS, s["atom_types"], n, self.config["fragment_bond_scale"]
         )
         geom_mask = geometry_pair_mask_from_fragments(ts_fragments, self.config["max_atoms"])
         return {
@@ -695,8 +697,8 @@ class PSI(nn.Module):
         d_model = config["gru_hidden"] * 2
         atom_dim = config["atom_embed_dim"]
         drop = config["dropout"]
-        energy_drop = config.get("energy_dropout", 0.45)
-        delta_clamp = config.get("delta_clamp", 2.0)
+        energy_drop = config["energy_dropout"]
+        delta_clamp = config["delta_clamp"]
         self.core = PSICore(config, num_atom_types)
         self.geom_head = GeometryHead(d_model, atom_dim, drop, delta_clamp)
         self.ener_head = EnergyHead(d_model, n_energy_feats, energy_drop)
@@ -810,7 +812,7 @@ def train_pipeline(config):
     energy_params = list(model.ener_head.parameters())
     optimizer = torch.optim.AdamW([
         {"params": core_params, "lr": config["lr"], "weight_decay": config["weight_decay"]},
-        {"params": energy_params, "lr": config["lr"], "weight_decay": config.get("energy_weight_decay", 1e-2)},
+        {"params": energy_params, "lr": config["lr"], "weight_decay": config["energy_weight_decay"]},
     ])
     scheduler = CosineAnnealingWarmup(optimizer, warmup_epochs=config["warmup_epochs"], total_epochs=config["epochs"])
     use_amp = config["amp"] and device.type == "cuda"
@@ -836,18 +838,20 @@ def train_pipeline(config):
         val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, is_train=False)
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
+        val_select = val_metrics["geom"] + config["energy_weight_end"] * val_metrics["ener"]
         history.append({
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
             "val_loss": val_metrics["loss"],
+            "val_select": val_select,
             "train_geom": train_metrics["geom"],
             "val_geom": val_metrics["geom"],
             "train_ener": train_metrics["ener"],
             "val_ener": val_metrics["ener"],
             "lr": current_lr,
         })
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
+        if val_select < best_val_loss:
+            best_val_loss = val_select
             patience_counter = 0
             torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, best_model_path)
         else:
@@ -865,7 +869,7 @@ def train_pipeline(config):
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"\nTraining history saved to {history_path}")
-    print(f"\nLoading best model (val_loss={best_val_loss:.4f})...")
+    print(f"\nLoading best model (val_select={best_val_loss:.4f})...")
     checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     print("\n" + "="*70); print(" EVALUATION RESULTS "); print("="*70)
@@ -895,7 +899,7 @@ def train_pipeline(config):
                 ea_pred = p_ea_real[i].item()
                 e_err = abs(ea_pred - ea_true)
                 split = "val" if batch["rxn_id"][i] in val_rxn_ids else "train"
-                atom_types = dataset.atom_types_map.get(rxn_id, [])
+                atom_types = dataset.atom_types_map[rxn_id]
                 results.append({
                     "rxn_id": rxn_id,
                     "split": split,
@@ -965,7 +969,7 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     c_P = padded_coords(p_atoms, config["max_atoms"])
     
     c_R_aligned = kabsch_align_reactant_fragments(
-        c_R, c_P, r_types, n, config.get("fragment_bond_scale", 1.45)
+        c_R, c_P, r_types, n, config["fragment_bond_scale"]
     )
     c_I = np.zeros_like(c_R)
     c_I[:n] = (c_R_aligned[:n] + c_P[:n]) / 2.0
@@ -974,7 +978,7 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     D_P = compute_distance_matrix(c_P)
     D_I = (D_R + D_P) / 2.0
     align_fragments = choose_alignment_fragments(
-        c_R, c_P, r_types, n, config.get("fragment_bond_scale", 1.45)
+        c_R, c_P, r_types, n, config["fragment_bond_scale"]
     )
     geom_mask = geometry_pair_mask_from_fragments(align_fragments, config["max_atoms"])
     
@@ -982,7 +986,9 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     mask[:n] = 1.0
     atom_ids = np.zeros(config["max_atoms"], dtype=np.int64)
     for i, atom_type in enumerate(r_types):
-        atom_ids[i] = atom_vocab.get(atom_type, 0)
+        if atom_type not in atom_vocab:
+            raise KeyError(f"Atom type '{atom_type}' not in training vocab {sorted(atom_vocab)}.")
+        atom_ids[i] = atom_vocab[atom_type]
     e_r = reactant["energy"] * config["hartree_to_kcal"]
     e_p = product["energy"] * config["hartree_to_kcal"]
     de_rxn = abs(e_r - e_p)
@@ -1020,14 +1026,14 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     )
     validate_ts_geometry(
         pred_dist, D_R[:n, :n], D_P[:n, :n], r_types[:n], n,
-        spectator_threshold=config.get("spectator_threshold", 0.15),
+        spectator_threshold=config["spectator_threshold"],
     )
     pred_coords = mds_by_fragments(
         pred_dist,
         atom_types=r_types[:n],
         fragments=align_fragments,
         reference_coords=c_I_real,
-        bond_scale=config.get("fragment_bond_scale", 1.45),
+        bond_scale=config["fragment_bond_scale"],
     )
     energy_pred = float(p_ea_norm.item()) * ea_std + ea_mean
     result = {
