@@ -1,6 +1,7 @@
 import os
 import json
 import numpy as np
+import argparse
 
 def mds(D, dim=3):
     N = D.shape[0]
@@ -743,3 +744,9 @@ if __name__ == "__main__":
     DATA_PATH = r"d:\Transition state\detailed_analysis.json"
     SAVE_DIR = r"d:\Transition state"
     create_dashboard(DATA_PATH, SAVE_DIR)
+    parser = argparse.ArgumentParser(description="Generate PSI Results Dashboard")
+    parser.add_argument("--data", default="detailed_analysis.json", help="Path to detailed_analysis.json")
+    parser.add_argument("--save-dir", default=".", help="Directory to save the HTML dashboard")
+    args = parser.parse_args()
+    
+    create_dashboard(args.data, args.save_dir)
