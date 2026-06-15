@@ -11,9 +11,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
 CONFIG = {
-    "tar_path": r"d:\Transition state\b97d3.tar.gz",
-    "dataset_json": r"d:\Transition state\extracted_dataset.json",
-    "save_dir": r"d:\Transition state",
     "tar_path": "b97d3.tar.gz",
     "dataset_json": "extracted_dataset.json",
     "save_dir": ".",

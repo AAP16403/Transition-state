@@ -741,9 +741,6 @@ def create_dashboard(data_path, save_dir):
     print(f"Interactive dashboard generated successfully: {output_html}")
 
 if __name__ == "__main__":
-    DATA_PATH = r"d:\Transition state\detailed_analysis.json"
-    SAVE_DIR = r"d:\Transition state"
-    create_dashboard(DATA_PATH, SAVE_DIR)
     parser = argparse.ArgumentParser(description="Generate PSI Results Dashboard")
     parser.add_argument("--data", default="detailed_analysis.json", help="Path to detailed_analysis.json")
     parser.add_argument("--save-dir", default=".", help="Directory to save the HTML dashboard")
