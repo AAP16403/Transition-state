@@ -411,121 +411,148 @@ def build_atom_vocab(raw_data):
     print(f"Atom vocabulary ({len(vocab)} types): {vocab}")
     return vocab
 
+def build_reaction_samples(config):
+    """Parse the dataset JSON once and build raw (un-normalized) samples.
+
+    Targets that don't depend on coordinate augmentation -- the true TS distance
+    matrix and the fragment geometry mask (both derived from the unaugmented
+    TS coords) -- are precomputed here so __getitem__ stays cheap.
+    """
+    with open(config["dataset_json"], "r") as f:
+        raw_data = json.load(f)
+    atom_vocab = build_atom_vocab(raw_data)
+    reactions = {}
+    for entry in raw_data:
+        parts = entry["filename"].split("/")
+        if len(parts) < 3: continue
+        rxn_id = parts[1]
+        prefix = parts[2].lower()
+        role = "r" if prefix.startswith("r") else "p" if prefix.startswith("p") else "ts" if prefix.startswith("ts") else None
+        if not role:
+            raise ValueError(f"Could not classify role for entry: {entry['filename']}")
+        if rxn_id not in reactions: reactions[rxn_id] = {}
+        reactions[rxn_id][role] = entry
+    samples = []
+    atom_types_map = {}
+    for rxn_id, roles in sorted(reactions.items()):
+        if "r" in roles and "p" in roles and "ts" in roles:
+            r_e = roles["r"]; p_e = roles["p"]; ts_e = roles["ts"]
+            n = len(ts_e["atoms"])
+            if n > config["max_atoms"]: continue
+            c_R = padded_coords(r_e["atoms"], config["max_atoms"])
+            c_P = padded_coords(p_e["atoms"], config["max_atoms"])
+            c_TS = padded_coords(ts_e["atoms"], config["max_atoms"])
+            atom_ids = np.zeros(config["max_atoms"], dtype=np.int64)
+            for i, a in enumerate(ts_e["atoms"]):
+                atom_ids[i] = atom_vocab[a["atom"]]
+            mask = np.zeros(config["max_atoms"], dtype=np.float32)
+            mask[:n] = 1.0
+            ea = (ts_e["energy"] - max(r_e["energy"], p_e["energy"])) * config["hartree_to_kcal"]
+            e_r = r_e["energy"] * config["hartree_to_kcal"]
+            e_p = p_e["energy"] * config["hartree_to_kcal"]
+            de_rxn = abs(e_r - e_p)
+            atom_types = [a["atom"] for a in ts_e["atoms"]]
+            c_R_aligned_init = kabsch_align_reactant_fragments(
+                c_R, c_P, atom_types, n, config["fragment_bond_scale"]
+            )
+            diff = c_R_aligned_init[:n] - c_P[:n]
+            diff_norms = np.linalg.norm(diff, axis=1)
+            energy_feats = np.array([
+                de_rxn, diff_norms.mean(), diff_norms.std(), diff_norms.max(), float(n),
+            ], dtype=np.float32)
+            D_TS = compute_distance_matrix(c_TS)
+            ts_fragments = find_fragments_from_coords(
+                c_TS, atom_types, n, config["fragment_bond_scale"]
+            )
+            geom_mask = geometry_pair_mask_from_fragments(ts_fragments, config["max_atoms"])
+            atom_types_map[rxn_id] = atom_types
+            samples.append({
+                "rxn_id": rxn_id, "n_atoms": n,
+                "c_R": c_R, "c_P": c_P,
+                "atom_types": atom_types,
+                "atom_ids": torch.from_numpy(atom_ids),
+                "mask": torch.from_numpy(mask),
+                "Ea_raw": ea,
+                "energy_feats_raw": energy_feats,
+                "D_TS": torch.from_numpy(D_TS),
+                "geom_mask": torch.from_numpy(geom_mask),
+            })
+    print(f"Loaded {len(samples)} complete reaction triplets.")
+    return samples, atom_vocab, atom_types_map
+
+def compute_normalization(samples, indices):
+    """Compute Ea / energy-feature normalization stats over the given indices only.
+
+    Restricting to the training indices keeps validation reactions out of the
+    normalization statistics.
+    """
+    all_ea = np.array([samples[i]["Ea_raw"] for i in indices], dtype=np.float64)
+    ea_mean = float(all_ea.mean())
+    ea_std = float(all_ea.std())
+    if ea_std < 1e-6:
+        ea_std = 1.0
+    all_efeats = np.stack([samples[i]["energy_feats_raw"] for i in indices])
+    efeat_mean = all_efeats.mean(axis=0).astype(np.float32)
+    efeat_std = all_efeats.std(axis=0).astype(np.float32)
+    efeat_std[efeat_std < 1e-6] = 1.0
+    print(f"Ea stats (train split): mean={ea_mean:.2f}, std={ea_std:.2f} kcal/mol")
+    print(f"Ea range (train split): [{all_ea.min():.2f}, {all_ea.max():.2f}] kcal/mol")
+    return {
+        "ea_mean": ea_mean,
+        "ea_std": ea_std,
+        "efeat_mean": efeat_mean,
+        "efeat_std": efeat_std,
+        "n_energy_feats": all_efeats.shape[1],
+    }
+
 class ReactionDataset(Dataset):
-    def __init__(self, config, augment=False):
+    """Thin view over a shared list of prebuilt samples.
+
+    Multiple views (e.g. augmented train vs. clean eval) share the same sample
+    list and normalization stats; only the `augment` flag differs.
+    """
+    def __init__(self, config, samples, atom_vocab, atom_types_map, stats, augment=False):
         self.config = config
+        self.samples = samples
+        self.atom_vocab = atom_vocab
+        self.atom_types_map = atom_types_map
         self.augment = augment
-        with open(config["dataset_json"], "r") as f:
-            raw_data = json.load(f)
-        self.atom_vocab = build_atom_vocab(raw_data)
-        reactions = {}
-        for entry in raw_data:
-            parts = entry["filename"].split("/")
-            if len(parts) < 3: continue
-            rxn_id = parts[1]
-            prefix = parts[2].lower()
-            role = "r" if prefix.startswith("r") else "p" if prefix.startswith("p") else "ts" if prefix.startswith("ts") else None
-            if not role:
-                raise ValueError(f"Could not classify role for entry: {entry['filename']}")
-            if rxn_id not in reactions: reactions[rxn_id] = {}
-            reactions[rxn_id][role] = entry
-        self.samples = []
-        self.atom_types_map = {}
-        all_ea = []
-        for rxn_id, roles in sorted(reactions.items()):
-            if "r" in roles and "p" in roles and "ts" in roles:
-                r_e = roles["r"]; p_e = roles["p"]; ts_e = roles["ts"]
-                n = len(ts_e["atoms"])
-                if n > config["max_atoms"]: continue
-                c_R = padded_coords(r_e["atoms"], config["max_atoms"])
-                c_P = padded_coords(p_e["atoms"], config["max_atoms"])
-                c_TS = padded_coords(ts_e["atoms"], config["max_atoms"])
-                atom_ids = np.zeros(config["max_atoms"], dtype=np.int64)
-                for i, a in enumerate(ts_e["atoms"]):
-                    atom_ids[i] = self.atom_vocab[a["atom"]]
-                mask = np.zeros(config["max_atoms"], dtype=np.float32)
-                mask[:n] = 1.0
-                ea = (ts_e["energy"] - max(r_e["energy"], p_e["energy"])) * config["hartree_to_kcal"]
-                all_ea.append(ea)
-                e_r = r_e["energy"] * config["hartree_to_kcal"]
-                e_p = p_e["energy"] * config["hartree_to_kcal"]
-                de_rxn = abs(e_r - e_p)
-                atom_types = [a["atom"] for a in ts_e["atoms"]]
-                c_R_aligned_init = kabsch_align_reactant_fragments(
-                    c_R, c_P, atom_types, n, config["fragment_bond_scale"]
-                )
-                diff = c_R_aligned_init[:n] - c_P[:n]
-                diff_norms = np.linalg.norm(diff, axis=1)
-                energy_feats = np.array([
-                    de_rxn, diff_norms.mean(), diff_norms.std(), diff_norms.max(), float(n),
-                ], dtype=np.float32)
-                self.atom_types_map[rxn_id] = atom_types
-                self.samples.append({
-                    "rxn_id": rxn_id, "n_atoms": n,
-                    "c_R": c_R, "c_P": c_P, "c_TS": c_TS,
-                    "atom_types": atom_types,
-                    "atom_ids": torch.from_numpy(atom_ids),
-                    "mask": torch.from_numpy(mask),
-                    "Ea_raw": ea,
-                    "energy_feats_raw": energy_feats,
-                    "E_R": r_e["energy"],
-                    "E_P": p_e["energy"],
-                })
-        all_ea = np.array(all_ea)
-        self.ea_mean = float(all_ea.mean())
-        self.ea_std = float(all_ea.std())
-        if self.ea_std < 1e-6:
-            self.ea_std = 1.0
-        all_efeats = np.stack([s["energy_feats_raw"] for s in self.samples])
-        self.efeat_mean = all_efeats.mean(axis=0).astype(np.float32)
-        self.efeat_std = all_efeats.std(axis=0).astype(np.float32)
-        self.efeat_std[self.efeat_std < 1e-6] = 1.0
-        self.n_energy_feats = all_efeats.shape[1]
-        print(f"Loaded {len(self.samples)} complete reaction triplets.")
-        print(f"Ea stats: mean={self.ea_mean:.2f}, std={self.ea_std:.2f} kcal/mol")
-        print(f"Ea range: [{all_ea.min():.2f}, {all_ea.max():.2f}] kcal/mol")
-        for sample in self.samples:
-            sample["Ea"] = torch.tensor((sample["Ea_raw"] - self.ea_mean) / self.ea_std, dtype=torch.float32)
-            sample["energy_feats"] = torch.from_numpy((sample["energy_feats_raw"] - self.efeat_mean) / self.efeat_std)
+        self.ea_mean = stats["ea_mean"]
+        self.ea_std = stats["ea_std"]
+        self.efeat_mean = stats["efeat_mean"]
+        self.efeat_std = stats["efeat_std"]
+        self.n_energy_feats = stats["n_energy_feats"]
 
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
+        n = s["n_atoms"]
         c_R = s["c_R"].copy()
         c_P = s["c_P"].copy()
-        c_TS = s["c_TS"].copy()
         if self.augment:
             noise_std = self.config["coord_noise_std"]
-            n = s["n_atoms"]
-            noise_R = np.random.randn(n, 3).astype(np.float32) * noise_std
-            noise_P = np.random.randn(n, 3).astype(np.float32) * noise_std
-            c_R[:n] += noise_R
-            c_P[:n] += noise_P
-        n = s["n_atoms"]
-        c_R_aligned = kabsch_align_reactant_fragments(
-            c_R, c_P, s["atom_types"], n, self.config["fragment_bond_scale"]
-        )
+            c_R[:n] += np.random.randn(n, 3).astype(np.float32) * noise_std
+            c_P[:n] += np.random.randn(n, 3).astype(np.float32) * noise_std
+        # Distance matrices are rotation/translation invariant, so no alignment
+        # of the coordinates is needed before computing them.
         D_R = compute_distance_matrix(c_R)
         D_P = compute_distance_matrix(c_P)
         D_I = (D_R + D_P) / 2.0
-        D_TS = compute_distance_matrix(c_TS)
-        ts_fragments = find_fragments_from_coords(
-            c_TS, s["atom_types"], n, self.config["fragment_bond_scale"]
-        )
-        geom_mask = geometry_pair_mask_from_fragments(ts_fragments, self.config["max_atoms"])
+        ea_norm = torch.tensor((s["Ea_raw"] - self.ea_mean) / self.ea_std, dtype=torch.float32)
+        efeat_norm = (s["energy_feats_raw"] - self.efeat_mean) / self.efeat_std
         return {
             "rxn_id": s["rxn_id"],
-            "n_atoms": s["n_atoms"],
+            "n_atoms": n,
             "D_R": torch.from_numpy(D_R),
             "D_I": torch.from_numpy(D_I),
             "D_P": torch.from_numpy(D_P),
-            "D_TS": torch.from_numpy(D_TS),
+            "D_TS": s["D_TS"],
             "mask": s["mask"],
-            "geom_mask": torch.from_numpy(geom_mask),
-            "Ea": s["Ea"],
+            "geom_mask": s["geom_mask"],
+            "Ea": ea_norm,
             "atom_ids": s["atom_ids"],
-            "energy_feats": s["energy_feats"],
+            "energy_feats": torch.from_numpy(efeat_norm.astype(np.float32)),
         }
 
 class GaussianEmbedding(nn.Module):
@@ -778,20 +805,22 @@ def train_pipeline(config):
     configure_torch_runtime(device)
     print("="*70); print(" PSI FULL PIPELINE (v2) "); print("="*70)
     extract_raw_data(config)
-    dataset = ReactionDataset(config, augment=True)
-    if len(dataset) == 0:
+    samples, atom_vocab, atom_types_map = build_reaction_samples(config)
+    if len(samples) == 0:
         print("Error: No complete reaction triplets found.")
         return
-    n_total = len(dataset)
+    n_total = len(samples)
     n_val = max(1, int(n_total * config["val_split"]))
     n_train = n_total - n_val
     rng = torch.Generator().manual_seed(config["split_seed"])
     indices = torch.randperm(n_total, generator=rng).tolist()
     train_indices = indices[:n_train]
     val_indices = indices[n_train:]
-    val_dataset = ReactionDataset(config, augment=False)
-    train_subset = Subset(dataset, train_indices)
-    val_subset = Subset(val_dataset, val_indices)
+    stats = compute_normalization(samples, train_indices)
+    train_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, augment=True)
+    eval_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, augment=False)
+    train_subset = Subset(train_dataset, train_indices)
+    val_subset = Subset(eval_dataset, val_indices)
     print(f"\nData split: {n_train} train, {n_val} validation")
     loader_kwargs = {
         "batch_size": config["batch_size"],
@@ -802,9 +831,9 @@ def train_pipeline(config):
         loader_kwargs["persistent_workers"] = True
     train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_subset, shuffle=False, **loader_kwargs)
-    eval_loader = DataLoader(Subset(val_dataset, list(range(n_total))), shuffle=False, **loader_kwargs)
-    num_atom_types = len(dataset.atom_vocab)
-    n_energy_feats = dataset.n_energy_feats
+    eval_loader = DataLoader(Subset(eval_dataset, list(range(n_total))), shuffle=False, **loader_kwargs)
+    num_atom_types = len(atom_vocab)
+    n_energy_feats = stats["n_energy_feats"]
     model = PSI(config, num_atom_types, n_energy_feats).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
@@ -818,11 +847,11 @@ def train_pipeline(config):
     use_amp = config["amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     metadata = {
-        "atom_vocab": dataset.atom_vocab,
-        "ea_mean": dataset.ea_mean,
-        "ea_std": dataset.ea_std,
-        "efeat_mean": dataset.efeat_mean.tolist(),
-        "efeat_std": dataset.efeat_std.tolist(),
+        "atom_vocab": atom_vocab,
+        "ea_mean": stats["ea_mean"],
+        "ea_std": stats["ea_std"],
+        "efeat_mean": stats["efeat_mean"].tolist(),
+        "efeat_std": stats["efeat_std"].tolist(),
         "n_energy_feats": n_energy_feats,
         "config_snapshot": {k: v for k, v in config.items() if isinstance(v, (int, float, str, bool))},
     }
@@ -875,9 +904,9 @@ def train_pipeline(config):
     print("\n" + "="*70); print(" EVALUATION RESULTS "); print("="*70)
     model.eval()
     results = []
-    ea_mean = dataset.ea_mean
-    ea_std = dataset.ea_std
-    val_rxn_ids = {dataset.samples[vi]["rxn_id"] for vi in val_indices}
+    ea_mean = stats["ea_mean"]
+    ea_std = stats["ea_std"]
+    val_rxn_ids = {samples[vi]["rxn_id"] for vi in val_indices}
     with torch.no_grad():
         for batch in eval_loader:
             DR, DI, DP, DTS, mask, geom_mask, true_ea_norm, atom_ids, energy_feats = move_batch_to_device(batch, device)
@@ -899,7 +928,7 @@ def train_pipeline(config):
                 ea_pred = p_ea_real[i].item()
                 e_err = abs(ea_pred - ea_true)
                 split = "val" if batch["rxn_id"][i] in val_rxn_ids else "train"
-                atom_types = dataset.atom_types_map[rxn_id]
+                atom_types = atom_types_map[rxn_id]
                 results.append({
                     "rxn_id": rxn_id,
                     "split": split,
