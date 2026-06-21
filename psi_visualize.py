@@ -3,130 +3,80 @@ import json
 import numpy as np
 import argparse
 
-def mds(D, dim=3):
-    N = D.shape[0]
-    H = np.eye(N) - np.ones((N, N))/N
-    B = -0.5 * H @ (D**2) @ H
-    evals, evecs = np.linalg.eigh(B)
-    idx = np.argsort(evals)[::-1]
-    evals = evals[idx]
-    evecs = evecs[:, idx]
-    n_dims = min(dim, N)
-    X = evecs[:, :n_dims] @ np.diag(np.sqrt(np.maximum(evals[:n_dims], 0)))
-    if n_dims < dim:
-        X = np.pad(X, ((0, 0), (0, dim - n_dims)))
-    return X
+from psi_utils import (
+    mds,
+    covalent_radius,
+    kabsch,
+    connected_components,
+    find_fragments_from_distances as fragments_from_distances,
+    fragments_from_mask,
+    mds_by_fragments,
+    masked_mae,
+    get_bonds_from_distances,
+)
 
-RADIUS = {
-    'H': 0.31, 'C': 0.76, 'N': 0.71, 'O': 0.66, 'F': 0.57,
-    'S': 1.05, 'Cl': 1.02, 'Br': 1.20, 'I': 1.39, 'P': 1.07,
-    'Si': 1.11, 'B': 0.84,
-}
 
-def covalent_radius(atom_type):
-    return RADIUS.get(atom_type, 0.76)
+def _r2(true, pred):
+    """Coefficient of determination R^2 = 1 - SS_res / SS_tot."""
+    true = np.asarray(true, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.float64)
+    if len(true) < 2:
+        return 0.0
+    ss_res = float(np.sum((true - pred) ** 2))
+    ss_tot = float(np.sum((true - true.mean()) ** 2))
+    if ss_tot < 1e-12:
+        return 0.0
+    return 1.0 - ss_res / ss_tot
 
-def kabsch(P, Q):
-    P_centered = P - P.mean(axis=0); Q_centered = Q - Q.mean(axis=0)
-    C = P_centered.T @ Q_centered
-    V, _, W = np.linalg.svd(C)
-    if np.linalg.det(V @ W) < 0.0:
-        P_centered = P_centered.copy()
-        P_centered[:, 2] *= -1.0
-        C = P_centered.T @ Q_centered
-        V, _, W = np.linalg.svd(C)
-    R = V @ W
-    return P_centered @ R + Q.mean(axis=0)
 
-def connected_components(adjacency):
-    seen = set()
-    fragments = []
-    for start in range(len(adjacency)):
-        if start in seen:
-            continue
-        stack = [start]
-        seen.add(start)
-        frag = []
-        while stack:
-            node = stack.pop()
-            frag.append(node)
-            for nbr in adjacency[node]:
-                if nbr not in seen:
-                    seen.add(nbr)
-                    stack.append(nbr)
-        fragments.append(sorted(frag))
-    return sorted(fragments, key=lambda frag: (frag[0], len(frag)))
+def energy_metrics(records):
+    """Regression metrics for the activation-energy prediction over `records`."""
+    if not records:
+        return {"n": 0, "MAE": 0.0, "RMSE": 0.0, "R2": 0.0, "Pearson": 0.0, "MAPE": 0.0}
+    true = np.array([r["Ea_true"] for r in records], dtype=np.float64)
+    pred = np.array([r["Ea_pred"] for r in records], dtype=np.float64)
+    err = pred - true
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    pearson = float(np.corrcoef(true, pred)[0, 1]) if len(true) > 1 else 0.0
+    denom = np.where(np.abs(true) < 1e-6, np.nan, np.abs(true))
+    mape = float(np.nanmean(np.abs(err) / denom) * 100.0)
+    return {"n": len(records), "MAE": mae, "RMSE": rmse, "R2": _r2(true, pred),
+            "Pearson": pearson, "MAPE": mape}
 
-def fragments_from_distances(D, atom_types, bond_scale=1.45):
-    n = len(atom_types)
-    adjacency = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
-            if D[i, j] <= cutoff:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    return connected_components(adjacency)
 
-def fragments_from_mask(mask):
-    mask = np.array(mask)
-    n = mask.shape[0]
-    adjacency = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if mask[i, j] > 0:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    return connected_components(adjacency)
+def geometry_metrics(records):
+    """Distance-prediction metrics, aggregated over all masked atom pairs.
 
-def mds_by_fragments(D, atom_types, fragments=None, reference_coords=None):
-    if fragments is None:
-        fragments = fragments_from_distances(D, atom_types)
-    X = np.zeros((D.shape[0], 3), dtype=np.float64)
-    cursor = 0.0
-    for frag in fragments:
-        idx = np.array(frag, dtype=np.int64)
-        if len(idx) >= 2:
-            frag_coords = mds(D[np.ix_(idx, idx)])
-        else:
-            frag_coords = np.zeros((1, 3), dtype=np.float64)
-        if reference_coords is not None:
-            ref = reference_coords[idx]
-            frag_coords = kabsch(frag_coords, ref) if len(idx) >= 2 else ref.copy()
-        else:
-            frag_coords = frag_coords - frag_coords.mean(axis=0)
-            span = np.ptp(frag_coords[:, 0]) if len(idx) > 1 else 0.0
-            frag_coords[:, 0] += cursor - frag_coords[:, 0].min()
-            cursor += max(span, 1.5) + 3.0
-        X[idx] = frag_coords
-    return X
+    Compares AI-predicted distances (D_pred) against the true TS distances on
+    the geometry-mask pairs, and reports the percentage improvement over the
+    plain reactant/product interpolation guess (D_I).
+    """
+    if not records:
+        return {"n": 0, "MAE": 0.0, "RMSE": 0.0, "R2": 0.0,
+                "guess_MAE": 0.0, "improve_pct": 0.0}
+    true_all, pred_all, guess_all = [], [], []
+    for r in records:
+        dt = np.array(r["D_true"], dtype=np.float64)
+        dp = np.array(r["D_pred"], dtype=np.float64)
+        di = np.array(r["D_I"], dtype=np.float64)
+        mask = np.array(r.get("geom_mask"), dtype=np.float64) if r.get("geom_mask") is not None else np.ones_like(dt)
+        # upper triangle of masked pairs only (matrices are symmetric)
+        iu = np.triu_indices_from(dt, k=1)
+        sel = mask[iu] > 0
+        true_all.append(dt[iu][sel])
+        pred_all.append(dp[iu][sel])
+        guess_all.append(di[iu][sel])
+    true = np.concatenate(true_all)
+    pred = np.concatenate(pred_all)
+    guess = np.concatenate(guess_all)
+    mae = float(np.mean(np.abs(pred - true)))
+    rmse = float(np.sqrt(np.mean((pred - true) ** 2)))
+    guess_mae = float(np.mean(np.abs(guess - true)))
+    improve = (1.0 - mae / guess_mae) * 100.0 if guess_mae > 1e-9 else 0.0
+    return {"n": int(true.size), "MAE": mae, "RMSE": rmse, "R2": _r2(true, pred),
+            "guess_MAE": guess_mae, "improve_pct": improve}
 
-def masked_mae(A, B, mask=None):
-    diff = np.abs(np.array(A) - np.array(B))
-    if mask is None:
-        return float(diff.mean())
-    mask = np.array(mask, dtype=np.float64)
-    return float((diff * mask).sum() / max(mask.sum(), 1.0))
-
-def get_bonds_from_distances(D, atom_types, fragments=None, bond_scale=1.45):
-    bonds = []
-    n = len(atom_types)
-    allowed = np.zeros((n, n), dtype=bool)
-    if fragments is None:
-        allowed[:, :] = True
-    else:
-        for frag in fragments:
-            idx = np.array(frag, dtype=np.int64)
-            allowed[np.ix_(idx, idx)] = True
-    for i in range(n):
-        for j in range(i+1, n):
-            if not allowed[i, j]:
-                continue
-            r_i = covalent_radius(atom_types[i])
-            r_j = covalent_radius(atom_types[j])
-            if D[i, j] < bond_scale * (r_i + r_j):
-                bonds.append((i, j))
-    return bonds
 
 def create_dashboard(data_path, save_dir):
     if not os.path.exists(data_path):
@@ -162,6 +112,40 @@ def create_dashboard(data_path, save_dir):
 
     train_corr = np.corrcoef([r["Ea_true"] for r in train_data], [r["Ea_pred"] for r in train_data])[0, 1] if len(train_data) > 1 else 0.0
     val_corr = np.corrcoef([r["Ea_true"] for r in val_data], [r["Ea_pred"] for r in val_data])[0, 1] if len(val_data) > 1 else 0.0
+
+    # Full regression metric breakdown (Train / Val / All) for both heads.
+    ea_metrics = {"Train": energy_metrics(train_data), "Val": energy_metrics(val_data), "All": energy_metrics(data)}
+    geom_metrics = {"Train": geometry_metrics(train_data), "Val": geometry_metrics(val_data), "All": geometry_metrics(data)}
+
+    def _metric_rows(metric_map, fields):
+        # fields: list of (label, key, formatter)
+        rows = ""
+        for label, key, fmt in fields:
+            cells = "".join(f"<td>{fmt(metric_map[s][key])}</td>" for s in ("Train", "Val", "All"))
+            rows += f"<tr><td style='color:#94a3b8;'>{label}</td>{cells}</tr>"
+        return rows
+
+    f2 = lambda v: f"{v:.2f}"
+    f3 = lambda v: f"{v:.3f}"
+    f4 = lambda v: f"{v:.4f}"
+    fpct = lambda v: f"{v:.1f}%"
+
+    energy_metric_rows = _metric_rows(ea_metrics, [
+        ("R²", "R2", f3),
+        ("Pearson R", "Pearson", f3),
+        ("MAE (kcal/mol)", "MAE", f2),
+        ("RMSE (kcal/mol)", "RMSE", f2),
+        ("MAPE", "MAPE", fpct),
+        ("Count", "n", lambda v: str(int(v))),
+    ])
+    geometry_metric_rows = _metric_rows(geom_metrics, [
+        ("R²", "R2", f3),
+        ("MAE (Å)", "MAE", f4),
+        ("RMSE (Å)", "RMSE", f4),
+        ("Guess MAE (Å)", "guess_MAE", f4),
+        ("Improvement vs Guess", "improve_pct", fpct),
+        ("Pairs", "n", lambda v: str(int(v))),
+    ])
 
     sorted_by_geom = sorted(data, key=lambda x: x["dist_MAE"])
     n_rxns = len(sorted_by_geom)
@@ -201,6 +185,8 @@ def create_dashboard(data_path, save_dir):
             "bonds_pred": get_bonds_from_distances(dp, atoms, fragments=fragments),
             "bonds_guess": get_bonds_from_distances(di, atoms, fragments=fragments),
             "dist_MAE": r["dist_MAE"],
+            "Ea_true": r["Ea_true"],
+            "Ea_pred": r["Ea_pred"],
             "Ea_error": r["Ea_error"],
             "tier": "Best" if r in best_5 else "Median" if r in median_5 else "Worst"
         }
@@ -226,6 +212,7 @@ def create_dashboard(data_path, save_dir):
   <meta charset="UTF-8">
   <title>PSI Transition State Prediction Dashboard</title>
   <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/3dmol@2.4.2/build/3Dmol-min.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
   <style>
     body {{
@@ -442,6 +429,25 @@ def create_dashboard(data_path, save_dir):
     .badge-tier.Best {{ background: rgba(16, 185, 129, 0.15); color: #34d399; }}
     .badge-tier.Median {{ background: rgba(245, 158, 11, 0.15); color: #fbbf24; }}
     .badge-tier.Worst {{ background: rgba(239, 68, 68, 0.15); color: #f87171; }}
+    .metrics-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }}
+    table.metrics-table {{ width: 100%; border-collapse: collapse; }}
+    table.metrics-table th, table.metrics-table td {{
+      padding: 0.55rem 0.85rem;
+      text-align: right;
+      font-size: 0.9rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }}
+    table.metrics-table th:first-child, table.metrics-table td:first-child {{ text-align: left; }}
+    table.metrics-table thead th {{
+      color: #94a3b8; text-transform: uppercase; font-size: 0.78rem; letter-spacing: 0.05em;
+    }}
+    table.metrics-table td {{ color: #ffffff; font-weight: 600; }}
+    table.metrics-table th.col-val {{ color: #a78bfa; }}
   </style>
 </head>
 <body>
@@ -472,6 +478,31 @@ def create_dashboard(data_path, save_dir):
       <div class="card stat-card geom">
         <div class="stat-label">Avg Distance MAE</div>
         <div class="stat-val">{np.mean(dist_maes):.4f} <span style="font-size: 1rem; font-weight: normal; color: #94a3b8;">Å</span></div>
+      </div>
+    </div>
+
+    <div class="metrics-grid">
+      <div class="card">
+        <div class="chart-title">Energy (Ea) Regression Metrics</div>
+        <table class="metrics-table">
+          <thead>
+            <tr><th>Metric</th><th>Train</th><th class="col-val">Val</th><th>All</th></tr>
+          </thead>
+          <tbody>
+            {energy_metric_rows}
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="chart-title">Geometry (Distance) Metrics</div>
+        <table class="metrics-table">
+          <thead>
+            <tr><th>Metric</th><th>Train</th><th class="col-val">Val</th><th>All</th></tr>
+          </thead>
+          <tbody>
+            {geometry_metric_rows}
+          </tbody>
+        </table>
       </div>
     </div>
 
@@ -515,6 +546,14 @@ def create_dashboard(data_path, save_dir):
           <div class="info-row">
             <span class="info-label">Distance MAE (AI)</span>
             <span class="info-val" id="case-dist-mae">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Ea True</span>
+            <span class="info-val" id="case-ea-true">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Ea Predicted</span>
+            <span class="info-val" id="case-ea-pred" style="color: #60a5fa;">-</span>
           </div>
           <div class="info-row">
             <span class="info-label">Ea Error</span>
@@ -642,6 +681,16 @@ def create_dashboard(data_path, save_dir):
       select.appendChild(opt);
     }}
 
+    // Initialize 3Dmol viewer (guard against the CDN failing to load)
+    let viewer = null;
+    if (typeof $3Dmol === 'undefined') {{
+      document.getElementById('mol-viewer').innerHTML =
+        '<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#f87171;text-align:center;padding:1rem;">' +
+        '3Dmol.js failed to load (check network / CDN). 3D structures cannot be displayed.</div>';
+    }} else {{
+      viewer = $3Dmol.createViewer("mol-viewer", {{ backgroundColor: "#0c101b" }});
+    }}
+
     function updateViewer() {{
       const rid = select.value;
       const r = repData[rid];
@@ -649,66 +698,59 @@ def create_dashboard(data_path, save_dir):
       document.getElementById('case-id').innerText = r.rxn_id;
       document.getElementById('case-atoms').innerText = r.atom_types.length;
       document.getElementById('case-dist-mae').innerText = r.dist_MAE.toFixed(4) + ' Å';
+      document.getElementById('case-ea-true').innerText = r.Ea_true.toFixed(2) + ' kcal/mol';
+      document.getElementById('case-ea-pred').innerText = r.Ea_pred.toFixed(2) + ' kcal/mol';
       document.getElementById('case-ea-error').innerText = r.Ea_error.toFixed(2) + ' kcal/mol';
       
       const tierBadge = document.getElementById('case-tier');
       tierBadge.className = `badge badge-tier ${{r.tier}}`;
       tierBadge.innerText = r.tier;
 
-      const traces = [];
+      if (!viewer) return;
+      viewer.clear();
 
-      function addStructure(coords, bonds, color, name, size, opacity) {{
-        traces.push({{
-          x: coords.map(c => c[0]),
-          y: coords.map(c => c[1]),
-          z: coords.map(c => c[2]),
-          mode: 'markers+text',
-          type: 'scatter3d',
-          name: name,
-          text: r.atom_types,
-          textposition: 'top center',
-          marker: {{ size: size, color: color, opacity: opacity }},
-          hoverinfo: 'name+text'
-        }});
-
-        let bx = [], by = [], bz = [];
-        for (let b of bonds) {{
-          bx.push(coords[b[0]][0], coords[b[1]][0], null);
-          by.push(coords[b[0]][1], coords[b[1]][1], null);
-          bz.push(coords[b[0]][2], coords[b[1]][2], null);
+      function makeXYZString(atomTypes, coords) {{
+        let lines = [atomTypes.length, "PSI TS Prediction"];
+        for (let i = 0; i < atomTypes.length; i++) {{
+          lines.push(`${{atomTypes[i]}} ${{coords[i][0]}} ${{coords[i][1]}} ${{coords[i][2]}}`);
         }}
-        traces.push({{
-          x: bx, y: by, z: bz,
-          mode: 'lines',
-          type: 'scatter3d',
-          line: {{ color: color, width: 2.5, opacity: opacity * 0.7 }},
-          showlegend: false,
-          hoverinfo: 'skip'
-        }});
+        return lines.join("\\n");
       }}
 
-      addStructure(r.coords_true, r.bonds_true, '#10b981', 'Ground Truth TS', 7, 0.95);
-      addStructure(r.coords_pred, r.bonds_pred, '#3b82f6', 'AI Predicted TS', 5.5, 0.85);
-      addStructure(r.coords_guess, r.bonds_guess, '#ef4444', 'Interpolated Guess', 3.5, 0.35);
+      const mTrue = viewer.addModel(makeXYZString(r.atom_types, r.coords_true), "xyz");
+      viewer.setStyle({{model: mTrue.getID()}}, {{
+        stick: {{color: '#10b981', radius: 0.12}},
+        sphere: {{color: '#10b981', radius: 0.3}}
+      }});
 
-      const viewerLayout = {{
-        paper_bgcolor: 'transparent',
-        margin: {{ l: 0, r: 0, t: 0, b: 0 }},
-        scene: {{
-          xaxis: {{ visible: false }},
-          yaxis: {{ visible: false }},
-          zaxis: {{ visible: false }},
-          camera: {{ eye: {{ x: 1.25, y: 1.25, z: 1.25 }} }}
-        }},
-        legend: {{
-          x: 0, y: 1,
-          font: {{ color: '#cbd5e1' }},
-          bgcolor: 'rgba(0,0,0,0.5)'
-        }}
-      }};
+      const mPred = viewer.addModel(makeXYZString(r.atom_types, r.coords_pred), "xyz");
+      viewer.setStyle({{model: mPred.getID()}}, {{
+        stick: {{color: '#3b82f6', radius: 0.08}},
+        sphere: {{color: '#3b82f6', radius: 0.22}}
+      }});
 
-      Plotly.newPlot('mol-viewer', traces, viewerLayout);
+      const mGuess = viewer.addModel(makeXYZString(r.atom_types, r.coords_guess), "xyz");
+      viewer.setStyle({{model: mGuess.getID()}}, {{
+        stick: {{color: '#f87171', radius: 0.05, opacity: 0.4}},
+        sphere: {{color: '#f87171', radius: 0.15, opacity: 0.4}}
+      }});
+
+      r.atom_types.forEach((type, idx) => {{
+        viewer.addLabel(`${{type}}${{idx}}`, {{
+          position: {{x: r.coords_true[idx][0], y: r.coords_true[idx][1], z: r.coords_true[idx][2]}},
+          backgroundColor: 'rgba(12,16,27,0.8)',
+          fontColor: '#cbd5e1',
+          fontSize: 10,
+          backgroundOpacity: 0.8,
+          borderThickness: 0,
+          alignment: 'center'
+        }});
+      }});
+
+      viewer.zoomTo();
+      viewer.render();
     }}
+
 
     if (select.options.length > 0) {{
       updateViewer();
@@ -747,3 +789,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     create_dashboard(args.data, args.save_dir)
+

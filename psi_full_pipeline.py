@@ -28,14 +28,14 @@ CONFIG = {
     "attn_layers": 3,
     "ff_dim": 512,
     "dropout": 0.25,
-    "energy_dropout": 0.45,
+    "energy_dropout": 0.30,
     "delta_clamp": 3.0,
     "energy_weight_start": 0.5,
-    "energy_weight_end": 3.0,
+    "energy_weight_end": 0.5,
     "energy_ramp_epochs": 200,
     "lr": 1.5e-4,
     "weight_decay": 2e-3,
-    "energy_weight_decay": 1e-2,
+    "energy_weight_decay": 3e-2,
     "warmup_epochs": 40,
     "grad_clip": 1.0,
     "batch_size": 32,
@@ -87,31 +87,30 @@ def move_batch_to_device(batch, device):
         batch["energy_feats"].to(device, non_blocking=True),
     )
 
-def parse_log_content(file_content):
-    atoms = []
-    energy = None
-    lines = file_content.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if "Standard Nuclear Orientation" in line:
-            current_atoms = []
-            i += 3
-            while i < len(lines) and not lines[i].strip().startswith("---"):
-                parts = lines[i].split()
-                if len(parts) == 5:
-                    current_atoms.append({
-                        "atom": parts[1],
-                        "x": float(parts[2]), "y": float(parts[3]), "z": float(parts[4])
-                    })
-                i += 1
-            atoms = current_atoms
-        elif "Final energy is" in line:
-            energy = float(line.split()[-1])
-        elif "Total energy in the final basis set =" in line:
-            energy = float(line.split()[-1])
-        i += 1
-    return {"energy": energy, "atoms": atoms}
+from psi_utils import (
+    covalent_radius,
+    compute_distance_matrix,
+    mds,
+    kabsch,
+    connected_components,
+    find_fragments_from_coords,
+    find_fragments_from_distances,
+    geometry_pair_mask_from_fragments,
+    choose_alignment_fragments,
+    kabsch_align_reactant,
+    kabsch_align_reactant_fragments,
+    mds_by_fragments,
+    clamp_steric_collisions,
+    classify_bonds,
+    apply_spectator_constraints,
+    enforce_triangle_inequality,
+    validate_ts_geometry,
+    padded_coords,
+    parse_log_content,
+    load_log_file,
+    write_xyz,
+    build_energy_features,
+)
 
 def extract_raw_data(config):
     if os.path.exists(config["dataset_json"]) and not config["force_extract"]:
@@ -139,267 +138,6 @@ def extract_raw_data(config):
     with open(config["dataset_json"], 'w') as f:
         json.dump(dataset, f, indent=2)
     print(f"Saved {len(dataset)} entries to {config['dataset_json']}\n")
-
-def compute_distance_matrix(coords):
-    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
-    dist = np.sqrt(np.sum(diff ** 2, axis=-1) + 1e-8)
-    return dist.astype(np.float32)
-
-def mds(D, dim=3):
-    n = D.shape[0]
-    H = np.eye(n) - np.ones((n, n)) / n
-    B = -0.5 * H @ (D ** 2) @ H
-    evals, evecs = np.linalg.eigh(B)
-    idx = np.argsort(evals)[::-1]
-    evals = evals[idx]
-    evecs = evecs[:, idx]
-    n_dims = min(dim, n)
-    X = evecs[:, :n_dims] @ np.diag(np.sqrt(np.maximum(evals[:n_dims], 0)))
-    if n_dims < dim:
-        X = np.pad(X, ((0, 0), (0, dim - n_dims)))
-    return X
-
-def kabsch(P, Q):
-    P_centered = P - P.mean(axis=0)
-    Q_centered = Q - Q.mean(axis=0)
-    C = P_centered.T @ Q_centered
-    V, _, W = np.linalg.svd(C)
-    if np.linalg.det(V @ W) < 0.0:
-        P_centered = P_centered.copy()
-        P_centered[:, 2] *= -1.0
-        C = P_centered.T @ Q_centered
-        V, _, W = np.linalg.svd(C)
-    R = V @ W
-    return P_centered @ R + Q.mean(axis=0)
-
-COVALENT_RADII = {
-    'H': 0.31, 'C': 0.76, 'N': 0.71, 'O': 0.66, 'F': 0.57,
-    'S': 1.05, 'Cl': 1.02, 'Br': 1.20, 'I': 1.39, 'P': 1.07,
-    'Si': 1.11, 'B': 0.84,
-}
-
-def covalent_radius(atom_type):
-    if atom_type not in COVALENT_RADII:
-        raise KeyError(f"No covalent radius for atom type '{atom_type}'. Add it to COVALENT_RADII.")
-    return COVALENT_RADII[atom_type]
-
-def find_fragments_from_coords(coords, atom_types, n, bond_scale=1.45):
-    adjacency = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
-            if np.linalg.norm(coords[i] - coords[j]) <= cutoff:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    return connected_components(adjacency)
-
-def find_fragments_from_distances(D, atom_types, bond_scale=1.45):
-    n = len(atom_types)
-    adjacency = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
-            if D[i, j] <= cutoff:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    return connected_components(adjacency)
-
-def connected_components(adjacency):
-    seen = set()
-    fragments = []
-    for start in range(len(adjacency)):
-        if start in seen:
-            continue
-        stack = [start]
-        seen.add(start)
-        frag = []
-        while stack:
-            node = stack.pop()
-            frag.append(node)
-            for nbr in adjacency[node]:
-                if nbr not in seen:
-                    seen.add(nbr)
-                    stack.append(nbr)
-        fragments.append(sorted(frag))
-    return sorted(fragments, key=lambda frag: (frag[0], len(frag)))
-
-def geometry_pair_mask_from_fragments(fragments, max_atoms, include_diagonal=False):
-    geom_mask = np.zeros((max_atoms, max_atoms), dtype=np.float32)
-    for frag in fragments:
-        idx = np.array(frag, dtype=np.int64)
-        geom_mask[np.ix_(idx, idx)] = 1.0
-    if not include_diagonal:
-        np.fill_diagonal(geom_mask, 0.0)
-    return geom_mask
-
-def choose_alignment_fragments(c_R, c_P, atom_types, n, bond_scale=1.45):
-    frags_R = find_fragments_from_coords(c_R, atom_types, n, bond_scale)
-    frags_P = find_fragments_from_coords(c_P, atom_types, n, bond_scale)
-    if len(frags_P) > len(frags_R):
-        return frags_P
-    if len(frags_R) > len(frags_P):
-        return frags_R
-    return frags_R
-
-def kabsch_align_reactant(c_R, c_P, n):
-    c_R_aligned = c_R.copy()
-    c_R_aligned[:n] = kabsch(c_R[:n], c_P[:n])
-    return c_R_aligned
-
-def kabsch_align_reactant_fragments(c_R, c_P, atom_types, n, bond_scale=1.45):
-    c_R_aligned = c_R.copy()
-    fragments = choose_alignment_fragments(c_R, c_P, atom_types, n, bond_scale)
-    for frag in fragments:
-        idx = np.array(frag, dtype=np.int64)
-        if len(idx) >= 2:
-            c_R_aligned[idx] = kabsch(c_R[idx], c_P[idx])
-        else:
-            c_R_aligned[idx] = c_P[idx]
-    return c_R_aligned
-
-def mds_by_fragments(D, atom_types=None, fragments=None, reference_coords=None, dim=3, bond_scale=1.45):
-    n = D.shape[0]
-    if fragments is None:
-        if atom_types is None:
-            fragments = [list(range(n))]
-        else:
-            fragments = find_fragments_from_distances(D, atom_types, bond_scale)
-    X = np.zeros((n, dim), dtype=np.float64)
-    cursor = 0.0
-    for frag in fragments:
-        idx = np.array(frag, dtype=np.int64)
-        if len(idx) >= 2:
-            frag_coords = mds(D[np.ix_(idx, idx)], dim=dim)
-        else:
-            frag_coords = np.zeros((1, dim), dtype=np.float64)
-        if reference_coords is not None:
-            ref = reference_coords[idx]
-            if len(idx) >= 2:
-                frag_coords = kabsch(frag_coords, ref)
-            else:
-                frag_coords[0] = ref[0]
-        else:
-            frag_coords = frag_coords - frag_coords.mean(axis=0)
-            span = np.ptp(frag_coords[:, 0]) if len(idx) > 1 else 0.0
-            frag_coords[:, 0] += cursor - frag_coords[:, 0].min()
-            cursor += max(span, 1.5) + 3.0
-        X[idx] = frag_coords
-    return X.astype(np.float32)
-
-# Steric floor as a fraction of (r_i + r_j). The covalent-radius sum is itself the
-# *bonded* distance, and transition states legitimately compress forming/breaking
-# bonds well below it: the tightest true pair in the training set sits at 0.787.
-# A floor of 0.85 therefore pushed 184 predicted pairs ABOVE their true distance
-# (net-degrading 127 reactions). 0.75 sits below every observed true distance, so
-# it only fires on genuinely non-physical overlaps.
-STERIC_FLOOR_FRAC = 0.75
-
-def clamp_steric_collisions(pred_dist, atom_types, floor_frac=STERIC_FLOOR_FRAC):
-    n = len(atom_types)
-    for i in range(n):
-        for j in range(i + 1, n):
-            r_i = covalent_radius(atom_types[i])
-            r_j = covalent_radius(atom_types[j])
-            min_d = floor_frac * (r_i + r_j)
-            if pred_dist[i, j] < min_d:
-                pred_dist[i, j] = min_d
-                pred_dist[j, i] = min_d
-    return pred_dist
-
-def classify_bonds(D_R, D_P, n, threshold=0.15):
-    active, spectator = [], []
-    for i in range(n):
-        for j in range(i + 1, n):
-            if abs(D_R[i, j] - D_P[i, j]) > threshold:
-                active.append((i, j))
-            else:
-                spectator.append((i, j))
-    return active, spectator
-
-def apply_spectator_constraints(pred_dist, D_R, D_P, n, threshold=0.15, tol=0.05, pair_mask=None):
-    _, spectator = classify_bonds(D_R, D_P, n, threshold)
-    for (i, j) in spectator:
-        if pair_mask is not None and pair_mask[i, j] <= 0:
-            continue
-        d_ref = (D_R[i, j] + D_P[i, j]) / 2.0
-        lo = d_ref * (1.0 - tol)
-        hi = d_ref * (1.0 + tol)
-        clamped = float(np.clip(pred_dist[i, j], lo, hi))
-        pred_dist[i, j] = clamped
-        pred_dist[j, i] = clamped
-    return pred_dist
-
-def enforce_triangle_inequality(D, fragments=None, tol=0.05):
-    """Repair only genuine metric violations.
-
-    Floyd-Warshall over the full matrix monotonically shrinks distances and, run
-    globally, rewrites well-predicted within-fragment pairs by routing shortcuts
-    through atoms in *other* fragments (whose mutual distances the model never
-    learned). That degrades good predictions. We instead run the relaxation
-    independently inside each fragment block and only commit a tightening when it
-    exceeds `tol` Angstrom, leaving already-consistent distances untouched.
-    """
-    D = D.copy()
-    n = D.shape[0]
-    if fragments is None:
-        fragments = [list(range(n))]
-    for frag in fragments:
-        idx = np.array(frag, dtype=np.int64)
-        if len(idx) < 3:
-            continue
-        sub = D[np.ix_(idx, idx)].copy()
-        m = len(idx)
-        for k in range(m):
-            for i in range(m):
-                for j in range(m):
-                    shortcut = sub[i, k] + sub[k, j]
-                    if sub[i, j] - shortcut > tol:
-                        sub[i, j] = sub[j, i] = shortcut
-        D[np.ix_(idx, idx)] = sub
-    return D
-
-def validate_ts_geometry(pred_dist, D_R, D_P, atom_types, n, spectator_threshold=0.15):
-    issues = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            r_i = covalent_radius(atom_types[i])
-            r_j = covalent_radius(atom_types[j])
-            min_d = STERIC_FLOOR_FRAC * (r_i + r_j)
-            if pred_dist[i, j] < min_d:
-                issues.append(f"  STERIC   {atom_types[i]}{i}-{atom_types[j]}{j}: {pred_dist[i,j]:.3f} Å < floor {min_d:.3f} Å")
-    active, _ = classify_bonds(D_R, D_P, n, spectator_threshold)
-    for (i, j) in active:
-        d_lo = min(D_R[i, j], D_P[i, j]) - 0.30
-        d_hi = max(D_R[i, j], D_P[i, j]) + 0.30
-        if not (d_lo <= pred_dist[i, j] <= d_hi):
-            issues.append(f"  ACT_OOB  {atom_types[i]}{i}-{atom_types[j]}{j}: pred={pred_dist[i,j]:.3f} Å  (R={D_R[i,j]:.3f}, P={D_P[i,j]:.3f})")
-    if issues:
-        print(f"[TS Validation] {len(issues)} issue(s) detected:")
-        for iss in issues:
-            print(iss)
-    else:
-        print("[TS Validation] Geometry passed all physical checks.")
-    return len(issues) == 0
-
-def padded_coords(atoms, max_atoms):
-    coords = np.zeros((max_atoms, 3), dtype=np.float32)
-    for i, atom in enumerate(atoms):
-        coords[i] = [atom["x"], atom["y"], atom["z"]]
-    return coords
-
-def load_log_file(path):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        parsed = parse_log_content(f.read())
-    if not parsed["atoms"]:
-        raise ValueError(f"No atoms found in {path}")
-    return parsed
-
-def write_xyz(path, atom_types, coords, comment):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"{len(atom_types)}\n")
-        f.write(f"{comment}\n")
-        for atom, (x, y, z) in zip(atom_types, coords):
-            f.write(f"{atom:<2} {x: .8f} {y: .8f} {z: .8f}\n")
 
 def build_atom_vocab(raw_data):
     atom_set = set()
@@ -450,16 +188,13 @@ def build_reaction_samples(config):
             ea = (ts_e["energy"] - max(r_e["energy"], p_e["energy"])) * config["hartree_to_kcal"]
             e_r = r_e["energy"] * config["hartree_to_kcal"]
             e_p = p_e["energy"] * config["hartree_to_kcal"]
-            de_rxn = abs(e_r - e_p)
             atom_types = [a["atom"] for a in ts_e["atoms"]]
             c_R_aligned_init = kabsch_align_reactant_fragments(
                 c_R, c_P, atom_types, n, config["fragment_bond_scale"]
             )
-            diff = c_R_aligned_init[:n] - c_P[:n]
-            diff_norms = np.linalg.norm(diff, axis=1)
-            energy_feats = np.array([
-                de_rxn, diff_norms.mean(), diff_norms.std(), diff_norms.max(), float(n),
-            ], dtype=np.float32)
+            energy_feats = build_energy_features(
+                atom_types, n, c_R_aligned_init, c_P, e_r, e_p, config["fragment_bond_scale"]
+            )
             D_TS = compute_distance_matrix(c_TS)
             ts_fragments = find_fragments_from_coords(
                 c_TS, atom_types, n, config["fragment_bond_scale"]
@@ -690,16 +425,29 @@ class EnergyHead(nn.Module):
         self.attn_scale = d_model ** 0.5
         self.attn_drop = nn.Dropout(dropout)
         self.feature_drop = nn.Dropout(dropout)
+        # Geometry pathway: a modest (not razor-thin) bottleneck so the encoder
+        # features contribute real signal without dominating / memorizing.
+        self.pool_proj = nn.Sequential(
+            nn.Linear(d_model, 16),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        # Molecule-level path (electronegativity / Z / mass descriptors, bond-angle
+        # statistics, and signed/unsigned reaction energy) is the primary,
+        # generalizable signal for the barrier -- give it a two-layer MLP.
         self.efeat_proj = nn.Sequential(
-            nn.Linear(n_energy_feats, 32),
+            nn.Linear(n_energy_feats, 64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
             nn.GELU(),
             nn.Dropout(dropout),
         )
         self.net = nn.Sequential(
-            nn.Linear(d_model + 32, 32),
+            nn.Linear(16 + 32, 64),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(32, 1),
+            nn.Linear(64, 1),
         )
 
     def forward(self, features, mask, energy_feats):
@@ -714,9 +462,11 @@ class EnergyHead(nn.Module):
         attn_weights = self.attn_drop(F.softmax(scores, dim=-1))
         pooled = torch.bmm(attn_weights, V).squeeze(1)
         pooled = self.feature_drop(pooled)
+        pooled_proj = self.pool_proj(pooled)
         efeat = self.efeat_proj(energy_feats)
-        combined = torch.cat([pooled, efeat], dim=-1)
+        combined = torch.cat([pooled_proj, efeat], dim=-1)
         return self.net(combined).squeeze(-1)
+
 
 class PSI(nn.Module):
     def __init__(self, config, num_atom_types, n_energy_feats=5):
@@ -733,9 +483,11 @@ class PSI(nn.Module):
     def forward(self, D_R, D_I, D_P, mask, atom_ids, energy_feats):
         f = self.core(D_R, D_I, D_P, mask, atom_ids)
         atom_emb = self.core.atom_embed(atom_ids)
+        # Detach features into the energy head: the (un-learnable) barrier loss must
+        # not back-propagate into the shared encoder and corrupt the geometry task.
         return (
             self.geom_head(f, atom_emb, D_R, D_I, D_P, mask),
-            self.ener_head(f, mask, energy_feats)
+            self.ener_head(f.detach(), mask, energy_feats)
         )
 
 class CosineAnnealingWarmup(torch.optim.lr_scheduler._LRScheduler):
@@ -867,7 +619,9 @@ def train_pipeline(config):
         val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, is_train=False)
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
-        val_select = val_metrics["geom"] + config["energy_weight_end"] * val_metrics["ener"]
+        # Select the checkpoint on geometry alone -- it is the deliverable and the
+        # generalizable task. The barrier term only added memorization-driven noise.
+        val_select = val_metrics["geom"]
         history.append({
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
@@ -898,7 +652,7 @@ def train_pipeline(config):
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"\nTraining history saved to {history_path}")
-    print(f"\nLoading best model (val_select={best_val_loss:.4f})...")
+    print(f"\nLoading best model (best val_geom={best_val_loss:.4f})...")
     checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     print("\n" + "="*70); print(" EVALUATION RESULTS "); print("="*70)
@@ -967,6 +721,11 @@ def train_pipeline(config):
     torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, final_path)
     print(f"\nModel saved to {final_path}")
     print(f"Predictions saved to {output_path}")
+    try:
+        from psi_visualize import create_dashboard
+        create_dashboard(output_path, config["save_dir"])
+    except Exception as e:
+        print(f"Warning: dashboard generation failed: {e}")
 
 def predict_transition_state(config, reactant_path, product_path, model_path, output_path, xyz_path=None):
     device = resolve_device(config)
@@ -1020,12 +779,9 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         atom_ids[i] = atom_vocab[atom_type]
     e_r = reactant["energy"] * config["hartree_to_kcal"]
     e_p = product["energy"] * config["hartree_to_kcal"]
-    de_rxn = abs(e_r - e_p)
-    diff = c_R_aligned[:n] - c_P[:n]
-    diff_norms = np.linalg.norm(diff, axis=1)
-    energy_feats = np.array([
-        de_rxn, diff_norms.mean(), diff_norms.std(), diff_norms.max(), float(n)
-    ], dtype=np.float32)
+    energy_feats = build_energy_features(
+        r_types, n, c_R_aligned, c_P, e_r, e_p, config["fragment_bond_scale"]
+    )
     energy_feats_norm = (energy_feats - efeat_mean) / efeat_std
     model = PSI(config, num_atom_types, n_energy_feats).to(device)
     model.load_state_dict(state_dict)
