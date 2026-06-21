@@ -33,7 +33,7 @@ This requires a trained `psi_final.pt` model.
 ### Visualization
 After training or prediction, you can generate a performance dashboard:
 ```bash
-python psi_visualize.py
+python psi_full_pipeline.py dashboard
 ```
 This will read the `detailed_analysis.json` generated during training/evaluation and create an interactive `psi_results_dashboard.html` that can be opened in any web browser.
 
