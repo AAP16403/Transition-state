@@ -467,7 +467,7 @@ CONFIG = {
     "tar_path": "b97d3.tar.gz",
     "dataset_json": "extracted_dataset.json",
     "save_dir": ".",
-    "extraction_limit": 6000,
+    "extraction_limit": 16000,
     "force_extract": False,
     "max_atoms": 30,
     "n_gaussians": 32,
