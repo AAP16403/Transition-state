@@ -611,6 +611,9 @@ def train_pipeline(config):
     print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>11} | {'T.Geom':>8} | {'T.Ener':>8} | {'V.Geom':>8} | {'V.Ener':>8} | {'LR':>10}")
     print("-" * 95)
     best_val_loss = float('inf')
+    best_ener = float('inf')
+    best_ener_head_state = None
+    best_ener_epoch = 0
     patience_counter = 0
     history = []
     best_model_path = os.path.join(config["save_dir"], "psi_best.pt")
@@ -619,8 +622,9 @@ def train_pipeline(config):
         val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, is_train=False)
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
-        # Select the checkpoint on geometry alone -- it is the deliverable and the
-        # generalizable task. The barrier term only added memorization-driven noise.
+        # The geometry encoder and the (detached) energy head train independently,
+        # so their best epochs differ. Checkpoint each on its own metric and later
+        # graft the best energy head onto the best-geometry model -- best of both.
         val_select = val_metrics["geom"]
         history.append({
             "epoch": epoch,
@@ -633,14 +637,20 @@ def train_pipeline(config):
             "val_ener": val_metrics["ener"],
             "lr": current_lr,
         })
+        improved = False
         if val_select < best_val_loss:
             best_val_loss = val_select
-            patience_counter = 0
+            improved = True
             torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, best_model_path)
-        else:
-            patience_counter += 1
-        if epoch % config["print_every"] == 0 or epoch == 1 or patience_counter == 0:
-            marker = " *" if patience_counter == 0 else ""
+        if val_metrics["ener"] < best_ener:
+            best_ener = val_metrics["ener"]
+            best_ener_epoch = epoch
+            improved = True
+            best_ener_head_state = {k: v.detach().cpu().clone() for k, v in model.ener_head.state_dict().items()}
+        # Keep training while either task is still improving.
+        patience_counter = 0 if improved else patience_counter + 1
+        if epoch % config["print_every"] == 0 or epoch == 1 or improved:
+            marker = " *" if improved else ""
             print(f"{epoch:6d} | {train_metrics['loss']:11.4f} | {val_metrics['loss']:11.4f} | "
                   f"{train_metrics['geom']:8.5f} | {train_metrics['ener']:8.5f} | "
                   f"{val_metrics['geom']:8.5f} | {val_metrics['ener']:8.5f} | "
@@ -655,6 +665,9 @@ def train_pipeline(config):
     print(f"\nLoading best model (best val_geom={best_val_loss:.4f})...")
     checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
+    if best_ener_head_state is not None:
+        model.ener_head.load_state_dict(best_ener_head_state)
+        print(f"Grafted best energy head (val_ener={best_ener:.4f} @ epoch {best_ener_epoch}) onto best-geometry model.")
     print("\n" + "="*70); print(" EVALUATION RESULTS "); print("="*70)
     model.eval()
     results = []
@@ -719,6 +732,8 @@ def train_pipeline(config):
         json.dump(results, f, indent=2)
     final_path = os.path.join(config["save_dir"], "psi_final.pt")
     torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, final_path)
+    # Keep psi_best.pt consistent with the grafted (best-geometry + best-energy) model.
+    torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, best_model_path)
     print(f"\nModel saved to {final_path}")
     print(f"Predictions saved to {output_path}")
     try:
