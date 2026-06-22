@@ -100,10 +100,13 @@ def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=
     (predict_transition_state) so the two can never drift out of sync. All
     inputs are available before the TS is known. Returns float32 of fixed length.
 
-    Feature groups:
-      [0:10]  reaction energetics + composition (original features)
-      [10:18] atomic descriptors (electronegativity, atomic number, mass)
-      [18:28] bond-angle statistics for reactant, product, and their change
+    Feature groups (20D total):
+      [0:10]  reaction energetics + composition
+      [10:20] bond-angle statistics for reactant, product, and their change
+
+    Note: per-atom atomic descriptors (EN, Z, Mass) have been moved out of this
+    global vector and are now attached directly to each atom in PSICore via
+    build_atom_physical_features(), preserving their spatial identity.
     """
     cR = np.asarray(c_R_aligned, dtype=np.float64)[:n]
     cP = np.asarray(c_P, dtype=np.float64)[:n]
@@ -117,16 +120,6 @@ def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=
     h_count = sum(1 for t in types if t == 'H')
     n_count = sum(1 for t in types if t == 'N')
     o_count = sum(1 for t in types if t == 'O')
-
-    # --- atomic descriptors ----------------------------------------------
-    en = np.array([electronegativity(t) for t in types], dtype=np.float64)
-    z = np.array([atomic_number(t) for t in types], dtype=np.float64)
-    mass = np.array([atomic_mass(t) for t in types], dtype=np.float64)
-    en_mean, en_std, en_min, en_max = _stats4(en)
-    z_mean = float(z.mean()) if z.size else 0.0
-    z_max = float(z.max()) if z.size else 0.0
-    mass_total = float(mass.sum())
-    mass_mean = float(mass.mean()) if mass.size else 0.0
 
     # --- bond-angle statistics -------------------------------------------
     ang_R = bond_angles_from_coords(cR, types, n, bond_scale)
@@ -143,17 +136,30 @@ def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=
         ang_change_max = 0.0
 
     feats = np.array([
-        # reaction energetics + composition
+        # reaction energetics + composition (10 features)
         de_rxn, de_rxn_signed, float(diff_norms.mean()), float(diff_norms.std()),
         float(diff_norms.max()), float(n),
         float(c_count), float(h_count), float(n_count), float(o_count),
-        # atomic descriptors
-        en_mean, en_std, en_min, en_max, z_mean, z_max, mass_total, mass_mean,
-        # bond-angle statistics
+        # bond-angle statistics (10 features)
         aR_mean, aR_std, aR_min, aR_max,
         aP_mean, aP_std, aP_min, aP_max,
         ang_change_mean, ang_change_max,
     ], dtype=np.float32)
+    return feats
+
+ATOM_PHYS_DIM = 3  # electronegativity, atomic number, mass
+
+def build_atom_physical_features(atom_types, n, max_atoms):
+    """Per-atom physical descriptors: [EN, Z, Mass] for each atom, zero-padded.
+
+    These features are attached directly to each atom node in PSICore so the
+    Transformer can reason about *which* atom has which property spatially,
+    rather than receiving only global min/max/mean statistics.
+    """
+    feats = np.zeros((max_atoms, ATOM_PHYS_DIM), dtype=np.float32)
+    for i in range(n):
+        t = atom_types[i]
+        feats[i] = [electronegativity(t), float(atomic_number(t)), atomic_mass(t)]
     return feats
 
 def compute_distance_matrix(coords):
@@ -467,8 +473,11 @@ CONFIG = {
     "tar_path": "b97d3.tar.gz",
     "dataset_json": "extracted_dataset.json",
     "save_dir": ".",
+    # ~3 logs (r/p/ts) per reaction, minus those dropped by the max_atoms filter,
+    # so extract ~16k logs to yield ~5000 complete reaction triplets.
     "extraction_limit": 16000,
-    "force_extract": False,
+    "target_reactions": 5000,
+    "force_extract": True,
     "max_atoms": 30,
     "n_gaussians": 32,
     "gauss_start": 0.4,
@@ -538,6 +547,7 @@ def move_batch_to_device(batch, device):
         batch["Ea"].to(device, non_blocking=True),
         batch["atom_ids"].to(device, non_blocking=True),
         batch["energy_feats"].to(device, non_blocking=True),
+        batch["atom_phys"].to(device, non_blocking=True),
     )
 
 def extract_raw_data(config):
@@ -600,7 +610,10 @@ def build_reaction_samples(config):
         reactions[rxn_id][role] = entry
     samples = []
     atom_types_map = {}
+    target_reactions = config.get("target_reactions", float("inf"))
     for rxn_id, roles in sorted(reactions.items()):
+        if len(samples) >= target_reactions:
+            break
         if "r" in roles and "p" in roles and "ts" in roles:
             r_e = roles["r"]; p_e = roles["p"]; ts_e = roles["ts"]
             n = len(ts_e["atoms"])
@@ -623,6 +636,9 @@ def build_reaction_samples(config):
             energy_feats = build_energy_features(
                 atom_types, n, c_R_aligned_init, c_P, e_r, e_p, config["fragment_bond_scale"]
             )
+            atom_phys = build_atom_physical_features(
+                atom_types, n, config["max_atoms"]
+            )
             D_TS = compute_distance_matrix(c_TS)
             ts_fragments = find_fragments_from_coords(
                 c_TS, atom_types, n, config["fragment_bond_scale"]
@@ -637,6 +653,7 @@ def build_reaction_samples(config):
                 "mask": torch.from_numpy(mask),
                 "Ea_raw": ea,
                 "energy_feats_raw": energy_feats,
+                "atom_phys_raw": atom_phys,
                 "D_TS": torch.from_numpy(D_TS),
                 "geom_mask": torch.from_numpy(geom_mask),
             })
@@ -644,7 +661,7 @@ def build_reaction_samples(config):
     return samples, atom_vocab, atom_types_map
 
 def compute_normalization(samples, indices):
-    """Compute Ea / energy-feature normalization stats over the given indices only.
+    """Compute Ea / energy-feature / atom-phys normalization stats over the given indices only.
 
     Restricting to the training indices keeps validation reactions out of the
     normalization statistics.
@@ -658,14 +675,28 @@ def compute_normalization(samples, indices):
     efeat_mean = all_efeats.mean(axis=0).astype(np.float32)
     efeat_std = all_efeats.std(axis=0).astype(np.float32)
     efeat_std[efeat_std < 1e-6] = 1.0
+    # Atom-physics normalization: collect all *valid* (non-padding) atom rows
+    # across training samples and compute per-feature mean/std.
+    all_aphys_rows = []
+    for i in indices:
+        s = samples[i]
+        n = s["n_atoms"]
+        all_aphys_rows.append(s["atom_phys_raw"][:n])  # (n, 3)
+    all_aphys = np.concatenate(all_aphys_rows, axis=0)   # (total_atoms, 3)
+    aphys_mean = all_aphys.mean(axis=0).astype(np.float32)
+    aphys_std = all_aphys.std(axis=0).astype(np.float32)
+    aphys_std[aphys_std < 1e-6] = 1.0
     print(f"Ea stats (train split): mean={ea_mean:.2f}, std={ea_std:.2f} kcal/mol")
     print(f"Ea range (train split): [{all_ea.min():.2f}, {all_ea.max():.2f}] kcal/mol")
+    print(f"Atom-phys stats (train): mean={aphys_mean}, std={aphys_std}")
     return {
         "ea_mean": ea_mean,
         "ea_std": ea_std,
         "efeat_mean": efeat_mean,
         "efeat_std": efeat_std,
         "n_energy_feats": all_efeats.shape[1],
+        "aphys_mean": aphys_mean,
+        "aphys_std": aphys_std,
     }
 
 class ReactionDataset(Dataset):
@@ -685,6 +716,8 @@ class ReactionDataset(Dataset):
         self.efeat_mean = stats["efeat_mean"]
         self.efeat_std = stats["efeat_std"]
         self.n_energy_feats = stats["n_energy_feats"]
+        self.aphys_mean = stats["aphys_mean"]
+        self.aphys_std = stats["aphys_std"]
 
     def __len__(self): return len(self.samples)
 
@@ -704,6 +737,7 @@ class ReactionDataset(Dataset):
         D_I = (D_R + D_P) / 2.0
         ea_norm = torch.tensor((s["Ea_raw"] - self.ea_mean) / self.ea_std, dtype=torch.float32)
         efeat_norm = (s["energy_feats_raw"] - self.efeat_mean) / self.efeat_std
+        aphys_norm = (s["atom_phys_raw"] - self.aphys_mean) / self.aphys_std
         return {
             "rxn_id": s["rxn_id"],
             "n_atoms": n,
@@ -716,6 +750,7 @@ class ReactionDataset(Dataset):
             "Ea": ea_norm,
             "atom_ids": s["atom_ids"],
             "energy_feats": torch.from_numpy(efeat_norm.astype(np.float32)),
+            "atom_phys": torch.from_numpy(aphys_norm.astype(np.float32)),
         }
 
 class GaussianEmbedding(nn.Module):
@@ -760,8 +795,10 @@ class PSICore(nn.Module):
         d_model = gru_hidden * 2
         self.atom_embed = nn.Embedding(num_atom_types + 1, atom_dim, padding_idx=0)
         self.gaussian = GaussianEmbedding(K, config["gauss_start"], config["gauss_stop"])
+        # Per-atom feature width = learnable embedding + physical descriptors (EN, Z, Mass)
+        atom_feat_dim = atom_dim + ATOM_PHYS_DIM
         self.input_proj = nn.Sequential(
-            nn.Linear(N * K + atom_dim, d_model),
+            nn.Linear(N * K + atom_feat_dim, d_model),
             nn.LayerNorm(d_model),
             nn.GELU(),
             nn.Dropout(config["dropout"]),
@@ -784,15 +821,17 @@ class PSICore(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
-    def forward(self, D_R, D_I, D_P, mask, atom_ids):
+    def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys):
         B, N, _ = D_R.shape
         atom_emb = self.atom_embed(atom_ids)
+        # Concatenate learnable embedding with explicit physical descriptors
+        atom_feat = torch.cat([atom_emb, atom_phys], dim=-1)  # [B, N, atom_dim + 3]
         emb_R = self.gaussian(D_R).view(B, N, -1)
         emb_I = self.gaussian(D_I).view(B, N, -1)
         emb_P = self.gaussian(D_P).view(B, N, -1)
-        emb_R = torch.cat([emb_R, atom_emb], dim=-1)
-        emb_I = torch.cat([emb_I, atom_emb], dim=-1)
-        emb_P = torch.cat([emb_P, atom_emb], dim=-1)
+        emb_R = torch.cat([emb_R, atom_feat], dim=-1)
+        emb_I = torch.cat([emb_I, atom_feat], dim=-1)
+        emb_P = torch.cat([emb_P, atom_feat], dim=-1)
         emb_R = self.input_proj(emb_R)
         emb_I = self.input_proj(emb_I)
         emb_P = self.input_proj(emb_P)
@@ -807,10 +846,12 @@ class PSICore(nn.Module):
         return self.final_norm(x)
 
 class GeometryHead(nn.Module):
-    def __init__(self, d_model, atom_embed_dim, dropout=0.25, delta_clamp=3.0):
+    def __init__(self, d_model, atom_embed_dim, atom_phys_dim=ATOM_PHYS_DIM, dropout=0.25, delta_clamp=3.0):
         super().__init__()
         self.delta_clamp = delta_clamp
-        pair_dim = d_model * 2 + atom_embed_dim * 2 + 3
+        # Pairwise features: transformer features (i,j) + atom embeddings (i,j)
+        # + physical descriptors (i,j) + raw distances (R,I,P)
+        pair_dim = d_model * 2 + (atom_embed_dim + atom_phys_dim) * 2 + 3
         self.net = nn.Sequential(
             nn.Linear(pair_dim, 256),
             nn.GELU(),
@@ -824,13 +865,15 @@ class GeometryHead(nn.Module):
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
-    def forward(self, features, atom_emb, D_R, D_I, D_P, mask):
+    def forward(self, features, atom_emb, atom_phys, D_R, D_I, D_P, mask):
         B, N, D = features.shape
-        atom_dim = atom_emb.shape[-1]
+        # Concatenate learnable atom embedding with physical descriptors
+        atom_feat = torch.cat([atom_emb, atom_phys], dim=-1)  # [B, N, atom_dim + 3]
+        atom_feat_dim = atom_feat.shape[-1]
         fi = features.unsqueeze(2).expand(B, N, N, D)
         fj = features.unsqueeze(1).expand(B, N, N, D)
-        ai = atom_emb.unsqueeze(2).expand(B, N, N, atom_dim)
-        aj = atom_emb.unsqueeze(1).expand(B, N, N, atom_dim)
+        ai = atom_feat.unsqueeze(2).expand(B, N, N, atom_feat_dim)
+        aj = atom_feat.unsqueeze(1).expand(B, N, N, atom_feat_dim)
         pair_dist = torch.stack([D_R, D_I, D_P], dim=-1)
         pair = torch.cat([fi, fj, ai, aj, pair_dist], dim=-1)
         out = self.net(pair)
@@ -860,9 +903,9 @@ class EnergyHead(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        # Molecule-level path (electronegativity / Z / mass descriptors, bond-angle
-        # statistics, and signed/unsigned reaction energy) is the primary,
-        # generalizable signal for the barrier -- give it a two-layer MLP.
+        # Molecule-level path (bond-angle statistics and signed/unsigned reaction
+        # energy) is the primary, generalizable signal for the barrier.
+        # Per-atom EN/Z/Mass are now in PSICore and flow through the attention pool.
         self.efeat_proj = nn.Sequential(
             nn.Linear(n_energy_feats, 64),
             nn.GELU(),
@@ -905,16 +948,16 @@ class PSI(nn.Module):
         energy_drop = config["energy_dropout"]
         delta_clamp = config["delta_clamp"]
         self.core = PSICore(config, num_atom_types)
-        self.geom_head = GeometryHead(d_model, atom_dim, drop, delta_clamp)
+        self.geom_head = GeometryHead(d_model, atom_dim, ATOM_PHYS_DIM, drop, delta_clamp)
         self.ener_head = EnergyHead(d_model, n_energy_feats, energy_drop)
 
-    def forward(self, D_R, D_I, D_P, mask, atom_ids, energy_feats):
-        f = self.core(D_R, D_I, D_P, mask, atom_ids)
+    def forward(self, D_R, D_I, D_P, mask, atom_ids, energy_feats, atom_phys):
+        f = self.core(D_R, D_I, D_P, mask, atom_ids, atom_phys)
         atom_emb = self.core.atom_embed(atom_ids)
         # Detach features into the energy head: the (un-learnable) barrier loss must
         # not back-propagate into the shared encoder and corrupt the geometry task.
         return (
-            self.geom_head(f, atom_emb, D_R, D_I, D_P, mask),
+            self.geom_head(f, atom_emb, atom_phys, D_R, D_I, D_P, mask),
             self.ener_head(f.detach(), mask, energy_feats)
         )
 
@@ -952,11 +995,11 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
         for batch in loader:
-            DR, DI, DP, DTS, mask, geom_mask, true_ea, atom_ids, energy_feats = move_batch_to_device(batch, device)
+            DR, DI, DP, DTS, mask, geom_mask, true_ea, atom_ids, energy_feats, atom_phys = move_batch_to_device(batch, device)
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_ea = model(DR, DI, DP, mask, atom_ids, energy_feats)
+                p_DTS, p_ea = model(DR, DI, DP, mask, atom_ids, energy_feats, atom_phys)
                 B, N, _ = DR.shape
                 valid_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
                 eye = torch.eye(N, device=mask.device, dtype=mask.dtype).unsqueeze(0)
@@ -1033,6 +1076,8 @@ def train_pipeline(config):
         "efeat_mean": stats["efeat_mean"].tolist(),
         "efeat_std": stats["efeat_std"].tolist(),
         "n_energy_feats": n_energy_feats,
+        "aphys_mean": stats["aphys_mean"].tolist(),
+        "aphys_std": stats["aphys_std"].tolist(),
         "config_snapshot": {k: v for k, v in config.items() if isinstance(v, (int, float, str, bool))},
     }
     print(f"\nTraining for up to {config['epochs']} epochs (patience={config['patience']})...")
@@ -1104,9 +1149,9 @@ def train_pipeline(config):
     val_rxn_ids = {samples[vi]["rxn_id"] for vi in val_indices}
     with torch.no_grad():
         for batch in eval_loader:
-            DR, DI, DP, DTS, mask, geom_mask, true_ea_norm, atom_ids, energy_feats = move_batch_to_device(batch, device)
+            DR, DI, DP, DTS, mask, geom_mask, true_ea_norm, atom_ids, energy_feats, atom_phys = move_batch_to_device(batch, device)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_ea_norm = model(DR, DI, DP, mask, atom_ids, energy_feats)
+                p_DTS, p_ea_norm = model(DR, DI, DP, mask, atom_ids, energy_feats, atom_phys)
             true_ea_real = true_ea_norm * ea_std + ea_mean
             p_ea_real = p_ea_norm * ea_std + ea_mean
             for i in range(len(batch["rxn_id"])):
@@ -1194,6 +1239,8 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     n_energy_feats = meta["n_energy_feats"]
     efeat_mean = np.array(meta["efeat_mean"], dtype=np.float32)
     efeat_std = np.array(meta["efeat_std"], dtype=np.float32)
+    aphys_mean = np.array(meta["aphys_mean"], dtype=np.float32)
+    aphys_std = np.array(meta["aphys_std"], dtype=np.float32)
     n = len(r_atoms)
     c_R = padded_coords(r_atoms, config["max_atoms"])
     c_P = padded_coords(p_atoms, config["max_atoms"])
@@ -1225,6 +1272,8 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         r_types, n, c_R_aligned, c_P, e_r, e_p, config["fragment_bond_scale"]
     )
     energy_feats_norm = (energy_feats - efeat_mean) / efeat_std
+    atom_phys = build_atom_physical_features(r_types, n, config["max_atoms"])
+    atom_phys_norm = (atom_phys - aphys_mean) / aphys_std
     model = PSI(config, num_atom_types, n_energy_feats).to(device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -1235,7 +1284,8 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         t_mask = torch.from_numpy(mask).unsqueeze(0).to(device)
         t_atom_ids = torch.from_numpy(atom_ids).unsqueeze(0).to(device)
         t_efeats = torch.from_numpy(energy_feats_norm).unsqueeze(0).to(device)
-        p_DTS, p_ea_norm = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_efeats)
+        t_aphys = torch.from_numpy(atom_phys_norm).unsqueeze(0).to(device)
+        p_DTS, p_ea_norm = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_efeats, t_aphys)
     pred_dist = p_DTS[0, :n, :n].cpu().numpy()
     pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
     np.fill_diagonal(pred_dist, 0.0)
