@@ -939,6 +939,70 @@ class EnergyHead(nn.Module):
         return self.net(combined).squeeze(-1)
 
 
+GEOM_SUMMARY_DIM = 7  # TS-displacement statistics fed to the stage-2 refiner
+
+def geom_summary(D_TS, D_R, D_P, mask):
+    """Summarize a predicted TS distance matrix into a fixed, invariant vector.
+
+    Distance matrices are already rotation/translation invariant, so we only
+    need to pool them. We describe how far the predicted TS sits from the
+    reactant and product (per-pair |D_TS - D_R| and |D_TS - D_P|), reduced to
+    masked mean/std/max over valid off-diagonal atom pairs, plus the fraction of
+    the bond reorganization completed toward the product. This is exactly the
+    geometric signal the activation barrier depends on.
+    """
+    B, N, _ = D_TS.shape
+    valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+    eye = torch.eye(N, device=D_TS.device, dtype=D_TS.dtype).unsqueeze(0)
+    m = valid * (1.0 - eye)                       # [B, N, N] valid off-diagonal
+    cnt = m.sum(dim=(1, 2)).clamp(min=1.0)
+    d_tr = (D_TS - D_R).abs()
+    d_tp = (D_TS - D_P).abs()
+
+    def _stats(x):
+        mean = (x * m).sum(dim=(1, 2)) / cnt
+        var = (((x - mean.view(B, 1, 1)) ** 2) * m).sum(dim=(1, 2)) / cnt
+        mx = (x * m + (m - 1.0) * 1e4).amax(dim=(1, 2))  # -1e4 on masked pairs
+        return mean, var.clamp(min=0.0).sqrt(), mx
+
+    tr_mean, tr_std, tr_max = _stats(d_tr)
+    tp_mean, tp_std, tp_max = _stats(d_tp)
+    frac = tr_mean / (tr_mean + tp_mean + 1e-6)   # 0 ~ TS=R, 1 ~ TS=P
+    return torch.stack([tr_mean, tr_std, tr_max, tp_mean, tp_std, tp_max, frac], dim=-1)
+
+
+class EnergyRefiner(nn.Module):
+    """Stage-2 boosting head: refines the stage-1 barrier guess into a final
+    prediction using the (detached) predicted TS geometry plus the same base
+    energy features.
+
+    Predicts a residual delta, with the last layer zero-initialized so training
+    starts exactly at the stage-1 baseline (delta = 0). All inputs arrive
+    detached, so the refiner's gradients never reach the encoder, geometry head,
+    or stage-1 energy head -- it only learns the leftover barrier error that the
+    explicit TS geometry can explain.
+    """
+    def __init__(self, n_energy_feats, geom_dim=GEOM_SUMMARY_DIM, dropout=0.45):
+        super().__init__()
+        in_dim = 1 + n_energy_feats + geom_dim  # ea_guess + base feats + TS geometry
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, ea_guess, energy_feats, geom_feats):
+        x = torch.cat([ea_guess.unsqueeze(-1), energy_feats, geom_feats], dim=-1)
+        delta = self.net(x).squeeze(-1)
+        return ea_guess + delta
+
+
 class PSI(nn.Module):
     def __init__(self, config, num_atom_types, n_energy_feats=5):
         super().__init__()
@@ -950,16 +1014,22 @@ class PSI(nn.Module):
         self.core = PSICore(config, num_atom_types)
         self.geom_head = GeometryHead(d_model, atom_dim, ATOM_PHYS_DIM, drop, delta_clamp)
         self.ener_head = EnergyHead(d_model, n_energy_feats, energy_drop)
+        self.refiner = EnergyRefiner(n_energy_feats, GEOM_SUMMARY_DIM, energy_drop)
 
     def forward(self, D_R, D_I, D_P, mask, atom_ids, energy_feats, atom_phys):
         f = self.core(D_R, D_I, D_P, mask, atom_ids, atom_phys)
         atom_emb = self.core.atom_embed(atom_ids)
-        # Detach features into the energy head: the (un-learnable) barrier loss must
-        # not back-propagate into the shared encoder and corrupt the geometry task.
-        return (
-            self.geom_head(f, atom_emb, atom_phys, D_R, D_I, D_P, mask),
-            self.ener_head(f.detach(), mask, energy_feats)
-        )
+        D_TS_pred = self.geom_head(f, atom_emb, atom_phys, D_R, D_I, D_P, mask)
+        # Stage 1: barrier guess. Detach features so the barrier loss never
+        # back-propagates into the shared encoder and corrupts the geometry task.
+        ea_guess = self.ener_head(f.detach(), mask, energy_feats)
+        # Stage 2: residual refinement. The predicted TS geometry and the stage-1
+        # guess are both detached -- the refiner SEES the 3D shape and the prior
+        # estimate but cannot back-propagate into the geometry head or stage-1
+        # head (one-way mirror). It only learns a correction to the barrier.
+        geom_feats = geom_summary(D_TS_pred.detach(), D_R, D_P, mask)
+        ea_final = self.refiner(ea_guess.detach(), energy_feats, geom_feats)
+        return D_TS_pred, ea_final, ea_guess
 
 class CosineAnnealingWarmup(torch.optim.lr_scheduler._LRScheduler):
     def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6, last_epoch=-1):
@@ -999,13 +1069,18 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_ea = model(DR, DI, DP, mask, atom_ids, energy_feats, atom_phys)
+                p_DTS, p_ea, p_ea_guess = model(DR, DI, DP, mask, atom_ids, energy_feats, atom_phys)
                 B, N, _ = DR.shape
                 valid_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
                 eye = torch.eye(N, device=mask.device, dtype=mask.dtype).unsqueeze(0)
                 m2d = valid_mask * (1.0 - eye)
                 l_geom = F.huber_loss(p_DTS * m2d, DTS * m2d, reduction='sum', delta=0.5) / m2d.sum().clamp(min=1)
-                l_ener = F.mse_loss(p_ea, true_ea)
+                # Supervise both stages: the stage-1 guess keeps learning the base
+                # barrier, and the stage-2 refined prediction learns the residual.
+                # Their gradients are isolated by detach inside PSI.forward.
+                l_ener_guess = F.mse_loss(p_ea_guess, true_ea)
+                l_ener_final = F.mse_loss(p_ea, true_ea)
+                l_ener = l_ener_guess + l_ener_final
                 loss = l_geom + energy_w * l_ener
             if is_train:
                 scaler.scale(loss).backward()
@@ -1061,7 +1136,7 @@ def train_pipeline(config):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
     core_params = list(model.core.parameters()) + list(model.geom_head.parameters())
-    energy_params = list(model.ener_head.parameters())
+    energy_params = list(model.ener_head.parameters()) + list(model.refiner.parameters())
     optimizer = torch.optim.AdamW([
         {"params": core_params, "lr": config["lr"], "weight_decay": config["weight_decay"]},
         {"params": energy_params, "lr": config["lr"], "weight_decay": config["energy_weight_decay"]},
@@ -1086,6 +1161,7 @@ def train_pipeline(config):
     best_val_loss = float('inf')
     best_ener = float('inf')
     best_ener_head_state = None
+    best_refiner_state = None
     best_ener_epoch = 0
     patience_counter = 0
     history = []
@@ -1120,6 +1196,7 @@ def train_pipeline(config):
             best_ener_epoch = epoch
             improved = True
             best_ener_head_state = {k: v.detach().cpu().clone() for k, v in model.ener_head.state_dict().items()}
+            best_refiner_state = {k: v.detach().cpu().clone() for k, v in model.refiner.state_dict().items()}
         # Keep training while either task is still improving.
         patience_counter = 0 if improved else patience_counter + 1
         if epoch % config["print_every"] == 0 or epoch == 1 or improved:
@@ -1140,7 +1217,8 @@ def train_pipeline(config):
     model.load_state_dict(checkpoint["model_state_dict"])
     if best_ener_head_state is not None:
         model.ener_head.load_state_dict(best_ener_head_state)
-        print(f"Grafted best energy head (val_ener={best_ener:.4f} @ epoch {best_ener_epoch}) onto best-geometry model.")
+        model.refiner.load_state_dict(best_refiner_state)
+        print(f"Grafted best energy head + refiner (val_ener={best_ener:.4f} @ epoch {best_ener_epoch}) onto best-geometry model.")
     print("\n" + "="*70); print(" EVALUATION RESULTS "); print("="*70)
     model.eval()
     results = []
@@ -1151,7 +1229,7 @@ def train_pipeline(config):
         for batch in eval_loader:
             DR, DI, DP, DTS, mask, geom_mask, true_ea_norm, atom_ids, energy_feats, atom_phys = move_batch_to_device(batch, device)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_ea_norm = model(DR, DI, DP, mask, atom_ids, energy_feats, atom_phys)
+                p_DTS, p_ea_norm, _ = model(DR, DI, DP, mask, atom_ids, energy_feats, atom_phys)
             true_ea_real = true_ea_norm * ea_std + ea_mean
             p_ea_real = p_ea_norm * ea_std + ea_mean
             for i in range(len(batch["rxn_id"])):
@@ -1285,7 +1363,7 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         t_atom_ids = torch.from_numpy(atom_ids).unsqueeze(0).to(device)
         t_efeats = torch.from_numpy(energy_feats_norm).unsqueeze(0).to(device)
         t_aphys = torch.from_numpy(atom_phys_norm).unsqueeze(0).to(device)
-        p_DTS, p_ea_norm = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_efeats, t_aphys)
+        p_DTS, p_ea_norm, _ = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_efeats, t_aphys)
     pred_dist = p_DTS[0, :n, :n].cpu().numpy()
     pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
     np.fill_diagonal(pred_dist, 0.0)
