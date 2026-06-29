@@ -1,11 +1,11 @@
 # PSI Transition State Prediction
 
-PSI is a deep learning pipeline for predicting the 3D geometries and activation energies of transition states from reactant and product geometries.
+PSI is a deep learning pipeline for predicting the 3D geometries and activation energies (Ea) of chemical reaction transition states from only the reactant and product geometries.
 
 ## Overview
 This repository contains the full end-to-end pipeline:
 1. **Data Extraction**: Extracts XYZ coordinates and energies from Gaussian `.log` files.
-2. **Training Pipeline**: Trains a dual-headed Transformer + GRU architecture on reactant and product distance matrices to predict the transition state distance matrix and activation energy.
+2. **Training Pipeline**: Trains a state-of-the-art hybrid deep learning model to predict transition state geometries and activation energies.
 3. **Visualization**: Generates an interactive HTML dashboard using `plotly` to evaluate the model's predictions (activation energy parity plot, distance MAE histograms, etc.).
 
 ## Installation

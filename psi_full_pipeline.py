@@ -491,6 +491,16 @@ CONFIG = {
     "egnn_hidden": 128,
     "egnn_coord_clamp": 2.0,  # max per-step coordinate displacement (Angstrom)
     "geom_coarse_weight": 0.5,  # weight on the pre-EGNN (coarse) distance aux loss
+    # --- Learned activation-energy (Ea) head -----------------------------
+    # A small head consumes the EGNN's refined per-atom features (h_ts) + the
+    # signed reaction energy and regresses Ea. Trained jointly with geometry but
+    # only after a warmup, so its gradient reshapes the EGNN ("learn physics")
+    # once predicted TS geometries are good enough to learn from. PhysicsEa
+    # (Marcus/Hammond/OLS) is kept as a side-by-side baseline.
+    "ea_loss_weight": 1.0,     # weight on the Ea loss (computed on normalized Ea)
+    "ea_warmup_epochs": 200,   # geometry-only until here, then the Ea loss turns on
+    "ea_select_weight": 0.25,  # Ea contribution to checkpoint selection (post-warmup)
+    "ea_head_dropout": 0.25,   # dropout inside the Ea head MLP
     "lr": 1.5e-4,
     "weight_decay": 2e-3,
     "warmup_epochs": 40,
@@ -541,6 +551,8 @@ def move_batch_to_device(batch, device):
         batch["geom_mask"].to(device, non_blocking=True),
         batch["atom_ids"].to(device, non_blocking=True),
         batch["atom_phys"].to(device, non_blocking=True),
+        batch["Ea"].to(device, non_blocking=True),
+        batch["de_rxn"].to(device, non_blocking=True),
     )
 
 def extract_raw_data(config):
@@ -645,6 +657,7 @@ def build_reaction_samples(config):
                 "atom_ids": torch.from_numpy(atom_ids),
                 "mask": torch.from_numpy(mask),
                 "Ea_raw": ea,
+                "de_rxn_raw": float(e_p - e_r),  # signed reaction energy (kcal/mol), BEP driver
                 "energy_feats_raw": energy_feats,
                 "atom_phys_raw": atom_phys,
                 "D_TS": torch.from_numpy(D_TS),
@@ -654,11 +667,12 @@ def build_reaction_samples(config):
     return samples, atom_vocab, atom_types_map
 
 def compute_normalization(samples, indices):
-    """Compute atom-phys normalization stats over the given indices only.
+    """Compute atom-phys + Ea + de_rxn normalization stats over the given indices.
 
     Restricting to the training indices keeps validation reactions out of the
-    normalization statistics.  Ea and energy-feature normalization are no longer
-    needed -- activation energy is computed post-hoc by PhysicsEaCalculator.
+    normalization statistics.  Ea and de_rxn are normalized (z-scored) so the
+    learned Ea head regresses a well-scaled target/input; the physics Ea
+    baseline is unaffected (it reads raw kcal/mol values directly).
     """
     # Atom-physics normalization: collect all *valid* (non-padding) atom rows
     # across training samples and compute per-feature mean/std.
@@ -671,14 +685,29 @@ def compute_normalization(samples, indices):
     aphys_mean = all_aphys.mean(axis=0).astype(np.float32)
     aphys_std = all_aphys.std(axis=0).astype(np.float32)
     aphys_std[aphys_std < 1e-6] = 1.0
-    # Also report Ea range for information (no normalization needed).
+    # Ea z-score stats (target for the learned head).
     all_ea = np.array([samples[i]["Ea_raw"] for i in indices], dtype=np.float64)
-    print(f"Ea stats (train split): mean={all_ea.mean():.2f}, std={all_ea.std():.2f} kcal/mol")
+    ea_mean = float(all_ea.mean())
+    ea_std = float(all_ea.std())
+    if ea_std < 1e-6:
+        ea_std = 1.0
+    # de_rxn z-score stats (input feature to the head).
+    all_de = np.array([samples[i]["de_rxn_raw"] for i in indices], dtype=np.float64)
+    de_rxn_mean = float(all_de.mean())
+    de_rxn_std = float(all_de.std())
+    if de_rxn_std < 1e-6:
+        de_rxn_std = 1.0
+    print(f"Ea stats (train split): mean={ea_mean:.2f}, std={ea_std:.2f} kcal/mol")
     print(f"Ea range (train split): [{all_ea.min():.2f}, {all_ea.max():.2f}] kcal/mol")
+    print(f"de_rxn stats (train split): mean={de_rxn_mean:.2f}, std={de_rxn_std:.2f} kcal/mol")
     print(f"Atom-phys stats (train): mean={aphys_mean}, std={aphys_std}")
     return {
         "aphys_mean": aphys_mean,
         "aphys_std": aphys_std,
+        "ea_mean": ea_mean,
+        "ea_std": ea_std,
+        "de_rxn_mean": de_rxn_mean,
+        "de_rxn_std": de_rxn_std,
     }
 
 class ReactionDataset(Dataset):
@@ -686,7 +715,8 @@ class ReactionDataset(Dataset):
 
     Multiple views (e.g. augmented train vs. clean eval) share the same sample
     list and normalization stats; only the `augment` flag differs.
-    Ea is not returned here -- it is computed post-hoc via PhysicsEaCalculator.
+    Returns the raw Ea target (kcal/mol) and the z-scored de_rxn feature for the
+    learned Ea head; Ea is normalized inside the training loop using ea_mean/std.
     """
     def __init__(self, config, samples, atom_vocab, atom_types_map, stats, augment=False):
         self.config = config
@@ -696,6 +726,8 @@ class ReactionDataset(Dataset):
         self.augment = augment
         self.aphys_mean = stats["aphys_mean"]
         self.aphys_std = stats["aphys_std"]
+        self.de_rxn_mean = stats["de_rxn_mean"]
+        self.de_rxn_std = stats["de_rxn_std"]
 
     def __len__(self): return len(self.samples)
 
@@ -714,6 +746,7 @@ class ReactionDataset(Dataset):
         D_P = compute_distance_matrix(c_P)
         D_I = (D_R + D_P) / 2.0
         aphys_norm = (s["atom_phys_raw"] - self.aphys_mean) / self.aphys_std
+        de_rxn_norm = (s["de_rxn_raw"] - self.de_rxn_mean) / self.de_rxn_std
         return {
             "rxn_id": s["rxn_id"],
             "n_atoms": n,
@@ -725,6 +758,8 @@ class ReactionDataset(Dataset):
             "geom_mask": s["geom_mask"],
             "atom_ids": s["atom_ids"],
             "atom_phys": torch.from_numpy(aphys_norm.astype(np.float32)),
+            "Ea": torch.tensor(s["Ea_raw"], dtype=torch.float32),
+            "de_rxn": torch.tensor(de_rxn_norm, dtype=torch.float32),
         }
 
 class GaussianEmbedding(nn.Module):
@@ -1219,13 +1254,47 @@ class EGNN(nn.Module):
         return h, x
 
 
-class PSI(nn.Module):
-    """Geometry-only TS predictor.
+class EaHead(nn.Module):
+    """Learned activation-energy head on the EGNN's refined node features.
 
-    The model predicts a transition-state distance matrix (and optionally refines
-    it to 3D coordinates via an EGNN).  Activation energy is computed post-hoc
-    from the predicted 3D geometry using PhysicsEaCalculator (Marcus theory +
-    Bell-Evans-Polanyi + Hammond postulate), not learned by a neural network.
+    After the EGNN message-passing, each atom's feature vector `h_ts` encodes its
+    local 3D environment in the predicted TS (neighbour distances, angles). We
+    masked-mean-pool those per-atom features into a molecule descriptor, append
+    the signed reaction energy (z-scored de_rxn -- the Bell-Evans-Polanyi
+    driver), and regress a *normalized* Ea. The gradient flows back into the
+    EGNN, so the same message-passing that places the TS atoms also learns the
+    structure->energy relationship ("learn physics using the EGNN").
+
+    Output is the normalized Ea; callers denormalize with ea_mean/ea_std.
+    """
+    def __init__(self, node_dim, hidden, dropout=0.25):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(node_dim + 1, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 1),
+        )
+
+    def forward(self, h_ts, mask, de_rxn):
+        # Masked mean-pool over real atoms -> [B, node_dim]
+        m = mask.unsqueeze(-1)                                   # [B, N, 1]
+        pooled = (h_ts * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+        feat = torch.cat([pooled, de_rxn.unsqueeze(-1)], dim=-1)  # [B, node_dim + 1]
+        return self.net(feat).squeeze(-1)                        # [B] normalized Ea
+
+
+class PSI(nn.Module):
+    """Geometry + learned-Ea TS predictor.
+
+    The model predicts a transition-state distance matrix and refines it to 3D
+    coordinates via an EGNN.  Activation energy is regressed by a small EaHead
+    on the EGNN's refined node features (trained jointly after a warmup). The
+    physics-based PhysicsEaCalculator (Marcus + Bell-Evans-Polanyi + Hammond) is
+    retained separately as a baseline for comparison, not used inside the model.
     """
     def __init__(self, config, num_atom_types):
         super().__init__()
@@ -1248,6 +1317,12 @@ class PSI(nn.Module):
                 coord_clamp=config["egnn_coord_clamp"],
                 dropout=drop,
             )
+            # Learned Ea head on the EGNN's refined per-atom features (h_ts).
+            self.ea_head = EaHead(
+                node_dim=config["egnn_hidden"],
+                hidden=config["egnn_hidden"],
+                dropout=config.get("ea_head_dropout", drop),
+            )
 
     @staticmethod
     def _coords_to_distance(x, mask):
@@ -1259,17 +1334,23 @@ class PSI(nn.Module):
         valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         return dist * (1.0 - eye) * valid
 
-    def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys):
-        """Predict TS distance matrix (geometry only, no energy head).
+    def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys, de_rxn=None):
+        """Predict TS distance matrix and (optionally) the learned Ea.
 
+        Args:
+            de_rxn: [B] z-scored signed reaction energy, fed to the Ea head.
+                    May be None at geometry-only call sites; Ea is then None.
         Returns:
-            D_TS_pred:   [B, N, N] EGNN-refined TS distances (or coarse if EGNN off)
-            D_TS_coarse: [B, N, N] pre-EGNN coarse distances (for aux loss)
+            D_TS_pred:    [B, N, N] EGNN-refined TS distances (or coarse if EGNN off)
+            D_TS_coarse:  [B, N, N] pre-EGNN coarse distances (for aux loss)
+            ea_pred_norm: [B] normalized Ea from the EaHead, or None if the head
+                          is absent (EGNN off) or de_rxn was not supplied.
         """
         f = self.core(D_R, D_I, D_P, mask, atom_ids, atom_phys)
         atom_emb = self.core.atom_embed(atom_ids)
         # Coarse TS distance matrix from the geometry head.
         D_TS_coarse = self.geom_head(f, atom_emb, atom_phys, D_R, D_I, D_P, mask)
+        ea_pred_norm = None
         if self.egnn_enabled:
             # Chemical properties in one vector; predicted TS coordinates in the
             # other -- both fed to the EGNN. The MDS seed is detached so the
@@ -1282,11 +1363,15 @@ class PSI(nn.Module):
             # it in fp32 regardless of the outer autocast context.
             with torch.amp.autocast(device_type=D_R.device.type, enabled=False):
                 x_init = torch_mds_coords(D_TS_coarse.detach().float(), mask)
-                _h_ts, x_ts = self.egnn(node_feats.float(), x_init, mask)
+                # h_ts is NOT detached: the Ea loss backpropagates through the
+                # EGNN, so message passing learns the structure->energy relation.
+                h_ts, x_ts = self.egnn(node_feats.float(), x_init, mask)
                 D_TS_pred = self._coords_to_distance(x_ts, mask)
+                if de_rxn is not None:
+                    ea_pred_norm = self.ea_head(h_ts, mask, de_rxn.float())
         else:
             D_TS_pred = D_TS_coarse
-        return D_TS_pred, D_TS_coarse
+        return D_TS_pred, D_TS_coarse, ea_pred_norm
 
 class CosineAnnealingWarmup(torch.optim.lr_scheduler._LRScheduler):
     def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6, last_epoch=-1):
@@ -1304,26 +1389,31 @@ class CosineAnnealingWarmup(torch.optim.lr_scheduler._LRScheduler):
             cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
             return [self.min_lr + (base_lr - self.min_lr) * cosine for base_lr in self.base_lrs]
 
-def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, is_train=True):
-    """Geometry-only training loop.
+def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True):
+    """Joint geometry + Ea training loop.
 
-    All gradient signal goes to predicting the best TS structure. Activation
-    energy is computed post-hoc from the predicted 3D coordinates using
-    PhysicsEaCalculator (Marcus theory + Hammond postulate).
+    Geometry is the backbone objective. After `ea_warmup_epochs`, the learned Ea
+    loss is switched on so its gradient flows through the EGNN (the head trains
+    on the *predicted* TS, matching inference). The physics Ea baseline is
+    computed separately, post-training, and does not touch this loop.
     """
     if is_train:
         model.train()
     else:
         model.eval()
-    total_loss, total_geom, n_batches = 0.0, 0.0, 0
+    total_loss, total_geom, total_ea_mae, total_ea_norm, n_batches = 0.0, 0.0, 0.0, 0.0, 0
+    ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
+    # Ea loss is gated by the geometry warmup so the head learns from sane TS.
+    ea_active = epoch > config["ea_warmup_epochs"]
+    ea_w = config["ea_loss_weight"] if ea_active else 0.0
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
         for batch in loader:
-            DR, DI, DP, DTS, mask, _geom_mask, atom_ids, atom_phys = move_batch_to_device(batch, device)
+            DR, DI, DP, DTS, mask, _geom_mask, atom_ids, atom_phys, Ea, de_rxn = move_batch_to_device(batch, device)
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_DTS_coarse = model(DR, DI, DP, mask, atom_ids, atom_phys)
+                p_DTS, p_DTS_coarse, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn)
                 N = DR.shape[1]
                 valid_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
                 eye = torch.eye(N, device=mask.device, dtype=mask.dtype).unsqueeze(0)
@@ -1335,6 +1425,15 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # geometry head directly, giving the EGNN a stable MDS seed.
                 l_geom_coarse = F.huber_loss(p_DTS_coarse * m2d, DTS * m2d, reduction='sum', delta=0.5) / denom
                 loss = l_geom + config["geom_coarse_weight"] * l_geom_coarse
+                # Learned Ea loss on the normalized target (computed every epoch
+                # for monitoring; only added to `loss` once warmed up).
+                if ea_pred_norm is not None:
+                    ea_target_norm = (Ea - ea_mean) / ea_std
+                    l_ea = F.smooth_l1_loss(ea_pred_norm, ea_target_norm)
+                    if ea_w > 0.0:
+                        loss = loss + ea_w * l_ea
+                else:
+                    l_ea = None
             if is_train:
                 # Guard against a non-finite batch corrupting the weights: skip
                 # the step entirely rather than relying solely on GradScaler.
@@ -1348,11 +1447,17 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 scaler.update()
             total_loss += loss.item()
             total_geom += l_geom.item()
+            if l_ea is not None:
+                total_ea_norm += l_ea.item()
+                # Denormalized Ea MAE (kcal/mol) for human-readable tracking.
+                total_ea_mae += (ea_pred_norm.detach() - ea_target_norm).abs().mean().item() * ea_std
             n_batches += 1
     nb = max(n_batches, 1)
     return {
         "loss": total_loss / nb,
         "geom": total_geom / nb,
+        "ea_mae": total_ea_mae / nb,
+        "ea_norm": total_ea_norm / nb,
     }
 
 def train_pipeline(config):
@@ -1402,22 +1507,32 @@ def train_pipeline(config):
         "atom_vocab": atom_vocab,
         "aphys_mean": stats["aphys_mean"].tolist(),
         "aphys_std": stats["aphys_std"].tolist(),
+        "ea_mean": stats["ea_mean"],
+        "ea_std": stats["ea_std"],
+        "de_rxn_mean": stats["de_rxn_mean"],
+        "de_rxn_std": stats["de_rxn_std"],
         "config_snapshot": {k: v for k, v in config.items() if isinstance(v, (int, float, str, bool))},
     }
     print(f"\nTraining for up to {config['epochs']} epochs (patience={config['patience']})...")
-    print(f"  Geometry-only training: Ea will be computed post-hoc via Marcus theory.")
-    print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>11} | {'T.Geom':>8} | {'V.Geom':>8} | {'LR':>10}")
-    print("-" * 72)
+    print(f"  Joint geometry + learned Ea; Ea loss turns on after epoch {config['ea_warmup_epochs']}.")
+    print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>11} | {'T.Geom':>8} | {'V.Geom':>8} | {'V.EaMAE':>8} | {'LR':>10}")
+    print("-" * 84)
     best_val_loss = float('inf')
     patience_counter = 0
     history = []
     best_model_path = os.path.join(config["save_dir"], "psi_best.pt")
     for epoch in range(1, config["epochs"] + 1):
-        train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, is_train=True)
-        val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, is_train=False)
+        train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
+        val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
+        # Geometry is the primary selection signal; once the Ea loss is active,
+        # blend in the (normalized) Ea error so early stopping does not cut off a
+        # still-improving head. ea_select_weight keeps geometry dominant.
+        ea_active = epoch > config["ea_warmup_epochs"]
         val_select = val_metrics["geom"]
+        if ea_active:
+            val_select = val_select + config["ea_select_weight"] * val_metrics["ea_norm"]
         history.append({
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
@@ -1425,6 +1540,9 @@ def train_pipeline(config):
             "val_select": val_select,
             "train_geom": train_metrics["geom"],
             "val_geom": val_metrics["geom"],
+            "train_ea_mae": train_metrics["ea_mae"],
+            "val_ea_mae": val_metrics["ea_mae"],
+            "val_ea_norm": val_metrics["ea_norm"],
             "lr": current_lr,
         })
         improved = val_select < best_val_loss
@@ -1436,7 +1554,7 @@ def train_pipeline(config):
             marker = " *" if improved else ""
             print(f"{epoch:6d} | {train_metrics['loss']:11.4f} | {val_metrics['loss']:11.4f} | "
                   f"{train_metrics['geom']:8.5f} | {val_metrics['geom']:8.5f} | "
-                  f"{current_lr:10.2e}{marker}")
+                  f"{val_metrics['ea_mae']:8.3f} | {current_lr:10.2e}{marker}")
         if patience_counter >= config["patience"]:
             print(f"\nEarly stopping at epoch {epoch} (no improvement for {config['patience']} epochs)")
             break
@@ -1450,17 +1568,22 @@ def train_pipeline(config):
     # =========================================================================
     # Post-training: predict TS geometries, then compute Ea via physics
     # =========================================================================
-    print("\n" + "="*70); print(" EVALUATION (geometry + physics Ea) "); print("="*70)
+    print("\n" + "="*70); print(" EVALUATION (geometry + learned Ea + physics baseline) "); print("="*70)
     model.eval()
-    # Step 1: collect predicted TS distance matrices for all reactions.
+    # Step 1: collect predicted TS distance matrices + learned Ea for all reactions.
     pred_dists_map = {}   # rxn_id -> (n, n) numpy pred dist
+    ea_neural_map = {}    # rxn_id -> learned Ea (kcal/mol, denormalized)
+    ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
     geom_results = []
     val_rxn_ids = {samples[vi]["rxn_id"] for vi in val_indices}
     with torch.no_grad():
         for batch in eval_loader:
-            DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys = move_batch_to_device(batch, device)
+            DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, _Ea, de_rxn = move_batch_to_device(batch, device)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, _ = model(DR, DI, DP, mask, atom_ids, atom_phys)
+                p_DTS, _, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn)
+            ea_pred_kcal = None
+            if ea_pred_norm is not None:
+                ea_pred_kcal = (ea_pred_norm.float().cpu().numpy() * ea_std + ea_mean)
             for i in range(len(batch["rxn_id"])):
                 rxn_id = batch["rxn_id"][i]
                 n = int(mask[i].sum().item())
@@ -1473,6 +1596,8 @@ def train_pipeline(config):
                 d_mae_all = d_abs.mean().item()
                 split = "val" if rxn_id in val_rxn_ids else "train"
                 pred_dists_map[rxn_id] = dp
+                if ea_pred_kcal is not None:
+                    ea_neural_map[rxn_id] = float(ea_pred_kcal[i])
                 geom_results.append({
                     "rxn_id": rxn_id, "split": split, "n_atoms": n,
                     "dist_MAE": d_mae, "dist_MAE_all": d_mae_all,
@@ -1515,22 +1640,29 @@ def train_pipeline(config):
     train_coords_ordered = [all_coords_ts[samples[i]["rxn_id"]] for i in train_indices]
     train_X, train_y = ea_calculator.compute_features_batch(train_samples_ordered, train_coords_ordered, config)
     ea_calculator.fit(train_X, train_y)
-    # Step 3: predict Ea for all reactions and assemble final results.
+    # Step 3: assemble results. Primary Ea is the learned neural head; the
+    # physics calculator (Marcus/Hammond/OLS) is reported alongside as a baseline.
+    samples_by_id = {s["rxn_id"]: s for s in samples}
     results = []
     for gr in geom_results:
         rxn_id = gr["rxn_id"]
-        s = next(s for s in samples if s["rxn_id"] == rxn_id)
+        s = samples_by_id[rxn_id]
         n = s["n_atoms"]
         c_R = np.asarray(s["c_R"][:n], dtype=np.float64)
         c_P = np.asarray(s["c_P"][:n], dtype=np.float64)
         c_TS_pred = all_coords_ts[rxn_id]
         de_rxn = float(s["energy_feats_raw"][1])
-        ea_pred = ea_calculator.predict_single(c_R, c_TS_pred, c_P, s["atom_types"], n, de_rxn)
         ea_true = s["Ea_raw"]
+        # Physics baseline.
+        ea_physics = ea_calculator.predict_single(c_R, c_TS_pred, c_P, s["atom_types"], n, de_rxn)
+        # Learned head (falls back to physics if EGNN/head disabled).
+        ea_pred = ea_neural_map.get(rxn_id, ea_physics)
         results.append({
             **gr,
             "Ea_true": ea_true, "Ea_pred": ea_pred,
             "Ea_error": abs(ea_pred - ea_true),
+            "Ea_pred_physics": ea_physics,
+            "Ea_error_physics": abs(ea_physics - ea_true),
         })
     # Save PhysicsEa coefficients into metadata for inference
     metadata["physics_ea_coeffs"] = ea_calculator.coeffs.tolist()
@@ -1538,18 +1670,19 @@ def train_pipeline(config):
     val_results = [r for r in results if r["split"] == "val"]
     def print_stats(name, res_list):
         if not res_list: return
-        ea_errs = [r["Ea_error"] for r in res_list]
         d_maes = [r["dist_MAE"] for r in res_list]
         ea_trues = [r["Ea_true"] for r in res_list]
         ea_preds = [r["Ea_pred"] for r in res_list]
+        ea_phys = [r["Ea_pred_physics"] for r in res_list]
         corr = np.corrcoef(ea_trues, ea_preds)[0, 1] if len(ea_trues) > 1 else 0.0
         r2 = _r2(ea_trues, ea_preds)
+        mae_neural = float(np.mean([r["Ea_error"] for r in res_list]))
+        r2_phys = _r2(ea_trues, ea_phys)
+        mae_phys = float(np.mean([r["Ea_error_physics"] for r in res_list]))
         print(f"\n{name} ({len(res_list)} reactions):")
-        print(f"  Ea MAE:         {np.mean(ea_errs):8.2f} kcal/mol")
-        print(f"  Ea R²:          {r2:8.4f}")
-        print(f"  Ea Correlation:  {corr:8.4f}")
-        print(f"  Dist MAE:       {np.mean(d_maes):8.4f} Å")
-        print(f"  Dist MAE std:   {np.std(d_maes):8.4f} Å")
+        print(f"  Ea MAE (neural):   {mae_neural:8.2f} kcal/mol   |  R²: {r2:7.4f}   r: {corr:7.4f}")
+        print(f"  Ea MAE (physics):  {mae_phys:8.2f} kcal/mol   |  R²: {r2_phys:7.4f}   (baseline)")
+        print(f"  Dist MAE:          {np.mean(d_maes):8.4f} Å      |  std: {np.std(d_maes):.4f} Å")
     print_stats("TRAIN SET", train_results)
     print_stats("VALIDATION SET", val_results)
     print_stats("ALL DATA", results)
@@ -1588,6 +1721,12 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     num_atom_types = max(atom_vocab.values())
     aphys_mean = np.array(meta["aphys_mean"], dtype=np.float32)
     aphys_std = np.array(meta["aphys_std"], dtype=np.float32)
+    # Ea / de_rxn normalization stats for the learned head (older checkpoints
+    # without a learned head won't have these -> neural Ea is then skipped).
+    ea_mean = meta.get("ea_mean")
+    ea_std = meta.get("ea_std")
+    de_rxn_mean = meta.get("de_rxn_mean", 0.0)
+    de_rxn_std = meta.get("de_rxn_std", 1.0)
     n = len(r_atoms)
     c_R = padded_coords(r_atoms, config["max_atoms"])
     c_P = padded_coords(p_atoms, config["max_atoms"])
@@ -1615,6 +1754,11 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         atom_ids[i] = atom_vocab[atom_type]
     atom_phys = build_atom_physical_features(r_types, n, config["max_atoms"])
     atom_phys_norm = (atom_phys - aphys_mean) / aphys_std
+    # Signed reaction energy (kcal/mol) -> z-scored input to the learned Ea head.
+    e_r = reactant["energy"] * config["hartree_to_kcal"]
+    e_p = product["energy"] * config["hartree_to_kcal"]
+    de_rxn = e_p - e_r
+    de_rxn_norm = (de_rxn - de_rxn_mean) / de_rxn_std
     model = PSI(config, num_atom_types).to(device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -1625,7 +1769,12 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         t_mask = torch.from_numpy(mask).unsqueeze(0).to(device)
         t_atom_ids = torch.from_numpy(atom_ids).unsqueeze(0).to(device)
         t_aphys = torch.from_numpy(atom_phys_norm).unsqueeze(0).to(device)
-        p_DTS, _ = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_aphys)
+        t_de_rxn = torch.tensor([de_rxn_norm], dtype=torch.float32, device=device)
+        p_DTS, _, ea_pred_norm = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_aphys, t_de_rxn)
+    # Learned Ea (denormalized); None if the checkpoint predates the head.
+    ea_neural = None
+    if ea_pred_norm is not None and ea_mean is not None and ea_std is not None:
+        ea_neural = float(ea_pred_norm.float().cpu().item() * ea_std + ea_mean)
     pred_dist = p_DTS[0, :n, :n].cpu().numpy()
     pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
     np.fill_diagonal(pred_dist, 0.0)
@@ -1652,19 +1801,19 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         reference_coords=c_I_real,
         bond_scale=config["fragment_bond_scale"],
     )
-    # Physics-based Ea from the predicted 3D TS coordinates.
-    e_r = reactant["energy"] * config["hartree_to_kcal"]
-    e_p = product["energy"] * config["hartree_to_kcal"]
-    de_rxn = e_p - e_r
+    # Physics-based Ea baseline from the predicted 3D TS coordinates.
     ea_calculator = PhysicsEaCalculator(
         bond_scale=config["fragment_bond_scale"],
         spectator_threshold=config["spectator_threshold"],
     )
     ea_calculator.coeffs = np.array(meta["physics_ea_coeffs"], dtype=np.float64)
     ea_calculator.fitted = True
-    energy_pred = ea_calculator.predict_single(
+    ea_physics = ea_calculator.predict_single(
         c_R[:n], pred_coords, c_P[:n], r_types[:n], n, de_rxn
     )
+    # Primary Ea is the learned head; fall back to physics for legacy checkpoints.
+    energy_pred = ea_neural if ea_neural is not None else ea_physics
+    ea_source = "neural" if ea_neural is not None else "physics (no learned head in checkpoint)"
     result = {
         "reactant_path": reactant_path,
         "product_path": product_path,
@@ -1672,6 +1821,8 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         "n_atoms": n,
         "atom_types": r_types,
         "Ea_pred": energy_pred,
+        "Ea_pred_physics": ea_physics,
+        "Ea_source": ea_source,
         "D_I": D_I[:n, :n].tolist(),
         "D_pred": pred_dist.tolist(),
         "geom_mask": geom_mask[:n, :n].tolist(),
@@ -1685,7 +1836,8 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     print(" PREDICTION RESULT ")
     print("="*70)
     print(f"Atoms: {n}")
-    print(f"Predicted activation energy: {energy_pred:.4f} kcal/mol")
+    print(f"Predicted activation energy ({ea_source}): {energy_pred:.4f} kcal/mol")
+    print(f"  Physics baseline: {ea_physics:.4f} kcal/mol")
     print(f"Prediction JSON saved to: {output_path}")
     if xyz_path:
         print(f"Predicted TS XYZ saved to: {xyz_path}")
@@ -1707,12 +1859,16 @@ def _r2(true, pred):
     return 1.0 - ss_res / ss_tot
 
 
-def energy_metrics(records):
-    """Regression metrics for the activation-energy prediction over `records`."""
-    if not records:
+def energy_metrics(records, pred_key="Ea_pred"):
+    """Regression metrics for an activation-energy prediction over `records`.
+
+    `pred_key` selects which prediction column to score (the learned head's
+    "Ea_pred" by default, or "Ea_pred_physics" for the baseline).
+    """
+    if not records or pred_key not in records[0]:
         return {"n": 0, "MAE": 0.0, "RMSE": 0.0, "R2": 0.0, "Pearson": 0.0, "MAPE": 0.0}
     true = np.array([r["Ea_true"] for r in records], dtype=np.float64)
-    pred = np.array([r["Ea_pred"] for r in records], dtype=np.float64)
+    pred = np.array([r[pred_key] for r in records], dtype=np.float64)
     err = pred - true
     mae = float(np.mean(np.abs(err)))
     rmse = float(np.sqrt(np.mean(err ** 2)))
@@ -1783,8 +1939,15 @@ def create_dashboard(data_path, save_dir):
     train_data = [r for r in data if r["split"] == "train"]
     val_data = [r for r in data if r["split"] == "val"]
 
-    # Full regression metric breakdown (Train / Val / All) for both heads.
+    # Full regression metric breakdown (Train / Val / All).
     ea_metrics = {"Train": energy_metrics(train_data), "Val": energy_metrics(val_data), "All": energy_metrics(data)}
+    # Physics baseline (only present if the results carry "Ea_pred_physics").
+    ea_phys_metrics = {
+        "Train": energy_metrics(train_data, "Ea_pred_physics"),
+        "Val": energy_metrics(val_data, "Ea_pred_physics"),
+        "All": energy_metrics(data, "Ea_pred_physics"),
+    }
+    has_physics = "Ea_pred_physics" in data[0] if data else False
     geom_metrics = {"Train": geometry_metrics(train_data), "Val": geometry_metrics(val_data), "All": geometry_metrics(data)}
 
     def _metric_rows(metric_map, fields):
@@ -1801,13 +1964,19 @@ def create_dashboard(data_path, save_dir):
     fpct = lambda v: f"{v:.1f}%"
 
     energy_metric_rows = _metric_rows(ea_metrics, [
-        ("R²", "R2", f3),
-        ("Pearson R", "Pearson", f3),
+        ("R² (neural)", "R2", f3),
+        ("Pearson R (neural)", "Pearson", f3),
         ("MAE (kcal/mol)", "MAE", f2),
         ("RMSE (kcal/mol)", "RMSE", f2),
         ("MAPE", "MAPE", fpct),
         ("Count", "n", lambda v: str(int(v))),
     ])
+    # Append the physics baseline (R²/MAE) so neural vs physics is visible inline.
+    if has_physics:
+        energy_metric_rows += _metric_rows(ea_phys_metrics, [
+            ("R² (physics baseline)", "R2", f3),
+            ("MAE physics (kcal/mol)", "MAE", f2),
+        ])
     geometry_metric_rows = _metric_rows(geom_metrics, [
         ("R²", "R2", f3),
         ("MAE (Å)", "MAE", f4),

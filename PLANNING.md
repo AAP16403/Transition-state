@@ -1,128 +1,52 @@
-# PSI Pipeline — Suggested Changes (planning only, not yet applied)
+# PSI Pipeline — Consolidated Development Plan
 
-This file lists improvements found while reading `psi_full_pipeline.py`, the
-README, and the repo layout. Nothing here has been implemented — it is a backlog
-for review. Items are grouped by severity.
+This document outlines a prioritized plan to improve the correctness, performance, and reproducibility of the `psi_cloud_pipeline.py` script.
 
 ---
 
-## A. Correctness / consistency (highest value)
+## A. Correctness & Reproducibility (Highest Priority)
 
-### A1. Eval vs. inference post-processing mismatch — affects Ea accuracy
-The TS distance matrix is post-processed differently in the two code paths:
+### A1. Unify Prediction Post-Processing
+**Problem**: The post-processing steps applied to the predicted transition state (TS) distance matrix are different between the training evaluation (`train_pipeline`) and the inference (`predict_transition_state`) code paths. The inference path includes extra steps like `apply_spectator_constraints` and `enforce_triangle_inequality` that are missing from the training evaluation.
+**Impact**: This is a critical correctness bug. The `PhysicsEaCalculator` is trained on geometries generated from one distribution of post-processing, but at inference time, it sees geometries from a different distribution. This mismatch can silently degrade the accuracy of the final activation energy (Ea) predictions.
+**Solution**: Create a single, shared helper function that contains the complete and consistent set of post-processing steps. This function will be called from both the training and inference paths to guarantee they are identical.
 
-- **Training eval** (`train_pipeline`, ~lines 1499–1511): symmetrize → zero
-  diagonal → `clamp_steric_collisions` → `mds_by_fragments`. **No**
-  `apply_spectator_constraints`, **no** `enforce_triangle_inequality`.
-- **Inference** (`predict_transition_state`, ~lines 1630–1654): same, **plus**
-  `apply_spectator_constraints` and `enforce_triangle_inequality`.
+### A2. Ensure Reproducible Augmentation
+**Problem**: The coordinate augmentation noise added in `ReactionDataset.__getitem__` uses an unseeded random number generator (`np.random.randn`).
+**Impact**: This makes training runs non-reproducible. Even with the same train/validation split, the model will see slightly different data in each run, leading to variance in final performance and making it difficult to reliably compare experiments.
+**Solution**: Add a seed to the random number generator within `__getitem__`. A simple `np.random.seed(idx)` is a good first step. For multi-worker data loading, this will need to be evolved to a per-worker seeding strategy, but it is a crucial first step for reproducibility.
 
-Consequence: the `PhysicsEaCalculator` OLS coefficients are fit on TS coordinates
-produced *without* spectator/triangle post-processing, but at prediction time the
-coordinates *do* get those steps. The distribution the coefficients were fit on
-differs from what they see at inference — a silent accuracy leak for Ea.
-
-**Fix:** factor the post-processing into one shared helper, e.g.
-`postprocess_pred_distance(pred_dist, D_R, D_P, atom_types, n, fragments, config)`,
-and call it from both paths so eval and inference are identical.
-
-### A2. Activation-energy reference point
-In `build_reaction_samples` (~line 622):
-```python
-ea = (ts_e["energy"] - max(r_e["energy"], p_e["energy"])) * hartree_to_kcal
-```
-Ea is measured from the *higher-energy endpoint* (max of R, P), not from the
-reactant. For an endothermic reaction this is the reverse barrier, not the
-forward one. If the intent is the forward barrier, this should be
-`ts_e["energy"] - r_e["energy"]`. **Confirm which barrier is intended** and add a
-one-line comment documenting the choice either way.
+### A3. Clarify Activation Energy Definition
+**Problem**: The calculation of the raw activation energy in `build_reaction_samples` is `ts_e["energy"] - max(r_e["energy"], p_e["energy"])`. This means Ea is calculated relative to the higher-energy state (reactant or product). For endothermic reactions, this corresponds to the reverse barrier, not the forward one.
+**Impact**: This can be a source of confusion and may not align with the standard definition of a forward activation barrier.
+**Solution**: Change the calculation to be `ts_e["energy"] - r_e["energy"]` to consistently represent the forward activation energy. Add a comment to clarify this definition.
 
 ---
 
-## B. Dead code / clarity
+## B. Code Simplification & Performance
 
-### B1. Dead initialization in `train_pipeline`
-Line ~1491 `train_X, train_y = [], []` is overwritten at ~line 1516 by
-`ea_calculator.compute_features_batch(...)`. Remove the dead assignment.
-(Same for `all_coords_ts = {}` pattern — that one is used, keep it.)
+### B1. Streamline Feature Generation
+**Problem**: The `build_energy_features` function calculates a 20-dimensional feature vector, but only one feature (`de_rxn_signed`) is ever used by the `PhysicsEaCalculator`. The expensive bond-angle calculations are dead weight.
+**Impact**: This adds unnecessary computational overhead to the data loading hot path for every single sample.
+**Solution**: Remove the call to `build_energy_features`. Instead, directly calculate and store the single required value (`de_rxn_raw`) in each sample dictionary. This will significantly speed up the `build_reaction_samples` step.
 
-### B2. `build_energy_features` is now almost entirely unused
-The function computes a 20-D vector (energetics + bond-angle stats), but after
-the move to `PhysicsEaCalculator` only index `[1]` (`de_rxn_signed`) is ever
-read (see `compute_features_batch` ~line 1041 and `predict_transition_state`
-~line 1527). The angle statistics, composition counts, etc. are dead weight
-computed for every one of ~5000 samples at build time.
+### B2. Optimize Results Assembly Lookup
+**Problem**: During the final results assembly in `train_pipeline`, a linear scan (`next(s for s in samples if s["rxn_id"] == rxn_id)`) is performed inside a loop, resulting in O(n²) complexity.
+**Impact**: This can be slow for large datasets.
+**Solution**: Pre-build a dictionary that maps `rxn_id` to the sample object. This will change the lookup from an O(n) scan to an O(1) dictionary access, speeding up the final results assembly.
 
-**Options:**
-- Minimal: replace the stored `energy_feats_raw` with a single scalar
-  `de_rxn_signed = e_p - e_r` and update the two read sites.
-- Or keep `build_energy_features` but stop calling it in the hot path.
-
-This also removes the per-sample bond-angle graph construction
-(`bond_angles_from_coords` ×2), which is the most expensive part of
-`build_reaction_samples`.
+### B3. Remove Redundant Code
+**Problem**: There are minor instances of dead code, such as the initialization of `train_X, train_y = [], []` in `train_pipeline`, which is immediately overwritten.
+**Impact**: Reduces code clarity.
+**Solution**: Remove the unnecessary initializations.
 
 ---
 
-## C. Performance
+## C. Documentation
 
-### C1. O(n²) rxn lookup in results assembly
-`train_pipeline` ~line 1522:
-```python
-s = next(s for s in samples if s["rxn_id"] == rxn_id)
-```
-runs a linear scan inside a loop over all reactions → O(n²) (n ≈ 5000).
-Build `samples_by_id = {s["rxn_id"]: s for s in samples}` once and index it.
-
-### C2. `detailed_analysis.json` size
-For every reaction the eval loop stores full `D_I`, `D_pred`, `D_true`, and
-`geom_mask` as nested lists (~line 1479). At ~5000 reactions × 4 × 30×30 floats
-this JSON can reach hundreds of MB and is slow to (de)serialize for the
-dashboard. Consider: store only the upper triangle, or only the
-representative/worst subset needed by the dashboard, or switch to `.npz`.
-
-### C3. Duplicate distance-matrix builds in physics features
-`compute_reorganization_energy` and `hammond_index` each rebuild `D_R/D_TS/D_P`
-from coordinates with their own O(n²) loops (lines ~909 and ~951). When both run
-for the same reaction (the normal path) the matrices are computed twice. Compute
-once and pass them in.
-
----
-
-## D. Reproducibility / robustness
-
-### D1. Unseeded augmentation noise
-`ReactionDataset.__getitem__` uses `np.random.randn(...)` (~lines 709–710) for
-coordinate noise. The train/val split is seeded (`split_seed`) but the
-augmentation RNG is not, so runs aren't reproducible. Seed NumPy (and consider
-a per-worker seed if `num_workers > 0` is ever used).
-
-### D2. `print_every` interacts oddly with `improved`
-Minor: the epoch line prints on `improved` regardless of `print_every`, which is
-fine, but early in training nearly every epoch "improves," so the log is dense
-at the start. Optional: gate verbose printing.
-
----
-
-## E. Documentation
-
-### E1. README is stale (already noted in review)
-`README.md` lines 8 and 45 describe a "dual-headed Transformer + GRU" with an
-"Energy Head with cross-attention to predict Ea." That head was removed; Ea is
-now post-hoc via `PhysicsEaCalculator` (Marcus + Hammond + BEP, 4 OLS coeffs).
-Update the Overview and Architecture sections to describe:
-- Geometry-only neural model (PSICore → GeometryHead → optional EGNN refiner).
-- Post-hoc physics-based Ea.
-
-### E2. Document the EGNN toggle and physics-Ea in README usage
-`CONFIG["egnn_enabled"]` and the physics-Ea coefficients saved into checkpoint
-metadata (`physics_ea_coeffs`) are not mentioned anywhere user-facing.
-
----
-
-## Suggested order of work
-1. A1 (shared post-processing) and A2 (Ea reference) — correctness.
-2. B1, B2 — remove dead/duplicated work.
-3. C1 — trivial speedup; C2/C3 if dataset size becomes a pain point.
-4. D1 — reproducibility.
-5. E1/E2 — docs.
+### C1. Update README Architecture
+**Problem**: The `README.md` is out of date. It describes an "Energy Head" that was part of a previous architecture (`psi_full_pipeline.py`). The current `psi_cloud_pipeline.py` uses a `PhysicsEaCalculator` instead.
+**Impact**: New users or collaborators will be confused about how the model works.
+**Solution**: Update the "Architecture" section of the `README.md` to accurately describe the current two-step process:
+1. A geometry-only neural network (`PSI`) predicts the 3D coordinates of the TS.
+2. A separate, post-hoc `PhysicsEaCalculator` uses these coordinates and classical chemical principles (Marcus Theory, Hammond Postulate) to calculate the Ea via a simple linear model.
