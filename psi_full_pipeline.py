@@ -147,6 +147,7 @@ def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=
     return feats
 
 ATOM_PHYS_DIM = 3  # electronegativity, atomic number, mass
+ENERGY_FEAT_DIM = 20  # reaction energetics + composition + bond-angle statistics
 
 def build_atom_physical_features(atom_types, n, max_atoms):
     """Per-atom physical descriptors: [EN, Z, Mass] for each atom, zero-padded.
@@ -521,6 +522,7 @@ CONFIG = {
     "spectator_tol": 0.05,
     "fragment_bond_scale": 1.45,
     "hartree_to_kcal": 627.509,
+    "skip_negative_ea": True,
 }
 
 def resolve_device(config):
@@ -553,6 +555,7 @@ def move_batch_to_device(batch, device):
         batch["atom_phys"].to(device, non_blocking=True),
         batch["Ea"].to(device, non_blocking=True),
         batch["de_rxn"].to(device, non_blocking=True),
+        batch["energy_feats"].to(device, non_blocking=True),
     )
 
 def extract_raw_data(config):
@@ -632,6 +635,8 @@ def build_reaction_samples(config):
             mask = np.zeros(config["max_atoms"], dtype=np.float32)
             mask[:n] = 1.0
             ea = (ts_e["energy"] - max(r_e["energy"], p_e["energy"])) * config["hartree_to_kcal"]
+            if config.get("skip_negative_ea", True) and ea < 0:
+                continue
             e_r = r_e["energy"] * config["hartree_to_kcal"]
             e_p = p_e["energy"] * config["hartree_to_kcal"]
             atom_types = [a["atom"] for a in ts_e["atoms"]]
@@ -701,6 +706,12 @@ def compute_normalization(samples, indices):
     print(f"Ea range (train split): [{all_ea.min():.2f}, {all_ea.max():.2f}] kcal/mol")
     print(f"de_rxn stats (train split): mean={de_rxn_mean:.2f}, std={de_rxn_std:.2f} kcal/mol")
     print(f"Atom-phys stats (train): mean={aphys_mean}, std={aphys_std}")
+    # Energy-feature normalization: z-score the 20D reaction descriptor vector.
+    all_efeats = np.array([samples[i]["energy_feats_raw"] for i in indices], dtype=np.float32)
+    efeat_mean = all_efeats.mean(axis=0).astype(np.float32)
+    efeat_std = all_efeats.std(axis=0).astype(np.float32)
+    efeat_std[efeat_std < 1e-6] = 1.0
+    print(f"Energy-feats stats (train): mean_range=[{efeat_mean.min():.2f}, {efeat_mean.max():.2f}]")
     return {
         "aphys_mean": aphys_mean,
         "aphys_std": aphys_std,
@@ -708,6 +719,8 @@ def compute_normalization(samples, indices):
         "ea_std": ea_std,
         "de_rxn_mean": de_rxn_mean,
         "de_rxn_std": de_rxn_std,
+        "efeat_mean": efeat_mean,
+        "efeat_std": efeat_std,
     }
 
 class ReactionDataset(Dataset):
@@ -728,6 +741,8 @@ class ReactionDataset(Dataset):
         self.aphys_std = stats["aphys_std"]
         self.de_rxn_mean = stats["de_rxn_mean"]
         self.de_rxn_std = stats["de_rxn_std"]
+        self.efeat_mean = stats["efeat_mean"]
+        self.efeat_std = stats["efeat_std"]
 
     def __len__(self): return len(self.samples)
 
@@ -747,6 +762,7 @@ class ReactionDataset(Dataset):
         D_I = (D_R + D_P) / 2.0
         aphys_norm = (s["atom_phys_raw"] - self.aphys_mean) / self.aphys_std
         de_rxn_norm = (s["de_rxn_raw"] - self.de_rxn_mean) / self.de_rxn_std
+        efeat_norm = (s["energy_feats_raw"] - self.efeat_mean) / self.efeat_std
         return {
             "rxn_id": s["rxn_id"],
             "n_atoms": n,
@@ -760,6 +776,7 @@ class ReactionDataset(Dataset):
             "atom_phys": torch.from_numpy(aphys_norm.astype(np.float32)),
             "Ea": torch.tensor(s["Ea_raw"], dtype=torch.float32),
             "de_rxn": torch.tensor(de_rxn_norm, dtype=torch.float32),
+            "energy_feats": torch.from_numpy(efeat_norm.astype(np.float32)),
         }
 
 class GaussianEmbedding(nn.Module):
@@ -1131,10 +1148,14 @@ def torch_mds_coords(D, mask, dim=3):
         [B, N, dim] coordinates, zeroed on padded atoms.
     """
     B, N, _ = D.shape
-    m = mask.to(torch.float64)                       # [B, N]
+    # Move to CPU for eigh: CPU LAPACK is far faster than GPU for small (30x30)
+    # batched matrices, and this path is detached so no backward is needed.
+    D_cpu = D.detach().cpu()
+    mask_cpu = mask.detach().cpu()
+    m = mask_cpu.to(torch.float64)                       # [B, N]
     pair = m.unsqueeze(-1) * m.unsqueeze(-2)         # [B, N, N] valid atom pairs
     cnt = m.sum(dim=1).clamp(min=1.0)                # [B] atoms per molecule
-    S = (D.to(torch.float64) ** 2) * pair            # squared, masked
+    S = (D_cpu.to(torch.float64) ** 2) * pair            # squared, masked
     # Masked double centering: subtract row/col/grand means over valid atoms.
     row_mean = S.sum(dim=2) / cnt.unsqueeze(-1)                      # [B, N]
     grand = S.sum(dim=(1, 2)) / (cnt ** 2)                          # [B]
@@ -1147,10 +1168,9 @@ def torch_mds_coords(D, mask, dim=3):
     # exactly-repeated (zero) eigenvalues from the padded block, and a single
     # degenerate element can make the *batched* GPU solver fail to converge
     # ("too many repeated eigenvalues", LinAlgError). Lift the degeneracy with a
-    # tiny diagonal jitter, and fall back to the more robust CPU LAPACK solver,
-    # then to a zero seed, if it still fails. This path is detached and only
-    # seeds the EGNN, so a defensive fallback never corrupts the trained signal.
-    eyeN = torch.eye(N, device=Bmat.device, dtype=Bmat.dtype).unsqueeze(0)
+    # tiny diagonal jitter. Running on CPU avoids the GPU eigh convergence issue
+    # entirely and is faster for small matrices.
+    eyeN = torch.eye(N, dtype=Bmat.dtype).unsqueeze(0)
     Bmat = Bmat + 1e-6 * eyeN
     evals, evecs = torch.linalg.eigh(Bmat)       # ascending eigenvalues
     top_vals = evals[:, -dim:].flip(-1).clamp(min=0.0)              # [B, dim]
@@ -1161,7 +1181,8 @@ def torch_mds_coords(D, mask, dim=3):
     # LinAlgError raised), which would poison the EGNN every forward pass. This
     # seed is detached, so replacing a bad embedding with zeros is harmless.
     coords = torch.nan_to_num(coords, nan=0.0, posinf=0.0, neginf=0.0)
-    return coords.to(D.dtype)
+    # Move result back to the original device (GPU) for the EGNN.
+    return coords.to(D.dtype).to(D.device)
 
 
 class EGCL(nn.Module):
@@ -1267,10 +1288,12 @@ class EaHead(nn.Module):
 
     Output is the normalized Ea; callers denormalize with ea_mean/ea_std.
     """
-    def __init__(self, node_dim, hidden, dropout=0.25):
+    def __init__(self, node_dim, hidden, energy_feat_dim=0, dropout=0.25):
         super().__init__()
+        # Input: pooled EGNN features + de_rxn scalar + energy descriptor vector
+        in_dim = node_dim + 1 + energy_feat_dim
         self.net = nn.Sequential(
-            nn.Linear(node_dim + 1, hidden),
+            nn.Linear(in_dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, hidden // 2),
@@ -1279,11 +1302,14 @@ class EaHead(nn.Module):
             nn.Linear(hidden // 2, 1),
         )
 
-    def forward(self, h_ts, mask, de_rxn):
+    def forward(self, h_ts, mask, de_rxn, energy_feats=None):
         # Masked mean-pool over real atoms -> [B, node_dim]
         m = mask.unsqueeze(-1)                                   # [B, N, 1]
         pooled = (h_ts * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
-        feat = torch.cat([pooled, de_rxn.unsqueeze(-1)], dim=-1)  # [B, node_dim + 1]
+        parts = [pooled, de_rxn.unsqueeze(-1)]                   # [B, node_dim], [B, 1]
+        if energy_feats is not None:
+            parts.append(energy_feats)                            # [B, 20]
+        feat = torch.cat(parts, dim=-1)
         return self.net(feat).squeeze(-1)                        # [B] normalized Ea
 
 
@@ -1317,10 +1343,12 @@ class PSI(nn.Module):
                 coord_clamp=config["egnn_coord_clamp"],
                 dropout=drop,
             )
-            # Learned Ea head on the EGNN's refined per-atom features (h_ts).
+            # Learned Ea head on the EGNN's refined per-atom features (h_ts)
+            # plus 20D energy descriptor (composition, bond-angle stats).
             self.ea_head = EaHead(
                 node_dim=config["egnn_hidden"],
                 hidden=config["egnn_hidden"],
+                energy_feat_dim=ENERGY_FEAT_DIM,
                 dropout=config.get("ea_head_dropout", drop),
             )
 
@@ -1334,12 +1362,14 @@ class PSI(nn.Module):
         valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         return dist * (1.0 - eye) * valid
 
-    def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys, de_rxn=None):
+    def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys, de_rxn=None, energy_feats=None):
         """Predict TS distance matrix and (optionally) the learned Ea.
 
         Args:
             de_rxn: [B] z-scored signed reaction energy, fed to the Ea head.
                     May be None at geometry-only call sites; Ea is then None.
+            energy_feats: [B, 20] z-scored molecular descriptor vector
+                    (composition, bond-angle stats) for the Ea head.
         Returns:
             D_TS_pred:    [B, N, N] EGNN-refined TS distances (or coarse if EGNN off)
             D_TS_coarse:  [B, N, N] pre-EGNN coarse distances (for aux loss)
@@ -1358,17 +1388,18 @@ class PSI(nn.Module):
             # (keeping eigh's unstable backward out of the graph) while the EGNN
             # learns the coordinate refinement under the main geometry loss.
             node_feats = torch.cat([atom_emb, atom_phys], dim=-1)
-            # Coordinate-space refinement is fp16-overflow-prone (squared
-            # interatomic distances) and numerically delicate (MDS eigh), so run
-            # it in fp32 regardless of the outer autocast context.
+            # Coordinate-space MDS is numerically delicate (eigh) and runs on
+            # CPU for speed; only the eigh needs fp32/fp64.  The EGNN itself
+            # stays under the outer AMP context for full GPU throughput.
             with torch.amp.autocast(device_type=D_R.device.type, enabled=False):
                 x_init = torch_mds_coords(D_TS_coarse.detach().float(), mask)
-                # h_ts is NOT detached: the Ea loss backpropagates through the
-                # EGNN, so message passing learns the structure->energy relation.
-                h_ts, x_ts = self.egnn(node_feats.float(), x_init, mask)
-                D_TS_pred = self._coords_to_distance(x_ts, mask)
-                if de_rxn is not None:
-                    ea_pred_norm = self.ea_head(h_ts, mask, de_rxn.float())
+            # h_ts is NOT detached: the Ea loss backpropagates through the
+            # EGNN, so message passing learns the structure->energy relation.
+            h_ts, x_ts = self.egnn(node_feats, x_init, mask)
+            D_TS_pred = self._coords_to_distance(x_ts, mask)
+            if de_rxn is not None:
+                ef = energy_feats.float() if energy_feats is not None else None
+                ea_pred_norm = self.ea_head(h_ts, mask, de_rxn.float(), ef)
         else:
             D_TS_pred = D_TS_coarse
         return D_TS_pred, D_TS_coarse, ea_pred_norm
@@ -1409,11 +1440,11 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
         for batch in loader:
-            DR, DI, DP, DTS, mask, _geom_mask, atom_ids, atom_phys, Ea, de_rxn = move_batch_to_device(batch, device)
+            DR, DI, DP, DTS, mask, _geom_mask, atom_ids, atom_phys, Ea, de_rxn, energy_feats = move_batch_to_device(batch, device)
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_DTS_coarse, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn)
+                p_DTS, p_DTS_coarse, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats)
                 N = DR.shape[1]
                 valid_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
                 eye = torch.eye(N, device=mask.device, dtype=mask.dtype).unsqueeze(0)
@@ -1511,6 +1542,8 @@ def train_pipeline(config):
         "ea_std": stats["ea_std"],
         "de_rxn_mean": stats["de_rxn_mean"],
         "de_rxn_std": stats["de_rxn_std"],
+        "efeat_mean": stats["efeat_mean"].tolist(),
+        "efeat_std": stats["efeat_std"].tolist(),
         "config_snapshot": {k: v for k, v in config.items() if isinstance(v, (int, float, str, bool))},
     }
     print(f"\nTraining for up to {config['epochs']} epochs (patience={config['patience']})...")
@@ -1530,6 +1563,11 @@ def train_pipeline(config):
         # blend in the (normalized) Ea error so early stopping does not cut off a
         # still-improving head. ea_select_weight keeps geometry dominant.
         ea_active = epoch > config["ea_warmup_epochs"]
+        if epoch == config["ea_warmup_epochs"] + 1:
+            best_val_loss = float('inf')
+            patience_counter = 0
+            print(f"\n--- Ea warmup ended. Resetting early stopping tracking ---")
+
         val_select = val_metrics["geom"]
         if ea_active:
             val_select = val_select + config["ea_select_weight"] * val_metrics["ea_norm"]
@@ -1578,9 +1616,9 @@ def train_pipeline(config):
     val_rxn_ids = {samples[vi]["rxn_id"] for vi in val_indices}
     with torch.no_grad():
         for batch in eval_loader:
-            DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, _Ea, de_rxn = move_batch_to_device(batch, device)
+            DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, _Ea, de_rxn, energy_feats = move_batch_to_device(batch, device)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, _, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn)
+                p_DTS, _, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats)
             ea_pred_kcal = None
             if ea_pred_norm is not None:
                 ea_pred_kcal = (ea_pred_norm.float().cpu().numpy() * ea_std + ea_mean)
@@ -1727,6 +1765,8 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     ea_std = meta.get("ea_std")
     de_rxn_mean = meta.get("de_rxn_mean", 0.0)
     de_rxn_std = meta.get("de_rxn_std", 1.0)
+    efeat_mean = np.array(meta.get("efeat_mean", np.zeros(ENERGY_FEAT_DIM)), dtype=np.float32)
+    efeat_std = np.array(meta.get("efeat_std", np.ones(ENERGY_FEAT_DIM)), dtype=np.float32)
     n = len(r_atoms)
     c_R = padded_coords(r_atoms, config["max_atoms"])
     c_P = padded_coords(p_atoms, config["max_atoms"])
@@ -1759,6 +1799,11 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     e_p = product["energy"] * config["hartree_to_kcal"]
     de_rxn = e_p - e_r
     de_rxn_norm = (de_rxn - de_rxn_mean) / de_rxn_std
+    # 20D energy descriptor (composition, bond-angle stats) for the Ea head.
+    energy_feats = build_energy_features(
+        r_types, n, c_R_aligned, c_P, e_r, e_p, config["fragment_bond_scale"]
+    )
+    energy_feats_norm = (energy_feats - efeat_mean) / efeat_std
     model = PSI(config, num_atom_types).to(device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -1770,7 +1815,8 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         t_atom_ids = torch.from_numpy(atom_ids).unsqueeze(0).to(device)
         t_aphys = torch.from_numpy(atom_phys_norm).unsqueeze(0).to(device)
         t_de_rxn = torch.tensor([de_rxn_norm], dtype=torch.float32, device=device)
-        p_DTS, _, ea_pred_norm = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_aphys, t_de_rxn)
+        t_efeats = torch.from_numpy(energy_feats_norm.astype(np.float32)).unsqueeze(0).to(device)
+        p_DTS, _, ea_pred_norm = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_aphys, t_de_rxn, t_efeats)
     # Learned Ea (denormalized); None if the checkpoint predates the head.
     ea_neural = None
     if ea_pred_norm is not None and ea_mean is not None and ea_std is not None:
