@@ -477,11 +477,11 @@ CONFIG = {
     "atom_embed_dim": 32,
     "gru_hidden": 128,
     "gru_layers": 2,
-    "gru_dropout": 0.2,
+    "gru_dropout": 0.3,
     "attn_heads": 8,
     "attn_layers": 3,
     "ff_dim": 512,
-    "dropout": 0.25,
+    "dropout": 0.35,
     "delta_clamp": 3.0,
     # --- EGNN coordinate refiner -----------------------------------------
     # After the geometry head predicts a TS distance matrix, we embed it to 3D
@@ -501,13 +501,13 @@ CONFIG = {
     "ea_loss_weight": 1.0,     # weight on the Ea loss (computed on normalized Ea)
     "ea_warmup_epochs": 200,   # geometry-only until here, then the Ea loss turns on
     "ea_select_weight": 0.25,  # Ea contribution to checkpoint selection (post-warmup)
-    "ea_head_dropout": 0.25,   # dropout inside the Ea head MLP
+    "ea_head_dropout": 0.35,   # dropout inside the Ea head MLP
     "lr": 1.5e-4,
-    "weight_decay": 2e-3,
+    "weight_decay": 1e-2,
     "warmup_epochs": 40,
     "grad_clip": 1.0,
     "batch_size": 32,
-    "num_workers": 0,
+    "num_workers": 2,
     "pin_memory": True,
     "device": "auto",
     "require_cuda": False,
@@ -517,7 +517,7 @@ CONFIG = {
     "val_split": 0.2,
     "split_seed": 42,
     "patience": 120,
-    "coord_noise_std": 0.03,
+    "coord_noise_std": 0.05,
     "spectator_threshold": 0.15,
     "spectator_tol": 0.05,
     "fragment_bond_scale": 1.45,
