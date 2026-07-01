@@ -1455,7 +1455,24 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # Auxiliary loss on the coarse (pre-EGNN) distances trains the
                 # geometry head directly, giving the EGNN a stable MDS seed.
                 l_geom_coarse = F.huber_loss(p_DTS_coarse * m2d, DTS * m2d, reduction='sum', delta=0.5) / denom
-                loss = l_geom + config["geom_coarse_weight"] * l_geom_coarse
+                
+                # --- PINN Matrix-wise Cross Check ---
+                # Physics constraint 1: Spectator bonds (abs(DR - DP) < threshold) shouldn't change.
+                # Target them towards the reactant/product midpoint (DI).
+                spectator_mask = (torch.abs(DR - DP) < config["spectator_threshold"]).float() * m2d
+                l_pinn_spectator = F.mse_loss(p_DTS * spectator_mask, DI * spectator_mask, reduction='sum') / denom
+                
+                # Physics constraint 2: Active bonds should generally be bounded by R and P.
+                min_D = torch.minimum(DR, DP) - 0.2
+                max_D = torch.maximum(DR, DP) + 0.2
+                excess_high = F.relu(p_DTS - max_D) * m2d
+                excess_low = F.relu(min_D - p_DTS) * m2d
+                l_pinn_bounds = (excess_high**2 + excess_low**2).sum() / denom
+                
+                l_pinn = l_pinn_spectator + 0.5 * l_pinn_bounds
+                
+                loss = l_geom + config["geom_coarse_weight"] * l_geom_coarse + 0.2 * l_pinn
+
                 # Learned Ea loss on the normalized target (computed every epoch
                 # for monitoring; only added to `loss` once warmed up).
                 if ea_pred_norm is not None:
