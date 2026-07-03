@@ -19,7 +19,7 @@ pip install -r requirements.txt
 ### Training
 To train the model on your dataset of Gaussian `.log` files:
 ```bash
-python psi_full_pipeline.py train --extract-limit 16000
+python psi_full_pipeline.py train --extract-limit 30000 --target-reactions 10000 --force-extract
 ```
 This extracts the files, processes the dataset, splits it into training and validation sets, and trains the model. The best model weights will be saved as `psi_final.pt`.
 

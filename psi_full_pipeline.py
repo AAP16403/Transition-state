@@ -317,6 +317,61 @@ def classify_bonds(D_R, D_P, n, threshold=0.15):
                 spectator.append((i, j))
     return active, spectator
 
+RISK_BOND_TYPES = {
+    tuple(sorted(pair))
+    for pair in [("N", "N"), ("N", "O"), ("O", "O"), ("C", "N"), ("H", "N")]
+}
+
+def bond_set_from_distance_matrix(D, atom_types, n, bond_scale=1.45):
+    bonds = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
+            if D[i, j] <= cutoff:
+                bonds[(i, j)] = tuple(sorted((atom_types[i], atom_types[j])))
+    return bonds
+
+def reaction_risk_features(D_R, D_P, atom_types, n, max_atoms, bond_scale=1.45, active_threshold=0.15):
+    """Risk flags for reaction classes that showed higher validation Ea error."""
+    bonds_R = bond_set_from_distance_matrix(D_R, atom_types, n, bond_scale)
+    bonds_P = bond_set_from_distance_matrix(D_P, atom_types, n, bond_scale)
+    formed = set(bonds_P) - set(bonds_R)
+    broken = set(bonds_R) - set(bonds_P)
+
+    active_mask = np.zeros((max_atoms, max_atoms), dtype=np.float32)
+    risk_pair_mask = np.zeros((max_atoms, max_atoms), dtype=np.float32)
+    risky_bond_types = set()
+    for i in range(n):
+        for j in range(i + 1, n):
+            bond_type = tuple(sorted((atom_types[i], atom_types[j])))
+            is_active = abs(D_R[i, j] - D_P[i, j]) > active_threshold
+            is_formed_or_broken = (i, j) in formed or (i, j) in broken
+            is_risky_type = bond_type in RISK_BOND_TYPES
+            if is_active:
+                active_mask[i, j] = active_mask[j, i] = 1.0
+                if is_risky_type:
+                    risky_bond_types.add(bond_type)
+            if is_formed_or_broken and is_risky_type:
+                risky_bond_types.add(bond_type)
+            if is_active or is_formed_or_broken:
+                risk_pair_mask[i, j] = risk_pair_mask[j, i] = 1.0
+
+    formed_n = len(formed)
+    broken_n = len(broken)
+    complexity_flag = float((formed_n + broken_n) >= 4 or broken_n >= 3)
+    risky_chem_flag = float(len(risky_bond_types) > 0)
+    risk_score = complexity_flag + risky_chem_flag
+    return {
+        "formed_bonds": formed_n,
+        "broken_bonds": broken_n,
+        "complexity_flag": complexity_flag,
+        "risky_chem_flag": risky_chem_flag,
+        "risk_score": risk_score,
+        "active_pair_mask": active_mask,
+        "risk_pair_mask": risk_pair_mask,
+        "risky_bond_types": sorted("-".join(t) for t in risky_bond_types),
+    }
+
 def apply_spectator_constraints(pred_dist, D_R, D_P, n, threshold=0.15, tol=0.05, pair_mask=None):
     _, spectator = classify_bonds(D_R, D_P, n, threshold)
     for (i, j) in spectator:
@@ -465,10 +520,10 @@ CONFIG = {
     "tar_path": "b97d3.tar.gz",
     "dataset_json": "extracted_dataset.json",
     "save_dir": ".",
-    # ~3 logs (r/p/ts) per reaction, minus those dropped by the max_atoms filter,
-    # so extract ~16k logs to yield ~5000 complete reaction triplets.
-    "extraction_limit": 16000,
-    "target_reactions": 5000,
+    # ~3 logs (r/p/ts) per reaction, minus those dropped by the max_atoms and
+    # negative-Ea filters, so extract ~30k logs to make a larger usable pool.
+    "extraction_limit": 30000,
+    "target_reactions": 10000,
     "force_extract": True,
     "max_atoms": 30,
     "n_gaussians": 32,
@@ -516,10 +571,13 @@ CONFIG = {
     "print_every": 25,
     "val_split": 0.2,
     "split_seed": 42,
-    "patience": 120,
+    "patience": 500,
     "coord_noise_std": 0.05,
     "spectator_threshold": 0.15,
     "spectator_tol": 0.05,
+    "risk_ea_loss_weight": 0.5,      # extra normalized-Ea loss on high-risk reaction classes
+    "risk_geom_loss_weight": 0.2,    # extra geometry loss on active/formed/broken risky pairs
+    "risk_pinn_loss_weight": 0.1,    # extra endpoint-bounds penalty on risky reaction classes
     "fragment_bond_scale": 1.45,
     "hartree_to_kcal": 627.509,
     "skip_negative_ea": True,
@@ -556,6 +614,11 @@ def move_batch_to_device(batch, device):
         batch["Ea"].to(device, non_blocking=True),
         batch["de_rxn"].to(device, non_blocking=True),
         batch["energy_feats"].to(device, non_blocking=True),
+        batch["active_pair_mask"].to(device, non_blocking=True),
+        batch["risk_pair_mask"].to(device, non_blocking=True),
+        batch["risk_score"].to(device, non_blocking=True),
+        batch["complexity_flag"].to(device, non_blocking=True),
+        batch["risky_chem_flag"].to(device, non_blocking=True),
     )
 
 def extract_raw_data(config):
@@ -649,7 +712,18 @@ def build_reaction_samples(config):
             atom_phys = build_atom_physical_features(
                 atom_types, n, config["max_atoms"]
             )
+            D_R_raw = compute_distance_matrix(c_R)
+            D_P_raw = compute_distance_matrix(c_P)
             D_TS = compute_distance_matrix(c_TS)
+            risk = reaction_risk_features(
+                D_R_raw,
+                D_P_raw,
+                atom_types,
+                n,
+                config["max_atoms"],
+                config["fragment_bond_scale"],
+                config["spectator_threshold"],
+            )
             ts_fragments = find_fragments_from_coords(
                 c_TS, atom_types, n, config["fragment_bond_scale"]
             )
@@ -667,6 +741,14 @@ def build_reaction_samples(config):
                 "atom_phys_raw": atom_phys,
                 "D_TS": torch.from_numpy(D_TS),
                 "geom_mask": torch.from_numpy(geom_mask),
+                "active_pair_mask": torch.from_numpy(risk["active_pair_mask"]),
+                "risk_pair_mask": torch.from_numpy(risk["risk_pair_mask"]),
+                "risk_score": risk["risk_score"],
+                "complexity_flag": risk["complexity_flag"],
+                "risky_chem_flag": risk["risky_chem_flag"],
+                "formed_bonds": risk["formed_bonds"],
+                "broken_bonds": risk["broken_bonds"],
+                "risky_bond_types": risk["risky_bond_types"],
             })
     print(f"Loaded {len(samples)} complete reaction triplets.")
     return samples, atom_vocab, atom_types_map
@@ -777,6 +859,11 @@ class ReactionDataset(Dataset):
             "Ea": torch.tensor(s["Ea_raw"], dtype=torch.float32),
             "de_rxn": torch.tensor(de_rxn_norm, dtype=torch.float32),
             "energy_feats": torch.from_numpy(efeat_norm.astype(np.float32)),
+            "active_pair_mask": s["active_pair_mask"],
+            "risk_pair_mask": s["risk_pair_mask"],
+            "risk_score": torch.tensor(s["risk_score"], dtype=torch.float32),
+            "complexity_flag": torch.tensor(s["complexity_flag"], dtype=torch.float32),
+            "risky_chem_flag": torch.tensor(s["risky_chem_flag"], dtype=torch.float32),
         }
 
 class GaussianEmbedding(nn.Module):
@@ -1440,7 +1527,11 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
         for batch in loader:
-            DR, DI, DP, DTS, mask, _geom_mask, atom_ids, atom_phys, Ea, de_rxn, energy_feats = move_batch_to_device(batch, device)
+            (
+                DR, DI, DP, DTS, mask, _geom_mask, atom_ids, atom_phys, Ea,
+                de_rxn, energy_feats, active_pair_mask, risk_pair_mask,
+                risk_score, complexity_flag, risky_chem_flag,
+            ) = move_batch_to_device(batch, device)
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
@@ -1473,6 +1564,27 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 
                 loss = l_geom + config["geom_coarse_weight"] * l_geom_coarse + 0.2 * l_pinn
 
+                risk_sample = (complexity_flag + risky_chem_flag).clamp(max=1.0)
+                risk_pair = risk_pair_mask * m2d
+                risk_pair_denom = risk_pair.sum().clamp(min=1.0)
+                risk_sample_count = risk_sample.sum().clamp(min=1.0)
+                if risk_pair.sum() > 0:
+                    l_risk_geom = F.huber_loss(
+                        p_DTS * risk_pair,
+                        DTS * risk_pair,
+                        reduction='sum',
+                        delta=0.5,
+                    ) / risk_pair_denom
+                    l_risk_bounds = (
+                        ((excess_high**2 + excess_low**2) * risk_pair).sum()
+                        / risk_pair_denom
+                    )
+                    loss = (
+                        loss
+                        + config["risk_geom_loss_weight"] * l_risk_geom
+                        + config["risk_pinn_loss_weight"] * l_risk_bounds
+                    )
+
                 # Learned Ea loss on the normalized target (computed every epoch
                 # for monitoring; only added to `loss` once warmed up).
                 if ea_pred_norm is not None:
@@ -1480,6 +1592,11 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                     l_ea = F.smooth_l1_loss(ea_pred_norm, ea_target_norm)
                     if ea_w > 0.0:
                         loss = loss + ea_w * l_ea
+                        if risk_sample.sum() > 0:
+                            ea_abs = F.smooth_l1_loss(ea_pred_norm, ea_target_norm, reduction='none')
+                            risk_weight = (1.0 + risk_score).clamp(max=3.0) * risk_sample
+                            l_risk_ea = (ea_abs * risk_weight).sum() / risk_sample_count
+                            loss = loss + config["risk_ea_loss_weight"] * l_risk_ea
                 else:
                     l_ea = None
             if is_train:
@@ -1633,7 +1750,11 @@ def train_pipeline(config):
     val_rxn_ids = {samples[vi]["rxn_id"] for vi in val_indices}
     with torch.no_grad():
         for batch in eval_loader:
-            DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, _Ea, de_rxn, energy_feats = move_batch_to_device(batch, device)
+            (
+                DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, _Ea,
+                de_rxn, energy_feats, _active_pair_mask, _risk_pair_mask,
+                _risk_score, _complexity_flag, _risky_chem_flag,
+            ) = move_batch_to_device(batch, device)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 p_DTS, _, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats)
             ea_pred_kcal = None
@@ -2693,6 +2814,7 @@ if __name__ == "__main__":
     subparsers = parser.add_subparsers(dest="command")
     train_parser = subparsers.add_parser("train", help="Train the PSI model and evaluate known triplets")
     train_parser.add_argument("--extract-limit", type=int, default=CONFIG["extraction_limit"], help="Number of log files to parse from the tarball")
+    train_parser.add_argument("--target-reactions", type=int, default=CONFIG["target_reactions"], help="Maximum complete reaction triplets to train/evaluate")
     train_parser.add_argument("--force-extract", action="store_true", help="Rebuild extracted_dataset.json instead of reusing it")
     train_parser.add_argument("--epochs", type=int, default=CONFIG["epochs"], help="Training epochs")
     train_parser.add_argument("--batch-size", type=int, default=CONFIG["batch_size"], help="Training batch size")
@@ -2723,6 +2845,7 @@ if __name__ == "__main__":
     else:
         if args.command == "train":
             CONFIG["extraction_limit"] = args.extract_limit
+            CONFIG["target_reactions"] = args.target_reactions
             CONFIG["force_extract"] = args.force_extract
             CONFIG["epochs"] = args.epochs
             CONFIG["batch_size"] = args.batch_size
