@@ -1,6 +1,4 @@
 import json
-import math
-import os
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -839,7 +837,7 @@ def add_deck_slides(prs, metrics, charts):
     add_bullets(
         slide,
         [
-            f"Geometry loss improves rapidly early and continues improving slowly through long training.",
+            "Geometry loss improves rapidly early and continues improving slowly through long training.",
             f"Ea head activates after epoch {metrics['config'].get('ea_warmup_epochs', 200)}, after the geometry backbone has stabilized.",
             f"Best validation geometry in history: epoch {metrics['best_val_geom']['epoch']} with loss {metrics['best_val_geom']['val_geom']:.5f}.",
             f"Best validation Ea in history: epoch {metrics['best_val_ea']['epoch']} with MAE {metrics['best_val_ea']['val_ea_mae']:.2f} kcal/mol.",
@@ -1151,7 +1149,7 @@ def add_deck_slides(prs, metrics, charts):
             "The base distance is an endpoint interpolation: D_base = alpha * D_R + (1 - alpha) * D_P.",
             f"The learned correction is clipped to +/-{metric_cfg(metrics, 'delta_clamp', 3.0)} A before addition, preventing one pair from making an unphysical jump.",
             "After addition, distances are clamped to non-negative values, symmetrized, diagonal-zeroed, and multiplied by the valid atom mask.",
-            f"At inference, steric collision clamping enforces D_ij >= 0.75 * (r_i + r_j) for every non-diagonal atom pair.",
+            "At inference, steric collision clamping enforces D_ij >= 0.75 * (r_i + r_j) for every non-diagonal atom pair.",
         ],
         0.78,
         1.48,

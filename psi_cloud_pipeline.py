@@ -6,15 +6,19 @@ import subprocess
 try:
     import numpy as np
     import torch
-except ImportError:
-    print("Installing required dependencies...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy", "torch"])
+except Exception as e:
+    print(f"Failed to import dependencies: {e}")
+    print("Attempting to install/upgrade required dependencies...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "numpy", "torch"])
+    # Clear partially loaded modules to avoid caching issues on re-import
+    for key in list(sys.modules.keys()):
+        if key.startswith("torch") or key.startswith("numpy"):
+            del sys.modules[key]
     import numpy as np
     import torch
 
 import json
 import math
-import tarfile
 import argparse
 import torch.nn as nn
 import torch.nn.functional as F
@@ -369,19 +373,41 @@ def reaction_risk_features(D_R, D_P, atom_types, n, max_atoms, bond_scale=1.45, 
 
     formed_n = len(formed)
     broken_n = len(broken)
+    changed_n = formed_n + broken_n
     complexity_flag = float((formed_n + broken_n) >= 4 or broken_n >= 3)
     risky_chem_flag = float(len(risky_bond_types) > 0)
     risk_score = complexity_flag + risky_chem_flag
+    complexity_margin_penalty = max(0.0, changed_n - 3.0) ** 2 + max(0.0, 1.0 - changed_n) ** 2
+    complexity_sigmoid_penalty = 1.0 / (1.0 + math.exp(-1.25 * (changed_n - 4.0)))
+    risk_penalty = complexity_margin_penalty + 0.5 * risky_chem_flag
     return {
         "formed_bonds": formed_n,
         "broken_bonds": broken_n,
+        "changed_bonds": changed_n,
         "complexity_flag": complexity_flag,
         "risky_chem_flag": risky_chem_flag,
         "risk_score": risk_score,
+        "complexity_margin_penalty": complexity_margin_penalty,
+        "complexity_sigmoid_penalty": complexity_sigmoid_penalty,
+        "risk_penalty": risk_penalty,
         "active_pair_mask": active_mask,
         "risk_pair_mask": risk_pair_mask,
         "risky_bond_types": sorted("-".join(t) for t in risky_bond_types),
     }
+
+def continuous_risk_penalty(formed_n, broken_n, risky_chem_flag, mode="margin", safe_min=1.0,
+                            safe_max=3.0, sigmoid_center=4.0, sigmoid_k=1.25):
+    """Smooth reaction-complexity penalty used for sample-level loss weighting."""
+    changed = float(formed_n + broken_n)
+    if mode == "binary":
+        complexity = float(changed >= safe_max + 1.0 or broken_n >= safe_max)
+    elif mode == "sigmoid":
+        complexity = 1.0 / (1.0 + math.exp(-sigmoid_k * (changed - sigmoid_center)))
+    elif mode == "margin":
+        complexity = max(0.0, changed - safe_max) ** 2 + max(0.0, safe_min - changed) ** 2
+    else:
+        raise ValueError(f"Unknown risk_penalty_mode '{mode}'. Use 'binary', 'margin', or 'sigmoid'.")
+    return float(complexity + 0.5 * float(risky_chem_flag > 0.0))
 
 def apply_spectator_constraints(pred_dist, D_R, D_P, n, threshold=0.15, tol=0.05, pair_mask=None):
     _, spectator = classify_bonds(D_R, D_P, n, threshold)
@@ -530,7 +556,7 @@ def get_bonds_from_distances(D, atom_types, fragments=None, bond_scale=1.45):
 CONFIG = {
     "dataset_json": "extracted_dataset.json",
     "save_dir": ".",
-    "target_reactions": 10000,
+    "target_reactions": 20000,
     "max_atoms": 30,
     "n_gaussians": 32,
     "gauss_start": 0.4,
@@ -575,15 +601,29 @@ CONFIG = {
     "amp": True,
     "epochs": 1500,
     "print_every": 25,
-    "val_split": 0.2,
+    "val_split": 0.1,
     "split_seed": 42,
+    "split_strategy": "stratified",
+    "split_bins": 5,
     "patience": 500,
     "coord_noise_std": 0.05,
     "spectator_threshold": 0.15,
     "spectator_tol": 0.05,
+    "risk_penalty_mode": "margin",
+    "risk_safe_min": 1.0,
+    "risk_safe_max": 3.0,
+    "risk_sigmoid_center": 4.0,
+    "risk_sigmoid_k": 1.25,
+    "risk_weight_alpha": 0.5,
+    "risk_weight_max": 3.0,
     "risk_ea_loss_weight": 0.5,      # extra normalized-Ea loss on high-risk reaction classes
     "risk_geom_loss_weight": 0.2,    # extra geometry loss on active/formed/broken risky pairs
     "risk_pinn_loss_weight": 0.1,    # extra endpoint-bounds penalty on risky reaction classes
+    "triangle_loss_weight": 0.05,
+    "triangle_coarse_weight": 0.25,
+    "triangle_refined_weight": 1.0,
+    "triangle_tolerance": 0.02,
+    "triangle_triplet_samples": 1024,
     "fragment_bond_scale": 1.45,
     "hartree_to_kcal": 627.509,
     "skip_negative_ea": True,
@@ -623,6 +663,7 @@ def move_batch_to_device(batch, device):
         batch["active_pair_mask"].to(device, non_blocking=True),
         batch["risk_pair_mask"].to(device, non_blocking=True),
         batch["risk_score"].to(device, non_blocking=True),
+        batch["risk_penalty"].to(device, non_blocking=True),
         batch["complexity_flag"].to(device, non_blocking=True),
         batch["risky_chem_flag"].to(device, non_blocking=True),
     )
@@ -649,8 +690,11 @@ def build_reaction_samples(config):
     matrix and the fragment geometry mask (both derived from the unaugmented
     TS coords) -- are precomputed here so __getitem__ stays cheap.
     """
-    with open(config["dataset_json"], "r") as f:
-        raw_data = json.load(f)
+    try:
+        with open(config["dataset_json"], "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse '{config['dataset_json']}'. The file is corrupted or was incompletely uploaded to Colab.\nPlease delete '{config['dataset_json']}' and re-upload or re-extract the dataset. Details: {e}") from None
     atom_vocab = build_atom_vocab(raw_data)
     reactions = {}
     for entry in raw_data:
@@ -728,14 +772,196 @@ def build_reaction_samples(config):
                 "active_pair_mask": torch.from_numpy(risk["active_pair_mask"]),
                 "risk_pair_mask": torch.from_numpy(risk["risk_pair_mask"]),
                 "risk_score": risk["risk_score"],
+                "risk_penalty": risk["risk_penalty"],
+                "complexity_margin_penalty": risk["complexity_margin_penalty"],
+                "complexity_sigmoid_penalty": risk["complexity_sigmoid_penalty"],
                 "complexity_flag": risk["complexity_flag"],
                 "risky_chem_flag": risk["risky_chem_flag"],
                 "formed_bonds": risk["formed_bonds"],
                 "broken_bonds": risk["broken_bonds"],
+                "changed_bonds": risk["changed_bonds"],
                 "risky_bond_types": risk["risky_bond_types"],
             })
     print(f"Loaded {len(samples)} complete reaction triplets.")
     return samples, atom_vocab, atom_types_map
+
+def _split_profile(samples, indices):
+    """Compact distribution summary for one dataset split."""
+    if not indices:
+        return {
+            "count": 0,
+            "ea_mean": None,
+            "ea_std": None,
+            "ea_min": None,
+            "ea_max": None,
+            "atom_mean": None,
+            "atom_min": None,
+            "atom_max": None,
+            "changed_mean": None,
+            "changed_max": None,
+            "formed_mean": None,
+            "broken_mean": None,
+            "risk_fraction": None,
+            "complex_fraction": None,
+            "risky_chem_fraction": None,
+        }
+
+    ea = np.array([samples[i]["Ea_raw"] for i in indices], dtype=np.float64)
+    atoms = np.array([samples[i]["n_atoms"] for i in indices], dtype=np.float64)
+    formed = np.array([samples[i].get("formed_bonds", 0) for i in indices], dtype=np.float64)
+    broken = np.array([samples[i].get("broken_bonds", 0) for i in indices], dtype=np.float64)
+    changed = formed + broken
+    risk = np.array([samples[i].get("risk_score", 0.0) for i in indices], dtype=np.float64)
+    complex_flag = np.array([samples[i].get("complexity_flag", 0.0) for i in indices], dtype=np.float64)
+    risky_chem = np.array([samples[i].get("risky_chem_flag", 0.0) for i in indices], dtype=np.float64)
+    return {
+        "count": int(len(indices)),
+        "ea_mean": float(ea.mean()),
+        "ea_std": float(ea.std()),
+        "ea_min": float(ea.min()),
+        "ea_max": float(ea.max()),
+        "atom_mean": float(atoms.mean()),
+        "atom_min": int(atoms.min()),
+        "atom_max": int(atoms.max()),
+        "changed_mean": float(changed.mean()),
+        "changed_max": int(changed.max()),
+        "formed_mean": float(formed.mean()),
+        "broken_mean": float(broken.mean()),
+        "risk_fraction": float(np.mean(risk > 0.0)),
+        "complex_fraction": float(np.mean(complex_flag > 0.0)),
+        "risky_chem_fraction": float(np.mean(risky_chem > 0.0)),
+    }
+
+def _print_split_profile(label, profile):
+    if profile["count"] == 0:
+        print(f"  {label:<10} N=0")
+        return
+    print(
+        f"  {label:<10} N={profile['count']:>6} | "
+        f"Ea {profile['ea_mean']:7.2f}+/-{profile['ea_std']:<6.2f} "
+        f"[{profile['ea_min']:.2f}, {profile['ea_max']:.2f}] | "
+        f"atoms {profile['atom_mean']:5.1f} [{profile['atom_min']}-{profile['atom_max']}] | "
+        f"changed {profile['changed_mean']:4.2f} max {profile['changed_max']:>2} | "
+        f"risk {profile['risk_fraction'] * 100:5.1f}%"
+    )
+
+def _validate_split(samples, train_indices, val_indices):
+    train_set = set(train_indices)
+    val_set = set(val_indices)
+    overlap = sorted(train_set & val_set)
+    if overlap:
+        raise ValueError(f"Train/validation split overlap detected at indices: {overlap[:10]}")
+    if len(train_indices) != len(train_set) or len(val_indices) != len(val_set):
+        raise ValueError("Train/validation split contains duplicate indices.")
+    covered = train_set | val_set
+    if len(covered) != len(samples):
+        missing = sorted(set(range(len(samples))) - covered)
+        raise ValueError(f"Train/validation split does not cover all samples. Missing: {missing[:10]}")
+
+    seen_rxns, duplicate_rxns = set(), set()
+    for s in samples:
+        rxn_id = s["rxn_id"]
+        if rxn_id in seen_rxns:
+            duplicate_rxns.add(rxn_id)
+        seen_rxns.add(rxn_id)
+    train_rxns = {samples[i]["rxn_id"] for i in train_indices}
+    val_rxns = {samples[i]["rxn_id"] for i in val_indices}
+    leaked_rxns = sorted(train_rxns & val_rxns)
+    return {
+        "duplicate_rxn_ids": sorted(duplicate_rxns)[:20],
+        "leaked_rxn_ids": leaked_rxns[:20],
+        "has_leakage": bool(leaked_rxns),
+    }
+
+def make_train_val_split(samples, config):
+    """Create a deterministic train/validation split and report its balance."""
+    n_total = len(samples)
+    if n_total < 2:
+        raise ValueError("Need at least two complete reaction triplets to create train/validation splits.")
+
+    val_split = float(config["val_split"])
+    if not 0.0 < val_split < 1.0:
+        raise ValueError(f"val_split must be between 0 and 1, got {val_split}.")
+    n_val = min(max(1, int(round(n_total * val_split))), n_total - 1)
+    seed = int(config.get("split_seed", 42))
+    strategy = config.get("split_strategy", "random").lower()
+    rng = np.random.default_rng(seed)
+
+    if strategy == "random":
+        indices = np.arange(n_total, dtype=np.int64)
+        rng.shuffle(indices)
+        val_indices = indices[:n_val].tolist()
+        train_indices = indices[n_val:].tolist()
+    elif strategy == "stratified":
+        ea_values = np.array([s["Ea_raw"] for s in samples], dtype=np.float64)
+        n_bins = max(1, int(config.get("split_bins", 5)))
+        quantiles = np.linspace(0.0, 1.0, min(n_bins, n_total) + 1)[1:-1]
+        ea_edges = np.unique(np.quantile(ea_values, quantiles)) if len(quantiles) else np.array([])
+        strata = {}
+        for i, s in enumerate(samples):
+            ea_bin = int(np.searchsorted(ea_edges, s["Ea_raw"], side="right"))
+            atom_bin = min(int(s["n_atoms"] // 5), 6)
+            changed_bin = min(int(s.get("formed_bonds", 0) + s.get("broken_bonds", 0)), 4)
+            risk_bin = int(float(s.get("risk_score", 0.0)) > 0.0)
+            key = (ea_bin, atom_bin, changed_bin, risk_bin)
+            strata.setdefault(key, []).append(i)
+
+        train_indices, val_indices = [], []
+        for key in sorted(strata):
+            group = np.array(strata[key], dtype=np.int64)
+            rng.shuffle(group)
+            group_val = int(round(len(group) * val_split))
+            if len(group) <= 1:
+                group_val = 0
+            else:
+                group_val = min(group_val, len(group) - 1)
+            val_indices.extend(group[:group_val].tolist())
+            train_indices.extend(group[group_val:].tolist())
+
+        rng.shuffle(train_indices)
+        rng.shuffle(val_indices)
+        if len(val_indices) < n_val:
+            move_n = min(n_val - len(val_indices), len(train_indices) - 1)
+            val_indices.extend(train_indices[:move_n])
+            train_indices = train_indices[move_n:]
+        elif len(val_indices) > n_val:
+            move_n = len(val_indices) - n_val
+            train_indices.extend(val_indices[:move_n])
+            val_indices = val_indices[move_n:]
+    else:
+        raise ValueError(f"Unknown split_strategy '{strategy}'. Use 'random' or 'stratified'.")
+
+    integrity = _validate_split(samples, train_indices, val_indices)
+    if integrity["has_leakage"]:
+        raise ValueError(f"Reaction IDs leaked across train/validation: {integrity['leaked_rxn_ids']}")
+
+    report = {
+        "strategy": strategy,
+        "seed": seed,
+        "val_split": val_split,
+        "n_total": n_total,
+        "n_train": len(train_indices),
+        "n_val": len(val_indices),
+        "integrity": integrity,
+        "profiles": {
+            "all": _split_profile(samples, list(range(n_total))),
+            "train": _split_profile(samples, train_indices),
+            "validation": _split_profile(samples, val_indices),
+        },
+    }
+
+    print(f"\nData split ({strategy}, seed={seed}, requested val_split={val_split:.3f}):")
+    _print_split_profile("All", report["profiles"]["all"])
+    _print_split_profile("Train", report["profiles"]["train"])
+    _print_split_profile("Val", report["profiles"]["validation"])
+    if integrity["duplicate_rxn_ids"]:
+        print(f"  Warning: duplicate rxn_id values found: {integrity['duplicate_rxn_ids']}")
+
+    split_path = os.path.join(config["save_dir"], "split_diagnostics.json")
+    with open(split_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    print(f"Split diagnostics saved to {split_path}")
+    return train_indices, val_indices, report
 
 def compute_normalization(samples, indices):
     """Compute atom-phys + Ea + de_rxn normalization stats over the given indices.
@@ -745,6 +971,9 @@ def compute_normalization(samples, indices):
     learned Ea head regresses a well-scaled target/input; the physics Ea
     baseline is unaffected (it reads raw kcal/mol values directly).
     """
+    if not indices:
+        raise ValueError("Cannot compute normalization without at least one training sample.")
+
     # Atom-physics normalization: collect all *valid* (non-padding) atom rows
     # across training samples and compute per-feature mean/std.
     all_aphys_rows = []
@@ -829,6 +1058,16 @@ class ReactionDataset(Dataset):
         aphys_norm = (s["atom_phys_raw"] - self.aphys_mean) / self.aphys_std
         de_rxn_norm = (s["de_rxn_raw"] - self.de_rxn_mean) / self.de_rxn_std
         efeat_norm = (s["energy_feats_raw"] - self.efeat_mean) / self.efeat_std
+        risk_penalty = continuous_risk_penalty(
+            s.get("formed_bonds", 0),
+            s.get("broken_bonds", 0),
+            s.get("risky_chem_flag", 0.0),
+            mode=self.config.get("risk_penalty_mode", "margin"),
+            safe_min=self.config.get("risk_safe_min", 1.0),
+            safe_max=self.config.get("risk_safe_max", 3.0),
+            sigmoid_center=self.config.get("risk_sigmoid_center", 4.0),
+            sigmoid_k=self.config.get("risk_sigmoid_k", 1.25),
+        )
         return {
             "rxn_id": s["rxn_id"],
             "n_atoms": n,
@@ -846,6 +1085,7 @@ class ReactionDataset(Dataset):
             "active_pair_mask": s["active_pair_mask"],
             "risk_pair_mask": s["risk_pair_mask"],
             "risk_score": torch.tensor(s["risk_score"], dtype=torch.float32),
+            "risk_penalty": torch.tensor(risk_penalty, dtype=torch.float32),
             "complexity_flag": torch.tensor(s["complexity_flag"], dtype=torch.float32),
             "risky_chem_flag": torch.tensor(s["risky_chem_flag"], dtype=torch.float32),
         }
@@ -1152,7 +1392,6 @@ class PhysicsEaCalculator:
             y: (N,) true Ea values
         """
         X, y = [], []
-        hartree_to_kcal = config["hartree_to_kcal"]
         for s, coords_ts in zip(samples, coords_TS_list):
             n = s["n_atoms"]
             c_R = np.asarray(s["c_R"][:n], dtype=np.float64)
@@ -1256,6 +1495,44 @@ def torch_mds_coords(D, mask, dim=3):
     return coords.to(D.dtype).to(D.device)
 
 
+def triangle_inequality_loss(D, mask, geom_mask=None, tol=0.02, triplet_samples=1024):
+    """Differentiable penalty for predicted distances that violate triangle inequality."""
+    B, N, _ = D.shape
+    if N < 3:
+        return D.new_tensor(0.0)
+
+    device = D.device
+    triplets = torch.cartesian_prod(
+        torch.arange(N, device=device),
+        torch.arange(N, device=device),
+        torch.arange(N, device=device),
+    )
+    distinct = (
+        (triplets[:, 0] != triplets[:, 1])
+        & (triplets[:, 0] != triplets[:, 2])
+        & (triplets[:, 1] != triplets[:, 2])
+    )
+    triplets = triplets[distinct]
+    if triplet_samples and 0 < triplet_samples < triplets.shape[0]:
+        pick = torch.linspace(
+            0,
+            triplets.shape[0] - 1,
+            steps=int(triplet_samples),
+            device=device,
+        ).long()
+        triplets = triplets[pick]
+
+    i, j, k = triplets[:, 0], triplets[:, 1], triplets[:, 2]
+    Dij = D[:, i, j].float()
+    Dik = D[:, i, k].float()
+    Dkj = D[:, k, j].float()
+    valid = (mask[:, i] * mask[:, j] * mask[:, k]).float()
+    if geom_mask is not None:
+        valid = valid * geom_mask[:, i, j].float() * geom_mask[:, i, k].float() * geom_mask[:, k, j].float()
+    violation = F.relu(Dij - (Dik + Dkj) - float(tol))
+    return ((violation ** 2) * valid).sum() / valid.sum().clamp(min=1.0)
+
+
 class EGCL(nn.Module):
     """One E(n)-equivariant graph convolution layer (Satorras et al., 2021).
 
@@ -1351,18 +1628,24 @@ class EaHead(nn.Module):
 
     After the EGNN message-passing, each atom's feature vector `h_ts` encodes its
     local 3D environment in the predicted TS (neighbour distances, angles). We
-    masked-mean-pool those per-atom features into a molecule descriptor, append
-    the signed reaction energy (z-scored de_rxn -- the Bell-Evans-Polanyi
-    driver), and regress a *normalized* Ea. The gradient flows back into the
-    EGNN, so the same message-passing that places the TS atoms also learns the
+    attention-pool those per-atom features into a reactive-region descriptor,
+    concatenate a masked mean descriptor for global context, append the signed
+    reaction energy (z-scored de_rxn -- the Bell-Evans-Polanyi driver), and
+    regress a *normalized* Ea. The gradient flows back into the EGNN, so the
+    same message-passing that places the TS atoms also learns the
     structure->energy relationship ("learn physics using the EGNN").
 
     Output is the normalized Ea; callers denormalize with ea_mean/ea_std.
     """
     def __init__(self, node_dim, hidden, energy_feat_dim=0, dropout=0.25):
         super().__init__()
-        # Input: pooled EGNN features + de_rxn scalar + energy descriptor vector
-        in_dim = node_dim + 1 + energy_feat_dim
+        self.attn = nn.Sequential(
+            nn.Linear(node_dim, hidden // 2),
+            nn.GELU(),
+            nn.Linear(hidden // 2, 1),
+        )
+        # Input: attention-pooled + mean-pooled EGNN features + de_rxn + descriptors
+        in_dim = 2 * node_dim + 1 + energy_feat_dim
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.GELU(),
@@ -1374,10 +1657,14 @@ class EaHead(nn.Module):
         )
 
     def forward(self, h_ts, mask, de_rxn, energy_feats=None):
-        # Masked mean-pool over real atoms -> [B, node_dim]
         m = mask.unsqueeze(-1)                                   # [B, N, 1]
-        pooled = (h_ts * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
-        parts = [pooled, de_rxn.unsqueeze(-1)]                   # [B, node_dim], [B, 1]
+        mean_pooled = (h_ts * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+        attn_logits = self.attn(h_ts).squeeze(-1)                 # [B, N]
+        attn_logits = attn_logits.masked_fill(mask <= 0, -1e4)
+        attn_weights = torch.softmax(attn_logits, dim=1).unsqueeze(-1)
+        attn_pooled = (h_ts * attn_weights * m).sum(dim=1)
+        pooled = torch.cat([attn_pooled, mean_pooled], dim=-1)
+        parts = [pooled, de_rxn.unsqueeze(-1)]                   # [B, 2*node_dim], [B, 1]
         if energy_feats is not None:
             parts.append(energy_feats)                            # [B, 20]
         feat = torch.cat(parts, dim=-1)
@@ -1503,7 +1790,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         model.train()
     else:
         model.eval()
-    total_loss, total_geom, total_ea_mae, total_ea_norm, n_batches = 0.0, 0.0, 0.0, 0.0, 0
+    total_loss, total_geom, total_triangle, total_ea_mae, total_ea_norm, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
     # Ea loss is gated by the geometry warmup so the head learns from sane TS.
     ea_active = epoch > config["ea_warmup_epochs"]
@@ -1512,9 +1799,9 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     with context:
         for batch in loader:
             (
-                DR, DI, DP, DTS, mask, _geom_mask, atom_ids, atom_phys, Ea,
+                DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, Ea,
                 de_rxn, energy_feats, active_pair_mask, risk_pair_mask,
-                risk_score, complexity_flag, risky_chem_flag,
+                risk_score, risk_penalty, complexity_flag, risky_chem_flag,
             ) = move_batch_to_device(batch, device)
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -1530,37 +1817,60 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # Auxiliary loss on the coarse (pre-EGNN) distances trains the
                 # geometry head directly, giving the EGNN a stable MDS seed.
                 l_geom_coarse = F.huber_loss(p_DTS_coarse * m2d, DTS * m2d, reduction='sum', delta=0.5) / denom
-                
+
                 # --- PINN Matrix-wise Cross Check ---
                 # Physics constraint 1: Spectator bonds (abs(DR - DP) < threshold) shouldn't change.
                 # Target them towards the reactant/product midpoint (DI).
                 spectator_mask = (torch.abs(DR - DP) < config["spectator_threshold"]).float() * m2d
                 l_pinn_spectator = F.mse_loss(p_DTS * spectator_mask, DI * spectator_mask, reduction='sum') / denom
-                
+
                 # Physics constraint 2: Active bonds should generally be bounded by R and P.
                 min_D = torch.minimum(DR, DP) - 0.2
                 max_D = torch.maximum(DR, DP) + 0.2
                 excess_high = F.relu(p_DTS - max_D) * m2d
                 excess_low = F.relu(min_D - p_DTS) * m2d
                 l_pinn_bounds = (excess_high**2 + excess_low**2).sum() / denom
-                
-                l_pinn = l_pinn_spectator + 0.5 * l_pinn_bounds
-                
-                loss = l_geom + config["geom_coarse_weight"] * l_geom_coarse + 0.2 * l_pinn
 
-                risk_sample = (complexity_flag + risky_chem_flag).clamp(max=1.0)
+                l_pinn = l_pinn_spectator + 0.5 * l_pinn_bounds
+
+                l_triangle_refined = triangle_inequality_loss(
+                    p_DTS,
+                    mask,
+                    geom_mask,
+                    tol=config["triangle_tolerance"],
+                    triplet_samples=config["triangle_triplet_samples"],
+                )
+                l_triangle_coarse = triangle_inequality_loss(
+                    p_DTS_coarse,
+                    mask,
+                    geom_mask,
+                    tol=config["triangle_tolerance"],
+                    triplet_samples=config["triangle_triplet_samples"],
+                )
+                l_triangle = (
+                    config["triangle_refined_weight"] * l_triangle_refined
+                    + config["triangle_coarse_weight"] * l_triangle_coarse
+                )
+
+                loss = (
+                    l_geom
+                    + config["geom_coarse_weight"] * l_geom_coarse
+                    + 0.2 * l_pinn
+                    + config["triangle_loss_weight"] * l_triangle
+                )
+
+                risk_scale = (
+                    1.0 + config["risk_weight_alpha"] * risk_penalty.float()
+                ).clamp(max=config["risk_weight_max"])
+                risk_sample = (risk_penalty > 0.0).float()
                 risk_pair = risk_pair_mask * m2d
-                risk_pair_denom = risk_pair.sum().clamp(min=1.0)
-                risk_sample_count = risk_sample.sum().clamp(min=1.0)
+                risk_pair_weight = risk_pair * risk_scale.view(-1, 1, 1)
+                risk_pair_denom = risk_pair_weight.sum().clamp(min=1.0)
                 if risk_pair.sum() > 0:
-                    l_risk_geom = F.huber_loss(
-                        p_DTS * risk_pair,
-                        DTS * risk_pair,
-                        reduction='sum',
-                        delta=0.5,
-                    ) / risk_pair_denom
+                    risk_geom_abs = F.huber_loss(p_DTS, DTS, reduction='none', delta=0.5)
+                    l_risk_geom = (risk_geom_abs * risk_pair_weight).sum() / risk_pair_denom
                     l_risk_bounds = (
-                        ((excess_high**2 + excess_low**2) * risk_pair).sum()
+                        ((excess_high**2 + excess_low**2) * risk_pair_weight).sum()
                         / risk_pair_denom
                     )
                     loss = (
@@ -1578,8 +1888,8 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                         loss = loss + ea_w * l_ea
                         if risk_sample.sum() > 0:
                             ea_abs = F.smooth_l1_loss(ea_pred_norm, ea_target_norm, reduction='none')
-                            risk_weight = (1.0 + risk_score).clamp(max=3.0) * risk_sample
-                            l_risk_ea = (ea_abs * risk_weight).sum() / risk_sample_count
+                            risk_weight = risk_scale * risk_sample
+                            l_risk_ea = (ea_abs * risk_weight).sum() / risk_weight.sum().clamp(min=1.0)
                             loss = loss + config["risk_ea_loss_weight"] * l_risk_ea
                 else:
                     l_ea = None
@@ -1596,6 +1906,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 scaler.update()
             total_loss += loss.item()
             total_geom += l_geom.item()
+            total_triangle += l_triangle.item()
             if l_ea is not None:
                 total_ea_norm += l_ea.item()
                 # Denormalized Ea MAE (kcal/mol) for human-readable tracking.
@@ -1605,6 +1916,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     return {
         "loss": total_loss / nb,
         "geom": total_geom / nb,
+        "triangle": total_triangle / nb,
         "ea_mae": total_ea_mae / nb,
         "ea_norm": total_ea_norm / nb,
     }
@@ -1612,6 +1924,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
 def train_pipeline(config):
     device = resolve_device(config)
     configure_torch_runtime(device)
+    os.makedirs(config["save_dir"], exist_ok=True)
     print("="*70); print(" PSI FULL PIPELINE (v2) "); print("="*70)
     extract_raw_data(config)
     samples, atom_vocab, atom_types_map = build_reaction_samples(config)
@@ -1619,18 +1932,12 @@ def train_pipeline(config):
         print("Error: No complete reaction triplets found.")
         return
     n_total = len(samples)
-    n_val = max(1, int(n_total * config["val_split"]))
-    n_train = n_total - n_val
-    rng = torch.Generator().manual_seed(config["split_seed"])
-    indices = torch.randperm(n_total, generator=rng).tolist()
-    train_indices = indices[:n_train]
-    val_indices = indices[n_train:]
+    train_indices, val_indices, split_report = make_train_val_split(samples, config)
     stats = compute_normalization(samples, train_indices)
     train_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, augment=True)
     eval_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, augment=False)
     train_subset = Subset(train_dataset, train_indices)
     val_subset = Subset(eval_dataset, val_indices)
-    print(f"\nData split: {n_train} train, {n_val} validation")
     loader_kwargs = {
         "batch_size": config["batch_size"],
         "num_workers": config["num_workers"],
@@ -1662,6 +1969,7 @@ def train_pipeline(config):
         "de_rxn_std": stats["de_rxn_std"],
         "efeat_mean": stats["efeat_mean"].tolist(),
         "efeat_std": stats["efeat_std"].tolist(),
+        "split_summary": split_report,
         "config_snapshot": {k: v for k, v in config.items() if isinstance(v, (int, float, str, bool))},
     }
     print(f"\nTraining for up to {config['epochs']} epochs (patience={config['patience']})...")
@@ -1672,7 +1980,22 @@ def train_pipeline(config):
     patience_counter = 0
     history = []
     best_model_path = os.path.join(config["save_dir"], "psi_best.pt")
-    for epoch in range(1, config["epochs"] + 1):
+    latest_model_path = os.path.join(config["save_dir"], "psi_latest.pt")
+    start_epoch = 1
+
+    if os.path.exists(latest_model_path):
+        print(f"Resuming from checkpoint {latest_model_path}...")
+        ckpt = torch.load(latest_model_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val_loss = ckpt["best_val_loss"]
+        patience_counter = ckpt["patience_counter"]
+        history = ckpt.get("history", [])
+        print(f"Resumed at epoch {start_epoch} (best val loss: {best_val_loss:.4f})")
+
+    for epoch in range(start_epoch, config["epochs"] + 1):
         train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
         val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
         scheduler.step()
@@ -1684,7 +2007,7 @@ def train_pipeline(config):
         if epoch == config["ea_warmup_epochs"] + 1:
             best_val_loss = float('inf')
             patience_counter = 0
-            print(f"\n--- Ea warmup ended. Resetting early stopping tracking ---")
+            print("\n--- Ea warmup ended. Resetting early stopping tracking ---")
 
         val_select = val_metrics["geom"]
         if ea_active:
@@ -1696,6 +2019,8 @@ def train_pipeline(config):
             "val_select": val_select,
             "train_geom": train_metrics["geom"],
             "val_geom": val_metrics["geom"],
+            "train_triangle": train_metrics["triangle"],
+            "val_triangle": val_metrics["triangle"],
             "train_ea_mae": train_metrics["ea_mae"],
             "val_ea_mae": val_metrics["ea_mae"],
             "val_ea_norm": val_metrics["ea_norm"],
@@ -1706,6 +2031,17 @@ def train_pipeline(config):
             best_val_loss = val_select
             torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, best_model_path)
         patience_counter = 0 if improved else patience_counter + 1
+
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
+            "patience_counter": patience_counter,
+            "metadata": metadata,
+            "history": history
+        }, latest_model_path)
         if epoch % config["print_every"] == 0 or epoch == 1 or improved:
             marker = " *" if improved else ""
             print(f"{epoch:6d} | {train_metrics['loss']:11.4f} | {val_metrics['loss']:11.4f} | "
@@ -1737,7 +2073,7 @@ def train_pipeline(config):
             (
                 DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, _Ea,
                 de_rxn, energy_feats, _active_pair_mask, _risk_pair_mask,
-                _risk_score, _complexity_flag, _risky_chem_flag,
+                _risk_score, _risk_penalty, _complexity_flag, _risky_chem_flag,
             ) = move_batch_to_device(batch, device)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 p_DTS, _, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats)
@@ -1828,6 +2164,7 @@ def train_pipeline(config):
     metadata["physics_ea_coeffs"] = ea_calculator.coeffs.tolist()
     train_results = [r for r in results if r["split"] == "train"]
     val_results = [r for r in results if r["split"] == "val"]
+    summary_lines = []
     def print_stats(name, res_list):
         if not res_list: return
         d_maes = [r["dist_MAE"] for r in res_list]
@@ -1839,23 +2176,38 @@ def train_pipeline(config):
         mae_neural = float(np.mean([r["Ea_error"] for r in res_list]))
         r2_phys = _r2(ea_trues, ea_phys)
         mae_phys = float(np.mean([r["Ea_error_physics"] for r in res_list]))
-        print(f"\n{name} ({len(res_list)} reactions):")
-        print(f"  Ea MAE (neural):   {mae_neural:8.2f} kcal/mol   |  R²: {r2:7.4f}   r: {corr:7.4f}")
-        print(f"  Ea MAE (physics):  {mae_phys:8.2f} kcal/mol   |  R²: {r2_phys:7.4f}   (baseline)")
-        print(f"  Dist MAE:          {np.mean(d_maes):8.4f} Å      |  std: {np.std(d_maes):.4f} Å")
+
+        out = f"\n{name} ({len(res_list)} reactions):\n"
+        out += f"  Ea MAE (neural):   {mae_neural:8.2f} kcal/mol   |  R²: {r2:7.4f}   r: {corr:7.4f}\n"
+        out += f"  Ea MAE (physics):  {mae_phys:8.2f} kcal/mol   |  R²: {r2_phys:7.4f}   (baseline)\n"
+        out += f"  Dist MAE:          {np.mean(d_maes):8.4f} Å      |  std: {np.std(d_maes):.4f} Å\n"
+        print(out, end='')
+        summary_lines.append(out)
+
     print_stats("TRAIN SET", train_results)
     print_stats("VALIDATION SET", val_results)
     print_stats("ALL DATA", results)
-    print(f"\n{'Reaction':<15} {'Split':<6} {'Ea True':>10} {'Ea Pred':>10} {'Ea Err':>10} {'Dist MAE':>10}")
+
+    header = f"\n{'Reaction':<15} {'Split':<6} {'Ea True':>10} {'Ea Pred':>10} {'Ea Err':>10} {'Dist MAE':>10}\n"
+    print(header, end='')
+    summary_lines.append(header)
     for r in sorted(results, key=lambda x: x["rxn_id"]):
-        print(f"{r['rxn_id']:<15} {r['split']:<6} {r['Ea_true']:10.2f} {r['Ea_pred']:10.2f} {r['Ea_error']:10.2f} {r['dist_MAE']:10.4f}")
+        line = f"{r['rxn_id']:<15} {r['split']:<6} {r['Ea_true']:10.2f} {r['Ea_pred']:10.2f} {r['Ea_error']:10.2f} {r['dist_MAE']:10.4f}\n"
+        print(line, end='')
+        summary_lines.append(line)
+
+    summary_path = os.path.join(config["save_dir"], "training_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.writelines(summary_lines)
+    print(f"\nDetailed textual summary saved to {summary_path}")
+
     output_path = os.path.join(config["save_dir"], "detailed_analysis.json")
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2)
     final_path = os.path.join(config["save_dir"], "psi_final.pt")
     torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, final_path)
     torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, best_model_path)
-    print(f"\nModel saved to {final_path}")
+    print(f"Model saved to {final_path}")
     print(f"Predictions saved to {output_path}")
     create_dashboard(output_path, config["save_dir"])
 
@@ -1970,17 +2322,24 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         bond_scale=config["fragment_bond_scale"],
     )
     # Physics-based Ea baseline from the predicted 3D TS coordinates.
-    ea_calculator = PhysicsEaCalculator(
-        bond_scale=config["fragment_bond_scale"],
-        spectator_threshold=config["spectator_threshold"],
-    )
-    ea_calculator.coeffs = np.array(meta["physics_ea_coeffs"], dtype=np.float64)
-    ea_calculator.fitted = True
-    ea_physics = ea_calculator.predict_single(
-        c_R[:n], pred_coords, c_P[:n], r_types[:n], n, de_rxn
-    )
+    ea_physics = None
+    if "physics_ea_coeffs" in meta:
+        ea_calculator = PhysicsEaCalculator(
+            bond_scale=config["fragment_bond_scale"],
+            spectator_threshold=config["spectator_threshold"],
+        )
+        ea_calculator.coeffs = np.array(meta["physics_ea_coeffs"], dtype=np.float64)
+        ea_calculator.fitted = True
+        ea_physics = ea_calculator.predict_single(
+            c_R[:n], pred_coords, c_P[:n], r_types[:n], n, de_rxn
+        )
     # Primary Ea is the learned head; fall back to physics for legacy checkpoints.
     energy_pred = ea_neural if ea_neural is not None else ea_physics
+    if energy_pred is None:
+        raise ValueError(
+            "Checkpoint does not contain learned Ea normalization stats or fitted physics_ea_coeffs; "
+            "run training/evaluation once to produce a complete psi_final.pt."
+        )
     ea_source = "neural" if ea_neural is not None else "physics (no learned head in checkpoint)"
     result = {
         "reactant_path": reactant_path,
@@ -1996,16 +2355,21 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         "geom_mask": geom_mask[:n, :n].tolist(),
         "coords_pred": pred_coords.tolist(),
     }
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
     if xyz_path:
+        os.makedirs(os.path.dirname(xyz_path) or ".", exist_ok=True)
         write_xyz(xyz_path, r_types, pred_coords, f"PSI predicted TS, Ea={energy_pred:.4f} kcal/mol")
     print("\n" + "="*70)
     print(" PREDICTION RESULT ")
     print("="*70)
     print(f"Atoms: {n}")
     print(f"Predicted activation energy ({ea_source}): {energy_pred:.4f} kcal/mol")
-    print(f"  Physics baseline: {ea_physics:.4f} kcal/mol")
+    if ea_physics is not None:
+        print(f"  Physics baseline: {ea_physics:.4f} kcal/mol")
+    else:
+        print("  Physics baseline: unavailable in this checkpoint")
     print(f"Prediction JSON saved to: {output_path}")
     if xyz_path:
         print(f"Predicted TS XYZ saved to: {xyz_path}")
@@ -2087,6 +2451,9 @@ def create_dashboard(data_path, save_dir):
 
     with open(data_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
+    if not data:
+        raise ValueError(f"{data_path} does not contain any reaction records.")
+    os.makedirs(save_dir, exist_ok=True)
 
     data = sorted(data, key=lambda x: x["rxn_id"])
 
@@ -2801,11 +3168,21 @@ if __name__ == "__main__":
     train_parser.add_argument("--epochs", type=int, default=CONFIG["epochs"], help="Training epochs")
     train_parser.add_argument("--batch-size", type=int, default=CONFIG["batch_size"], help="Training batch size")
     train_parser.add_argument("--num-workers", type=int, default=CONFIG["num_workers"], help="DataLoader worker processes")
+    train_parser.add_argument("--val-split", type=float, default=CONFIG["val_split"], help="Validation fraction; 0.1 keeps 90%% of data for training")
+    train_parser.add_argument("--split-seed", type=int, default=CONFIG["split_seed"], help="Random seed for train/validation splitting")
+    train_parser.add_argument("--split-strategy", choices=["random", "stratified"], default=CONFIG["split_strategy"], help="Train/validation split strategy")
+    train_parser.add_argument("--split-bins", type=int, default=CONFIG["split_bins"], help="Ea quantile bins for stratified splitting")
+    train_parser.add_argument("--risk-penalty-mode", choices=["binary", "margin", "sigmoid"], default=CONFIG["risk_penalty_mode"], help="Sample-level risk weighting function")
+    train_parser.add_argument("--risk-weight-alpha", type=float, default=CONFIG["risk_weight_alpha"], help="Scale applied to continuous risk penalty weights")
+    train_parser.add_argument("--risk-weight-max", type=float, default=CONFIG["risk_weight_max"], help="Maximum continuous risk loss multiplier")
+    train_parser.add_argument("--triangle-loss-weight", type=float, default=CONFIG["triangle_loss_weight"], help="Weight for triangle-inequality PINN loss")
+    train_parser.add_argument("--triangle-triplet-samples", type=int, default=CONFIG["triangle_triplet_samples"], help="Triplets sampled per batch for triangle loss; 0 uses all")
     train_parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default=CONFIG["device"], help="Training device")
     train_parser.add_argument("--require-cuda", action="store_true", help="Fail instead of falling back to CPU")
     train_parser.add_argument("--no-amp", action="store_true", help="Disable CUDA mixed precision")
     train_parser.add_argument("--patience", type=int, default=CONFIG["patience"], help="Early stopping patience")
     train_parser.add_argument("--lr", type=float, default=CONFIG["lr"], help="Learning rate")
+    train_parser.add_argument("--save-dir", default=CONFIG["save_dir"], help="Directory to save checkpoints (e.g. Google Drive)")
     predict_parser = subparsers.add_parser("predict", help="Predict a transition state from reactant/product logs")
     predict_parser.add_argument("--reactant", "-r", required=True, help="Path to reactant .log file")
     predict_parser.add_argument("--product", "-p", required=True, help="Path to product .log file")
@@ -2834,9 +3211,19 @@ if __name__ == "__main__":
             CONFIG["epochs"] = args.epochs
             CONFIG["batch_size"] = args.batch_size
             CONFIG["num_workers"] = args.num_workers
+            CONFIG["val_split"] = args.val_split
+            CONFIG["split_seed"] = args.split_seed
+            CONFIG["split_strategy"] = args.split_strategy
+            CONFIG["split_bins"] = args.split_bins
+            CONFIG["risk_penalty_mode"] = args.risk_penalty_mode
+            CONFIG["risk_weight_alpha"] = args.risk_weight_alpha
+            CONFIG["risk_weight_max"] = args.risk_weight_max
+            CONFIG["triangle_loss_weight"] = args.triangle_loss_weight
+            CONFIG["triangle_triplet_samples"] = args.triangle_triplet_samples
             CONFIG["device"] = args.device
             CONFIG["require_cuda"] = args.require_cuda
             CONFIG["amp"] = not args.no_amp
             CONFIG["patience"] = args.patience
             CONFIG["lr"] = args.lr
+            CONFIG["save_dir"] = args.save_dir
         train_pipeline(CONFIG)
