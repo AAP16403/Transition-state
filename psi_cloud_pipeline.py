@@ -581,14 +581,19 @@ CONFIG = {
     "geom_coarse_weight": 0.5,  # weight on the pre-EGNN (coarse) distance aux loss
     # --- Learned activation-energy (Ea) head -----------------------------
     # A small head consumes the EGNN's refined per-atom features (h_ts) + the
-    # signed reaction energy and regresses Ea. Trained jointly with geometry but
-    # only after a warmup, so its gradient reshapes the EGNN ("learn physics")
+    # signed reaction energy and regresses Ea. It trains from the start on
+    # detached TS features, then after warmup its gradient can reshape the EGNN
     # once predicted TS geometries are good enough to learn from. PhysicsEa
     # (Marcus/Hammond/OLS) is kept as a side-by-side baseline.
-    "ea_loss_weight": 1.0,     # weight on the Ea loss (computed on normalized Ea)
-    "ea_warmup_epochs": 200,   # geometry-only until here, then the Ea loss turns on
-    "ea_select_weight": 0.25,  # Ea contribution to checkpoint selection (post-warmup)
-    "ea_head_dropout": 0.35,   # dropout inside the Ea head MLP
+    "ea_loss_weight": 2.0,          # full joint Ea weight after warmup
+    "ea_loss_start_epoch": 1,       # train Ea head from the first epoch
+    "ea_warmup_loss_weight": 1.0,   # detached-feature Ea weight before joint mode
+    "ea_warmup_epochs": 150,        # after this, Ea gradients can reach EGNN/backbone
+    "ea_select_weight": 0.5,        # Ea contribution to checkpoint selection
+    "ea_head_dropout": 0.15,        # dropout inside the Ea head MLP
+    "ea_head_lr": 3e-4,             # faster LR for the scalar Ea head
+    "ea_head_weight_decay": 1e-3,
+    "ea_detach_during_warmup": True,
     "lr": 1.5e-4,
     "weight_decay": 1e-2,
     "warmup_epochs": 40,
@@ -599,13 +604,13 @@ CONFIG = {
     "device": "auto",
     "require_cuda": False,
     "amp": True,
-    "epochs": 1500,
+    "epochs": 1200,
     "print_every": 25,
     "val_split": 0.1,
     "split_seed": 42,
     "split_strategy": "stratified",
     "split_bins": 5,
-    "patience": 500,
+    "patience": 220,
     "coord_noise_std": 0.05,
     "spectator_threshold": 0.15,
     "spectator_tol": 0.05,
@@ -1646,6 +1651,9 @@ class EaHead(nn.Module):
         )
         # Input: attention-pooled + mean-pooled EGNN features + de_rxn + descriptors
         in_dim = 2 * node_dim + 1 + energy_feat_dim
+        final = nn.Linear(hidden // 2, 1)
+        nn.init.xavier_uniform_(final.weight, gain=0.1)
+        nn.init.zeros_(final.bias)
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.GELU(),
@@ -1653,7 +1661,7 @@ class EaHead(nn.Module):
             nn.Linear(hidden, hidden // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden // 2, 1),
+            final,
         )
 
     def forward(self, h_ts, mask, de_rxn, energy_feats=None):
@@ -1720,7 +1728,10 @@ class PSI(nn.Module):
         valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         return dist * (1.0 - eye) * valid
 
-    def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys, de_rxn=None, energy_feats=None):
+    def forward(
+        self, D_R, D_I, D_P, mask, atom_ids, atom_phys,
+        de_rxn=None, energy_feats=None, detach_ea_features=False,
+    ):
         """Predict TS distance matrix and (optionally) the learned Ea.
 
         Args:
@@ -1733,6 +1744,8 @@ class PSI(nn.Module):
             D_TS_coarse:  [B, N, N] pre-EGNN coarse distances (for aux loss)
             ea_pred_norm: [B] normalized Ea from the EaHead, or None if the head
                           is absent (EGNN off) or de_rxn was not supplied.
+            detach_ea_features: stop Ea gradients at h_ts while still training
+                          the Ea head. Used during Ea warm-start.
         """
         f = self.core(D_R, D_I, D_P, mask, atom_ids, atom_phys)
         atom_emb = self.core.atom_embed(atom_ids)
@@ -1756,8 +1769,9 @@ class PSI(nn.Module):
             h_ts, x_ts = self.egnn(node_feats, x_init, mask)
             D_TS_pred = self._coords_to_distance(x_ts, mask)
             if de_rxn is not None:
+                h_ea = h_ts.detach() if detach_ea_features else h_ts
                 ef = energy_feats.float() if energy_feats is not None else None
-                ea_pred_norm = self.ea_head(h_ts, mask, de_rxn.float(), ef)
+                ea_pred_norm = self.ea_head(h_ea, mask, de_rxn.float(), ef)
         else:
             D_TS_pred = D_TS_coarse
         return D_TS_pred, D_TS_coarse, ea_pred_norm
@@ -1778,13 +1792,39 @@ class CosineAnnealingWarmup(torch.optim.lr_scheduler._LRScheduler):
             cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
             return [self.min_lr + (base_lr - self.min_lr) * cosine for base_lr in self.base_lrs]
 
+
+def build_optimizer(model, config):
+    """Use a faster, lighter-decayed optimizer group for the scalar Ea head."""
+    ea_params = list(model.ea_head.parameters()) if hasattr(model, "ea_head") else []
+    if not ea_params:
+        return torch.optim.AdamW(
+            model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
+        )
+
+    ea_param_ids = {id(p) for p in ea_params}
+    base_params = [
+        p for p in model.parameters()
+        if p.requires_grad and id(p) not in ea_param_ids
+    ]
+    return torch.optim.AdamW(
+        [
+            {"params": base_params, "lr": config["lr"], "weight_decay": config["weight_decay"]},
+            {
+                "params": ea_params,
+                "lr": config["ea_head_lr"],
+                "weight_decay": config["ea_head_weight_decay"],
+            },
+        ]
+    )
+
+
 def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True):
     """Joint geometry + Ea training loop.
 
-    Geometry is the backbone objective. After `ea_warmup_epochs`, the learned Ea
-    loss is switched on so its gradient flows through the EGNN (the head trains
-    on the *predicted* TS, matching inference). The physics Ea baseline is
-    computed separately, post-training, and does not touch this loop.
+    Geometry is the backbone objective. The learned Ea head trains from
+    `ea_loss_start_epoch`; before `ea_warmup_epochs` it can use detached EGNN
+    features so the starting Ea prediction improves without letting noisy early
+    Ea gradients reshape the geometry backbone.
     """
     if is_train:
         model.train()
@@ -1792,9 +1832,19 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         model.eval()
     total_loss, total_geom, total_triangle, total_ea_mae, total_ea_norm, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
-    # Ea loss is gated by the geometry warmup so the head learns from sane TS.
-    ea_active = epoch > config["ea_warmup_epochs"]
-    ea_w = config["ea_loss_weight"] if ea_active else 0.0
+    ea_started = epoch >= config.get("ea_loss_start_epoch", config["ea_warmup_epochs"] + 1)
+    ea_joint = epoch > config["ea_warmup_epochs"]
+    detach_ea_features = (
+        config.get("ea_detach_during_warmup", True)
+        and ea_started
+        and not ea_joint
+    )
+    if ea_joint:
+        ea_w = config["ea_loss_weight"]
+    elif ea_started:
+        ea_w = config.get("ea_warmup_loss_weight", 1.0)
+    else:
+        ea_w = 0.0
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
         for batch in loader:
@@ -1806,7 +1856,10 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_DTS_coarse, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats)
+                p_DTS, p_DTS_coarse, ea_pred_norm = model(
+                    DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats,
+                    detach_ea_features=detach_ea_features,
+                )
                 N = DR.shape[1]
                 valid_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
                 eye = torch.eye(N, device=mask.device, dtype=mask.dtype).unsqueeze(0)
@@ -1879,14 +1932,15 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                         + config["risk_pinn_loss_weight"] * l_risk_bounds
                     )
 
-                # Learned Ea loss on the normalized target (computed every epoch
-                # for monitoring; only added to `loss` once warmed up).
+                # Learned Ea loss on the normalized target. During warm-start it
+                # trains the head on detached features; after warmup it becomes
+                # a joint EGNN/backbone objective.
                 if ea_pred_norm is not None:
                     ea_target_norm = (Ea - ea_mean) / ea_std
                     l_ea = F.smooth_l1_loss(ea_pred_norm, ea_target_norm)
                     if ea_w > 0.0:
                         loss = loss + ea_w * l_ea
-                        if risk_sample.sum() > 0:
+                        if ea_joint and risk_sample.sum() > 0:
                             ea_abs = F.smooth_l1_loss(ea_pred_norm, ea_target_norm, reduction='none')
                             risk_weight = risk_scale * risk_sample
                             l_risk_ea = (ea_abs * risk_weight).sum() / risk_weight.sum().clamp(min=1.0)
@@ -1952,10 +2006,9 @@ def train_pipeline(config):
     model = PSI(config, num_atom_types).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
-    # Single param group: all parameters serve the geometry objective.
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
-    )
+    optimizer = build_optimizer(model, config)
+    if hasattr(model, "ea_head"):
+        print(f"Learning rates: base={config['lr']:.2e}, ea_head={config['ea_head_lr']:.2e}")
     scheduler = CosineAnnealingWarmup(optimizer, warmup_epochs=config["warmup_epochs"], total_epochs=config["epochs"])
     use_amp = config["amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -1973,9 +2026,12 @@ def train_pipeline(config):
         "config_snapshot": {k: v for k, v in config.items() if isinstance(v, (int, float, str, bool))},
     }
     print(f"\nTraining for up to {config['epochs']} epochs (patience={config['patience']})...")
-    print(f"  Joint geometry + learned Ea; Ea loss turns on after epoch {config['ea_warmup_epochs']}.")
-    print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>11} | {'T.Geom':>8} | {'V.Geom':>8} | {'V.EaMAE':>8} | {'LR':>10}")
-    print("-" * 84)
+    print(
+        f"  Ea head starts at epoch {config['ea_loss_start_epoch']} on detached features; "
+        f"full joint Ea starts after epoch {config['ea_warmup_epochs']}."
+    )
+    print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>11} | {'T.Geom':>8} | {'V.Geom':>8} | {'T.EaMAE':>8} | {'V.EaMAE':>8} | {'LR':>10}")
+    print("-" * 95)
     best_val_loss = float('inf')
     patience_counter = 0
     history = []
@@ -1987,27 +2043,38 @@ def train_pipeline(config):
         print(f"Resuming from checkpoint {latest_model_path}...")
         ckpt = torch.load(latest_model_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["best_val_loss"]
         patience_counter = ckpt["patience_counter"]
         history = ckpt.get("history", [])
-        print(f"Resumed at epoch {start_epoch} (best val loss: {best_val_loss:.4f})")
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        except (KeyError, ValueError) as exc:
+            print(f"Checkpoint model loaded, but optimizer/scheduler state was reset: {exc}")
+            best_val_loss = float('inf')
+            patience_counter = 0
+            scheduler.last_epoch = start_epoch - 1
+            lrs = scheduler.get_lr()
+            for group, lr in zip(optimizer.param_groups, lrs):
+                group["lr"] = lr
+            scheduler._last_lr = lrs
+        print(f"Resumed at epoch {start_epoch} (best val_select: {best_val_loss:.4f})")
 
     for epoch in range(start_epoch, config["epochs"] + 1):
         train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
         val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
-        # Geometry is the primary selection signal; once the Ea loss is active,
-        # blend in the (normalized) Ea error so early stopping does not cut off a
+        current_ea_lr = optimizer.param_groups[-1]['lr']
+        # Geometry is the primary selection signal; once joint Ea is active,
+        # blend in normalized Ea error so checkpointing does not ignore a
         # still-improving head. ea_select_weight keeps geometry dominant.
         ea_active = epoch > config["ea_warmup_epochs"]
         if epoch == config["ea_warmup_epochs"] + 1:
             best_val_loss = float('inf')
             patience_counter = 0
-            print("\n--- Ea warmup ended. Resetting early stopping tracking ---")
+            print("\n--- Ea joint warmup ended. Resetting early stopping tracking ---")
 
         val_select = val_metrics["geom"]
         if ea_active:
@@ -2022,9 +2089,11 @@ def train_pipeline(config):
             "train_triangle": train_metrics["triangle"],
             "val_triangle": val_metrics["triangle"],
             "train_ea_mae": train_metrics["ea_mae"],
+            "train_ea_norm": train_metrics["ea_norm"],
             "val_ea_mae": val_metrics["ea_mae"],
             "val_ea_norm": val_metrics["ea_norm"],
             "lr": current_lr,
+            "ea_lr": current_ea_lr,
         })
         improved = val_select < best_val_loss
         if improved:
@@ -2046,7 +2115,8 @@ def train_pipeline(config):
             marker = " *" if improved else ""
             print(f"{epoch:6d} | {train_metrics['loss']:11.4f} | {val_metrics['loss']:11.4f} | "
                   f"{train_metrics['geom']:8.5f} | {val_metrics['geom']:8.5f} | "
-                  f"{val_metrics['ea_mae']:8.3f} | {current_lr:10.2e}{marker}")
+                  f"{train_metrics['ea_mae']:8.3f} | {val_metrics['ea_mae']:8.3f} | "
+                  f"{current_lr:10.2e}{marker}")
         if patience_counter >= config["patience"]:
             print(f"\nEarly stopping at epoch {epoch} (no improvement for {config['patience']} epochs)")
             break
@@ -2054,7 +2124,7 @@ def train_pipeline(config):
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"\nTraining history saved to {history_path}")
-    print(f"\nLoading best model (best val_geom={best_val_loss:.4f})...")
+    print(f"\nLoading best model (best val_select={best_val_loss:.4f})...")
     checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     # =========================================================================
@@ -3182,6 +3252,14 @@ if __name__ == "__main__":
     train_parser.add_argument("--no-amp", action="store_true", help="Disable CUDA mixed precision")
     train_parser.add_argument("--patience", type=int, default=CONFIG["patience"], help="Early stopping patience")
     train_parser.add_argument("--lr", type=float, default=CONFIG["lr"], help="Learning rate")
+    train_parser.add_argument("--ea-head-lr", type=float, default=CONFIG["ea_head_lr"], help="Learning rate for the Ea head")
+    train_parser.add_argument("--ea-loss-weight", type=float, default=CONFIG["ea_loss_weight"], help="Full joint normalized-Ea loss weight")
+    train_parser.add_argument("--ea-warmup-loss-weight", type=float, default=CONFIG["ea_warmup_loss_weight"], help="Detached-feature Ea loss weight before joint warmup ends")
+    train_parser.add_argument("--ea-loss-start-epoch", type=int, default=CONFIG["ea_loss_start_epoch"], help="First epoch that trains the Ea head")
+    train_parser.add_argument("--ea-warmup-epochs", type=int, default=CONFIG["ea_warmup_epochs"], help="Epochs before Ea gradients can reach EGNN/backbone")
+    train_parser.add_argument("--ea-select-weight", type=float, default=CONFIG["ea_select_weight"], help="Ea contribution to validation checkpoint selection")
+    train_parser.add_argument("--ea-head-dropout", type=float, default=CONFIG["ea_head_dropout"], help="Dropout inside the Ea head MLP")
+    train_parser.add_argument("--no-ea-detach-warmup", action="store_true", help="Allow Ea warmup gradients to reach EGNN/backbone")
     train_parser.add_argument("--save-dir", default=CONFIG["save_dir"], help="Directory to save checkpoints (e.g. Google Drive)")
     predict_parser = subparsers.add_parser("predict", help="Predict a transition state from reactant/product logs")
     predict_parser.add_argument("--reactant", "-r", required=True, help="Path to reactant .log file")
@@ -3225,5 +3303,13 @@ if __name__ == "__main__":
             CONFIG["amp"] = not args.no_amp
             CONFIG["patience"] = args.patience
             CONFIG["lr"] = args.lr
+            CONFIG["ea_head_lr"] = args.ea_head_lr
+            CONFIG["ea_loss_weight"] = args.ea_loss_weight
+            CONFIG["ea_warmup_loss_weight"] = args.ea_warmup_loss_weight
+            CONFIG["ea_loss_start_epoch"] = args.ea_loss_start_epoch
+            CONFIG["ea_warmup_epochs"] = args.ea_warmup_epochs
+            CONFIG["ea_select_weight"] = args.ea_select_weight
+            CONFIG["ea_head_dropout"] = args.ea_head_dropout
+            CONFIG["ea_detach_during_warmup"] = not args.no_ea_detach_warmup
             CONFIG["save_dir"] = args.save_dir
         train_pipeline(CONFIG)
