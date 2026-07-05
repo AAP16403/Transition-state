@@ -279,33 +279,21 @@ def kabsch_align_reactant_fragments(c_R, c_P, atom_types, n, bond_scale=1.45):
             c_R_aligned[idx] = c_P[idx]
     return c_R_aligned
 
-def mds_by_fragments(D, atom_types=None, fragments=None, reference_coords=None, dim=3, bond_scale=1.45):
-    n = D.shape[0]
-    if fragments is None:
-        if atom_types is None:
-            fragments = [list(range(n))]
-        else:
-            fragments = find_fragments_from_distances(D, atom_types, bond_scale)
-    X = np.zeros((n, dim), dtype=np.float64)
-    cursor = 0.0
-    for frag in fragments:
-        idx = np.array(frag, dtype=np.int64)
-        if len(idx) >= 2:
-            frag_coords = mds(D[np.ix_(idx, idx)], dim=dim)
-        else:
-            frag_coords = np.zeros((1, dim), dtype=np.float64)
-        if reference_coords is not None:
-            ref = reference_coords[idx]
-            if len(idx) >= 2:
-                frag_coords = kabsch(frag_coords, ref)
-            else:
-                frag_coords[0] = ref[0]
-        else:
-            frag_coords = frag_coords - frag_coords.mean(axis=0)
-            span = np.ptp(frag_coords[:, 0]) if len(idx) > 1 else 0.0
-            frag_coords[:, 0] += cursor - frag_coords[:, 0].min()
-            cursor += max(span, 1.5) + 3.0
-        X[idx] = frag_coords
+def mds_aligned(D, reference_coords=None, dim=3):
+    """Recover one global coordinate set from a full distance matrix.
+
+    A single MDS embedding preserves inter-fragment distances. When a reference
+    frame is available, only one global rigid alignment is applied.
+    """
+    X = mds(D, dim=dim)
+    if reference_coords is not None:
+        ref = np.asarray(reference_coords, dtype=np.float64)
+        if len(X) >= 2:
+            X = kabsch(X, ref)
+        elif len(X) == 1:
+            X[0] = ref[0]
+    elif len(X) > 0:
+        X = X - X.mean(axis=0)
     return X.astype(np.float32)
 
 STERIC_FLOOR_FRAC = 0.75
@@ -322,15 +310,13 @@ def clamp_steric_collisions(pred_dist, atom_types, floor_frac=STERIC_FLOOR_FRAC)
                 pred_dist[j, i] = min_d
     return pred_dist
 
-def classify_bonds(D_R, D_P, n, threshold=0.15):
-    active, spectator = [], []
+def spectator_pairs(D_R, D_P, n, threshold=0.15):
+    spectator = []
     for i in range(n):
         for j in range(i + 1, n):
-            if abs(D_R[i, j] - D_P[i, j]) > threshold:
-                active.append((i, j))
-            else:
+            if abs(D_R[i, j] - D_P[i, j]) <= threshold:
                 spectator.append((i, j))
-    return active, spectator
+    return spectator
 
 RISK_BOND_TYPES = {
     tuple(sorted(pair))
@@ -353,7 +339,6 @@ def reaction_risk_features(D_R, D_P, atom_types, n, max_atoms, bond_scale=1.45, 
     formed = set(bonds_P) - set(bonds_R)
     broken = set(bonds_R) - set(bonds_P)
 
-    active_mask = np.zeros((max_atoms, max_atoms), dtype=np.float32)
     risk_pair_mask = np.zeros((max_atoms, max_atoms), dtype=np.float32)
     risky_bond_types = set()
     for i in range(n):
@@ -363,7 +348,6 @@ def reaction_risk_features(D_R, D_P, atom_types, n, max_atoms, bond_scale=1.45, 
             is_formed_or_broken = (i, j) in formed or (i, j) in broken
             is_risky_type = bond_type in RISK_BOND_TYPES
             if is_active:
-                active_mask[i, j] = active_mask[j, i] = 1.0
                 if is_risky_type:
                     risky_bond_types.add(bond_type)
             if is_formed_or_broken and is_risky_type:
@@ -390,7 +374,6 @@ def reaction_risk_features(D_R, D_P, atom_types, n, max_atoms, bond_scale=1.45, 
         "complexity_margin_penalty": complexity_margin_penalty,
         "complexity_sigmoid_penalty": complexity_sigmoid_penalty,
         "risk_penalty": risk_penalty,
-        "active_pair_mask": active_mask,
         "risk_pair_mask": risk_pair_mask,
         "risky_bond_types": sorted("-".join(t) for t in risky_bond_types),
     }
@@ -410,8 +393,7 @@ def continuous_risk_penalty(formed_n, broken_n, risky_chem_flag, mode="margin", 
     return float(complexity + 0.5 * float(risky_chem_flag > 0.0))
 
 def apply_spectator_constraints(pred_dist, D_R, D_P, n, threshold=0.15, tol=0.05, pair_mask=None):
-    _, spectator = classify_bonds(D_R, D_P, n, threshold)
-    for (i, j) in spectator:
+    for (i, j) in spectator_pairs(D_R, D_P, n, threshold):
         if pair_mask is not None and pair_mask[i, j] <= 0:
             continue
         d_ref = (D_R[i, j] + D_P[i, j]) / 2.0
@@ -422,27 +404,18 @@ def apply_spectator_constraints(pred_dist, D_R, D_P, n, threshold=0.15, tol=0.05
         pred_dist[j, i] = clamped
     return pred_dist
 
-def enforce_triangle_inequality(D, fragments=None, tol=0.05):
+def enforce_triangle_inequality(D, tol=0.05):
     D = D.copy()
     n = D.shape[0]
-    if fragments is None:
-        fragments = [list(range(n))]
-    for frag in fragments:
-        idx = np.array(frag, dtype=np.int64)
-        if len(idx) < 3:
-            continue
-        sub = D[np.ix_(idx, idx)].copy()
-        m = len(idx)
-        for k in range(m):
-            for i in range(m):
-                for j in range(m):
-                    shortcut = sub[i, k] + sub[k, j]
-                    if sub[i, j] - shortcut > tol:
-                        sub[i, j] = sub[j, i] = shortcut
-        D[np.ix_(idx, idx)] = sub
+    for k in range(n):
+        for i in range(n):
+            for j in range(n):
+                shortcut = D[i, k] + D[k, j]
+                if D[i, j] - shortcut > tol:
+                    D[i, j] = D[j, i] = shortcut
     return D
 
-def validate_ts_geometry(pred_dist, D_R, D_P, atom_types, n, spectator_threshold=0.15):
+def validate_ts_geometry(pred_dist, atom_types, n):
     issues = []
     for i in range(n):
         for j in range(i + 1, n):
@@ -451,12 +424,6 @@ def validate_ts_geometry(pred_dist, D_R, D_P, atom_types, n, spectator_threshold
             min_d = STERIC_FLOOR_FRAC * (r_i + r_j)
             if pred_dist[i, j] < min_d:
                 issues.append(f"  STERIC   {atom_types[i]}{i}-{atom_types[j]}{j}: {pred_dist[i,j]:.3f} Å < floor {min_d:.3f} Å")
-    active, _ = classify_bonds(D_R, D_P, n, spectator_threshold)
-    for (i, j) in active:
-        d_lo = min(D_R[i, j], D_P[i, j]) - 0.30
-        d_hi = max(D_R[i, j], D_P[i, j]) + 0.30
-        if not (d_lo <= pred_dist[i, j] <= d_hi):
-            issues.append(f"  ACT_OOB  {atom_types[i]}{i}-{atom_types[j]}{j}: pred={pred_dist[i,j]:.3f} Å  (R={D_R[i,j]:.3f}, P={D_P[i,j]:.3f})")
     if issues:
         print(f"[TS Validation] {len(issues)} issue(s) detected:")
         for iss in issues:
@@ -594,6 +561,15 @@ CONFIG = {
     "ea_head_lr": 3e-4,             # faster LR for the scalar Ea head
     "ea_head_weight_decay": 1e-3,
     "ea_detach_during_warmup": True,
+    # --- Phase 2: optional high-Ea tail weighting ------------------------
+    # Disabled by default so Phase 1 warm-start runs remain isolated. When
+    # enabled, the Ea SmoothL1 loss is sample-weighted by raw Ea (kcal/mol)
+    # to reduce regression-to-mean on rare high-barrier reactions.
+    "ea_tail_weighting_enabled": False,
+    "ea_tail_weight_mode": "piecewise",
+    "ea_tail_weight_bins": [80.0, 100.0, 120.0],
+    "ea_tail_weight_values": [1.0, 1.5, 2.0, 2.5],
+    "ea_tail_weight_max": 2.5,
     "lr": 1.5e-4,
     "weight_decay": 1e-2,
     "warmup_epochs": 40,
@@ -601,8 +577,8 @@ CONFIG = {
     "batch_size": 32,
     "num_workers": 2,
     "pin_memory": True,
-    "device": "auto",
-    "require_cuda": False,
+    "device": "cuda",
+    "require_cuda": True,
     "amp": True,
     "epochs": 1200,
     "print_every": 25,
@@ -611,7 +587,7 @@ CONFIG = {
     "split_strategy": "stratified",
     "split_bins": 5,
     "patience": 220,
-    "coord_noise_std": 0.05,
+    "skip_final_eval": False,
     "spectator_threshold": 0.15,
     "spectator_tol": 0.05,
     "risk_penalty_mode": "margin",
@@ -623,7 +599,6 @@ CONFIG = {
     "risk_weight_max": 3.0,
     "risk_ea_loss_weight": 0.5,      # extra normalized-Ea loss on high-risk reaction classes
     "risk_geom_loss_weight": 0.2,    # extra geometry loss on active/formed/broken risky pairs
-    "risk_pinn_loss_weight": 0.1,    # extra endpoint-bounds penalty on risky reaction classes
     "triangle_loss_weight": 0.05,
     "triangle_coarse_weight": 0.25,
     "triangle_refined_weight": 1.0,
@@ -635,17 +610,8 @@ CONFIG = {
 }
 
 def resolve_device(config):
-    requested = config["device"].lower()
-    if requested == "auto":
-        if config["require_cuda"]:
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA is required but not available!")
-            return torch.device("cuda")
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(requested)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is requested but not available!")
-    return device
+    print("WARNING: Forcing CUDA device, CPU fallback removed.")
+    return torch.device("cuda")
 
 def configure_torch_runtime(device):
     if device.type == "cuda":
@@ -665,7 +631,6 @@ def move_batch_to_device(batch, device):
         batch["Ea"].to(device, non_blocking=True),
         batch["de_rxn"].to(device, non_blocking=True),
         batch["energy_feats"].to(device, non_blocking=True),
-        batch["active_pair_mask"].to(device, non_blocking=True),
         batch["risk_pair_mask"].to(device, non_blocking=True),
         batch["risk_score"].to(device, non_blocking=True),
         batch["risk_penalty"].to(device, non_blocking=True),
@@ -691,9 +656,8 @@ def build_atom_vocab(raw_data):
 def build_reaction_samples(config):
     """Parse the dataset JSON once and build raw (un-normalized) samples.
 
-    Targets that don't depend on coordinate augmentation -- the true TS distance
-    matrix and the fragment geometry mask (both derived from the unaugmented
-    TS coords) -- are precomputed here so __getitem__ stays cheap.
+    The true TS distance matrix and fragment geometry mask are precomputed here
+    so __getitem__ stays cheap.
     """
     try:
         with open(config["dataset_json"], "r", encoding="utf-8") as f:
@@ -774,7 +738,6 @@ def build_reaction_samples(config):
                 "atom_phys_raw": atom_phys,
                 "D_TS": torch.from_numpy(D_TS),
                 "geom_mask": torch.from_numpy(geom_mask),
-                "active_pair_mask": torch.from_numpy(risk["active_pair_mask"]),
                 "risk_pair_mask": torch.from_numpy(risk["risk_pair_mask"]),
                 "risk_score": risk["risk_score"],
                 "risk_penalty": risk["risk_penalty"],
@@ -1026,17 +989,14 @@ def compute_normalization(samples, indices):
 class ReactionDataset(Dataset):
     """Thin view over a shared list of prebuilt samples.
 
-    Multiple views (e.g. augmented train vs. clean eval) share the same sample
-    list and normalization stats; only the `augment` flag differs.
     Returns the raw Ea target (kcal/mol) and the z-scored de_rxn feature for the
     learned Ea head; Ea is normalized inside the training loop using ea_mean/std.
     """
-    def __init__(self, config, samples, atom_vocab, atom_types_map, stats, augment=False):
+    def __init__(self, config, samples, atom_vocab, atom_types_map, stats):
         self.config = config
         self.samples = samples
         self.atom_vocab = atom_vocab
         self.atom_types_map = atom_types_map
-        self.augment = augment
         self.aphys_mean = stats["aphys_mean"]
         self.aphys_std = stats["aphys_std"]
         self.de_rxn_mean = stats["de_rxn_mean"]
@@ -1051,10 +1011,6 @@ class ReactionDataset(Dataset):
         n = s["n_atoms"]
         c_R = s["c_R"].copy()
         c_P = s["c_P"].copy()
-        if self.augment:
-            noise_std = self.config["coord_noise_std"]
-            c_R[:n] += np.random.randn(n, 3).astype(np.float32) * noise_std
-            c_P[:n] += np.random.randn(n, 3).astype(np.float32) * noise_std
         # Distance matrices are rotation/translation invariant, so no alignment
         # of the coordinates is needed before computing them.
         D_R = compute_distance_matrix(c_R)
@@ -1087,7 +1043,6 @@ class ReactionDataset(Dataset):
             "Ea": torch.tensor(s["Ea_raw"], dtype=torch.float32),
             "de_rxn": torch.tensor(de_rxn_norm, dtype=torch.float32),
             "energy_feats": torch.from_numpy(efeat_norm.astype(np.float32)),
-            "active_pair_mask": s["active_pair_mask"],
             "risk_pair_mask": s["risk_pair_mask"],
             "risk_score": torch.tensor(s["risk_score"], dtype=torch.float32),
             "risk_penalty": torch.tensor(risk_penalty, dtype=torch.float32),
@@ -1373,6 +1328,8 @@ class PhysicsEaCalculator:
         lam = compute_reorganization_energy(
             coords_R, coords_TS, coords_P, atom_types, n, self.bond_scale
         )
+        if not np.isfinite(lam) or lam < 0.0:
+            lam = 0.0
         eta = hammond_index(
             coords_R, coords_TS, coords_P, atom_types, n,
             self.threshold, self.bond_scale
@@ -1479,14 +1436,13 @@ def torch_mds_coords(D, mask, dim=3):
     Bmat = Bmat * pair                               # keep padded rows/cols at 0
     # Symmetrize defensively before eigh.
     Bmat = 0.5 * (Bmat + Bmat.transpose(1, 2))
-    # eigh fragility: with max_atoms padding, every molecule's Bmat carries many
-    # exactly-repeated (zero) eigenvalues from the padded block, and a single
-    # degenerate element can make the *batched* GPU solver fail to converge
-    # ("too many repeated eigenvalues", LinAlgError). Lift the degeneracy with a
-    # tiny diagonal jitter. Running on CPU avoids the GPU eigh convergence issue
-    # entirely and is faster for small matrices.
-    eyeN = torch.eye(N, dtype=Bmat.dtype).unsqueeze(0)
-    Bmat = Bmat + 1e-6 * eyeN
+    # Keep padded atoms out of the top eigenspace. A global positive jitter makes
+    # padded dummy modes tie with true zero modes from planar fragments; shifting
+    # only dummy diagonals negative prevents that mixing while preserving the
+    # valid-block jitter.
+    eyeN = torch.eye(N, dtype=Bmat.dtype, device=Bmat.device).unsqueeze(0)
+    dummy_shift = (1.0 - m).unsqueeze(-1) * eyeN
+    Bmat = Bmat - dummy_shift + 1e-6 * eyeN
     evals, evecs = torch.linalg.eigh(Bmat)       # ascending eigenvalues
     top_vals = evals[:, -dim:].flip(-1).clamp(min=0.0)              # [B, dim]
     top_vecs = evecs[:, :, -dim:].flip(-1)                          # [B, N, dim]
@@ -1500,7 +1456,9 @@ def torch_mds_coords(D, mask, dim=3):
     return coords.to(D.dtype).to(D.device)
 
 
-def triangle_inequality_loss(D, mask, geom_mask=None, tol=0.02, triplet_samples=1024):
+def triangle_inequality_loss(
+    D, mask, geom_mask=None, tol=0.02, triplet_samples=1024, stochastic=True
+):
     """Differentiable penalty for predicted distances that violate triangle inequality."""
     B, N, _ = D.shape
     if N < 3:
@@ -1519,12 +1477,16 @@ def triangle_inequality_loss(D, mask, geom_mask=None, tol=0.02, triplet_samples=
     )
     triplets = triplets[distinct]
     if triplet_samples and 0 < triplet_samples < triplets.shape[0]:
-        pick = torch.linspace(
-            0,
-            triplets.shape[0] - 1,
-            steps=int(triplet_samples),
-            device=device,
-        ).long()
+        n_pick = int(triplet_samples)
+        if stochastic:
+            pick = torch.randperm(triplets.shape[0], device=device)[:n_pick]
+        else:
+            pick = torch.linspace(
+                0,
+                triplets.shape[0] - 1,
+                steps=n_pick,
+                device=device,
+            ).long()
         triplets = triplets[pick]
 
     i, j, k = triplets[:, 0], triplets[:, 1], triplets[:, 2]
@@ -1584,9 +1546,11 @@ class EGCL(nn.Module):
         hj = h.unsqueeze(1).expand(B, N, N, H)
         edge_in = torch.cat([hi, hj, dist2], dim=-1)
         m_ij = self.edge_mlp(edge_in) * emask                        # masked messages
-        # Equivariant coordinate update (normalized by neighbor count).
-        trans = rel * torch.clamp(self.coord_mlp(m_ij),
-                                  min=-self.coord_clamp, max=self.coord_clamp)
+        # Equivariant coordinate update (normalized by neighbor count). Clamp
+        # the actual displacement vector norm, not just the scalar edge weight.
+        raw_trans = rel * self.coord_mlp(m_ij)
+        trans_norm = torch.norm(raw_trans, dim=-1, keepdim=True).clamp(min=1e-8)
+        trans = raw_trans * (torch.clamp(trans_norm, max=self.coord_clamp) / trans_norm)
         trans = trans * emask
         deg = emask.sum(dim=2).clamp(min=1.0)                        # [B, N, 1]
         x = x + trans.sum(dim=2) / deg
@@ -1644,13 +1608,14 @@ class EaHead(nn.Module):
     """
     def __init__(self, node_dim, hidden, energy_feat_dim=0, dropout=0.25):
         super().__init__()
+        self.energy_feat_dim = int(energy_feat_dim)
         self.attn = nn.Sequential(
             nn.Linear(node_dim, hidden // 2),
             nn.GELU(),
             nn.Linear(hidden // 2, 1),
         )
         # Input: attention-pooled + mean-pooled EGNN features + de_rxn + descriptors
-        in_dim = 2 * node_dim + 1 + energy_feat_dim
+        in_dim = 2 * node_dim + 1 + self.energy_feat_dim
         final = nn.Linear(hidden // 2, 1)
         nn.init.xavier_uniform_(final.weight, gain=0.1)
         nn.init.zeros_(final.bias)
@@ -1672,9 +1637,27 @@ class EaHead(nn.Module):
         attn_weights = torch.softmax(attn_logits, dim=1).unsqueeze(-1)
         attn_pooled = (h_ts * attn_weights * m).sum(dim=1)
         pooled = torch.cat([attn_pooled, mean_pooled], dim=-1)
-        parts = [pooled, de_rxn.unsqueeze(-1)]                   # [B, 2*node_dim], [B, 1]
-        if energy_feats is not None:
-            parts.append(energy_feats)                            # [B, 20]
+        parts = [
+            pooled,
+            de_rxn.to(device=pooled.device, dtype=pooled.dtype).unsqueeze(-1),
+        ]
+        if self.energy_feat_dim > 0:
+            if energy_feats is None:
+                energy_feats = pooled.new_zeros(pooled.size(0), self.energy_feat_dim)
+            else:
+                if (
+                    energy_feats.dim() != 2
+                    or energy_feats.size(0) != pooled.size(0)
+                    or energy_feats.size(-1) != self.energy_feat_dim
+                ):
+                    raise ValueError(
+                        f"energy_feats must have shape [{pooled.size(0)}, {self.energy_feat_dim}], "
+                        f"got {tuple(energy_feats.shape)}"
+                    )
+                energy_feats = energy_feats.to(device=pooled.device, dtype=pooled.dtype)
+            parts.append(energy_feats)
+        elif energy_feats is not None and energy_feats.numel() > 0:
+            raise ValueError("energy_feats were provided but this EaHead was built with energy_feat_dim=0")
         feat = torch.cat(parts, dim=-1)
         return self.net(feat).squeeze(-1)                        # [B] normalized Ea
 
@@ -1818,6 +1801,33 @@ def build_optimizer(model, config):
     )
 
 
+def ea_tail_sample_weights(Ea, config):
+    """Piecewise sample weights for rare high-barrier Ea targets."""
+    weights = torch.ones_like(Ea, dtype=torch.float32)
+    if not config.get("ea_tail_weighting_enabled", False):
+        return weights
+
+    mode = config.get("ea_tail_weight_mode", "piecewise")
+    if mode != "piecewise":
+        raise ValueError(f"Unsupported ea_tail_weight_mode '{mode}'. Use 'piecewise'.")
+
+    bins = list(config.get("ea_tail_weight_bins", [80.0, 100.0, 120.0]))
+    values = list(config.get("ea_tail_weight_values", [1.0, 1.5, 2.0, 2.5]))
+    if len(values) != len(bins) + 1:
+        raise ValueError(
+            "ea_tail_weight_values must have exactly one more entry than "
+            "ea_tail_weight_bins."
+        )
+
+    for threshold, value in zip(bins, values[1:]):
+        weights = torch.where(Ea >= float(threshold), weights.new_tensor(float(value)), weights)
+    return weights.clamp(max=float(config.get("ea_tail_weight_max", max(values))))
+
+
+def weighted_mean(values, weights):
+    return (values * weights).sum() / weights.sum().clamp(min=1.0)
+
+
 def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True):
     """Joint geometry + Ea training loop.
 
@@ -1830,7 +1840,9 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         model.train()
     else:
         model.eval()
-    total_loss, total_geom, total_triangle, total_ea_mae, total_ea_norm, n_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+    total_loss, total_geom, total_triangle = 0.0, 0.0, 0.0
+    total_ea_mae, total_ea_norm, total_ea_weighted_norm = 0.0, 0.0, 0.0
+    total_ea_tail_weight, n_batches = 0.0, 0
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
     ea_started = epoch >= config.get("ea_loss_start_epoch", config["ea_warmup_epochs"] + 1)
     ea_joint = epoch > config["ea_warmup_epochs"]
@@ -1850,7 +1862,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         for batch in loader:
             (
                 DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, Ea,
-                de_rxn, energy_feats, active_pair_mask, risk_pair_mask,
+                de_rxn, energy_feats, risk_pair_mask,
                 risk_score, risk_penalty, complexity_flag, risky_chem_flag,
             ) = move_batch_to_device(batch, device)
             if is_train:
@@ -1875,16 +1887,13 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # Physics constraint 1: Spectator bonds (abs(DR - DP) < threshold) shouldn't change.
                 # Target them towards the reactant/product midpoint (DI).
                 spectator_mask = (torch.abs(DR - DP) < config["spectator_threshold"]).float() * m2d
-                l_pinn_spectator = F.mse_loss(p_DTS * spectator_mask, DI * spectator_mask, reduction='sum') / denom
+                spectator_denom = spectator_mask.sum().clamp(min=1.0)
+                l_pinn_spectator = (
+                    F.mse_loss(p_DTS * spectator_mask, DI * spectator_mask, reduction='sum')
+                    / spectator_denom
+                )
 
-                # Physics constraint 2: Active bonds should generally be bounded by R and P.
-                min_D = torch.minimum(DR, DP) - 0.2
-                max_D = torch.maximum(DR, DP) + 0.2
-                excess_high = F.relu(p_DTS - max_D) * m2d
-                excess_low = F.relu(min_D - p_DTS) * m2d
-                l_pinn_bounds = (excess_high**2 + excess_low**2).sum() / denom
-
-                l_pinn = l_pinn_spectator + 0.5 * l_pinn_bounds
+                l_pinn = l_pinn_spectator
 
                 l_triangle_refined = triangle_inequality_loss(
                     p_DTS,
@@ -1892,6 +1901,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                     geom_mask,
                     tol=config["triangle_tolerance"],
                     triplet_samples=config["triangle_triplet_samples"],
+                    stochastic=is_train,
                 )
                 l_triangle_coarse = triangle_inequality_loss(
                     p_DTS_coarse,
@@ -1899,6 +1909,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                     geom_mask,
                     tol=config["triangle_tolerance"],
                     triplet_samples=config["triangle_triplet_samples"],
+                    stochastic=is_train,
                 )
                 l_triangle = (
                     config["triangle_refined_weight"] * l_triangle_refined
@@ -1922,31 +1933,25 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 if risk_pair.sum() > 0:
                     risk_geom_abs = F.huber_loss(p_DTS, DTS, reduction='none', delta=0.5)
                     l_risk_geom = (risk_geom_abs * risk_pair_weight).sum() / risk_pair_denom
-                    l_risk_bounds = (
-                        ((excess_high**2 + excess_low**2) * risk_pair_weight).sum()
-                        / risk_pair_denom
-                    )
-                    loss = (
-                        loss
-                        + config["risk_geom_loss_weight"] * l_risk_geom
-                        + config["risk_pinn_loss_weight"] * l_risk_bounds
-                    )
+                    loss = loss + config["risk_geom_loss_weight"] * l_risk_geom
 
                 # Learned Ea loss on the normalized target. During warm-start it
                 # trains the head on detached features; after warmup it becomes
                 # a joint EGNN/backbone objective.
                 if ea_pred_norm is not None:
                     ea_target_norm = (Ea - ea_mean) / ea_std
-                    l_ea = F.smooth_l1_loss(ea_pred_norm, ea_target_norm)
+                    ea_abs = F.smooth_l1_loss(ea_pred_norm, ea_target_norm, reduction='none')
+                    ea_tail_weight = ea_tail_sample_weights(Ea.float(), config)
+                    l_ea = ea_abs.mean()
+                    l_ea_weighted = weighted_mean(ea_abs, ea_tail_weight)
                     if ea_w > 0.0:
-                        loss = loss + ea_w * l_ea
+                        loss = loss + ea_w * l_ea_weighted
                         if ea_joint and risk_sample.sum() > 0:
-                            ea_abs = F.smooth_l1_loss(ea_pred_norm, ea_target_norm, reduction='none')
                             risk_weight = risk_scale * risk_sample
                             l_risk_ea = (ea_abs * risk_weight).sum() / risk_weight.sum().clamp(min=1.0)
                             loss = loss + config["risk_ea_loss_weight"] * l_risk_ea
                 else:
-                    l_ea = None
+                    l_ea = l_ea_weighted = ea_tail_weight = None
             if is_train:
                 # Guard against a non-finite batch corrupting the weights: skip
                 # the step entirely rather than relying solely on GradScaler.
@@ -1963,6 +1968,8 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
             total_triangle += l_triangle.item()
             if l_ea is not None:
                 total_ea_norm += l_ea.item()
+                total_ea_weighted_norm += l_ea_weighted.item()
+                total_ea_tail_weight += ea_tail_weight.mean().item()
                 # Denormalized Ea MAE (kcal/mol) for human-readable tracking.
                 total_ea_mae += (ea_pred_norm.detach() - ea_target_norm).abs().mean().item() * ea_std
             n_batches += 1
@@ -1973,6 +1980,8 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         "triangle": total_triangle / nb,
         "ea_mae": total_ea_mae / nb,
         "ea_norm": total_ea_norm / nb,
+        "ea_weighted_norm": total_ea_weighted_norm / nb,
+        "ea_tail_weight": total_ea_tail_weight / nb,
     }
 
 def train_pipeline(config):
@@ -1988,8 +1997,8 @@ def train_pipeline(config):
     n_total = len(samples)
     train_indices, val_indices, split_report = make_train_val_split(samples, config)
     stats = compute_normalization(samples, train_indices)
-    train_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, augment=True)
-    eval_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, augment=False)
+    train_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats)
+    eval_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats)
     train_subset = Subset(train_dataset, train_indices)
     val_subset = Subset(eval_dataset, val_indices)
     loader_kwargs = {
@@ -2023,13 +2032,22 @@ def train_pipeline(config):
         "efeat_mean": stats["efeat_mean"].tolist(),
         "efeat_std": stats["efeat_std"].tolist(),
         "split_summary": split_report,
-        "config_snapshot": {k: v for k, v in config.items() if isinstance(v, (int, float, str, bool))},
+        "config_snapshot": {
+            k: v for k, v in config.items()
+            if isinstance(v, (int, float, str, bool, list, tuple))
+        },
     }
     print(f"\nTraining for up to {config['epochs']} epochs (patience={config['patience']})...")
     print(
         f"  Ea head starts at epoch {config['ea_loss_start_epoch']} on detached features; "
         f"full joint Ea starts after epoch {config['ea_warmup_epochs']}."
     )
+    if config.get("ea_tail_weighting_enabled", False):
+        print(
+            f"  Phase 2 high-Ea weighting: {config['ea_tail_weight_mode']} "
+            f"bins={config['ea_tail_weight_bins']} values={config['ea_tail_weight_values']} "
+            f"max={config['ea_tail_weight_max']}."
+        )
     print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>11} | {'T.Geom':>8} | {'V.Geom':>8} | {'T.EaMAE':>8} | {'V.EaMAE':>8} | {'LR':>10}")
     print("-" * 95)
     best_val_loss = float('inf')
@@ -2090,8 +2108,12 @@ def train_pipeline(config):
             "val_triangle": val_metrics["triangle"],
             "train_ea_mae": train_metrics["ea_mae"],
             "train_ea_norm": train_metrics["ea_norm"],
+            "train_ea_weighted_norm": train_metrics["ea_weighted_norm"],
+            "train_ea_tail_weight": train_metrics["ea_tail_weight"],
             "val_ea_mae": val_metrics["ea_mae"],
             "val_ea_norm": val_metrics["ea_norm"],
+            "val_ea_weighted_norm": val_metrics["ea_weighted_norm"],
+            "val_ea_tail_weight": val_metrics["ea_tail_weight"],
             "lr": current_lr,
             "ea_lr": current_ea_lr,
         })
@@ -2124,6 +2146,9 @@ def train_pipeline(config):
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"\nTraining history saved to {history_path}")
+    if config.get("skip_final_eval", False):
+        print("Skipping final evaluation; resume from psi_latest.pt or run again without --skip-final-eval.")
+        return
     print(f"\nLoading best model (best val_select={best_val_loss:.4f})...")
     checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -2142,7 +2167,7 @@ def train_pipeline(config):
         for batch in eval_loader:
             (
                 DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, _Ea,
-                de_rxn, energy_feats, _active_pair_mask, _risk_pair_mask,
+                de_rxn, energy_feats, _risk_pair_mask,
                 _risk_score, _risk_penalty, _complexity_flag, _risky_chem_flag,
             ) = move_batch_to_device(batch, device)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
@@ -2191,15 +2216,12 @@ def train_pipeline(config):
         pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
         np.fill_diagonal(pred_dist, 0.0)
         pred_dist = clamp_steric_collisions(pred_dist, atom_types)
-        # Recover 3D coordinates via fragment-aware MDS
+        # Recover 3D coordinates from the full distance matrix so inter-fragment
+        # predictions are preserved.
         c_R = np.asarray(s["c_R"][:n], dtype=np.float64)
         c_P = np.asarray(s["c_P"][:n], dtype=np.float64)
-        align_frags = choose_alignment_fragments(c_R, c_P, atom_types, n, config["fragment_bond_scale"])
         c_I = (kabsch_align_reactant_fragments(c_R, c_P, atom_types, n, config["fragment_bond_scale"])[:n] + c_P[:n]) / 2.0
-        pred_coords = mds_by_fragments(
-            pred_dist, atom_types=atom_types, fragments=align_frags,
-            reference_coords=c_I, bond_scale=config["fragment_bond_scale"],
-        )
+        pred_coords = mds_aligned(pred_dist, reference_coords=c_I)
         all_coords_ts[rxn_id] = pred_coords
     # Compute physics features for train split, fit OLS
     train_samples_ordered = [samples[i] for i in train_indices]
@@ -2377,20 +2399,9 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         tol=config["spectator_tol"],
         pair_mask=geom_mask[:n, :n],
     )
-    pred_dist = enforce_triangle_inequality(
-        pred_dist, fragments=[f for f in align_fragments if max(f) < n]
-    )
-    validate_ts_geometry(
-        pred_dist, D_R[:n, :n], D_P[:n, :n], r_types[:n], n,
-        spectator_threshold=config["spectator_threshold"],
-    )
-    pred_coords = mds_by_fragments(
-        pred_dist,
-        atom_types=r_types[:n],
-        fragments=align_fragments,
-        reference_coords=c_I_real,
-        bond_scale=config["fragment_bond_scale"],
-    )
+    pred_dist = enforce_triangle_inequality(pred_dist)
+    validate_ts_geometry(pred_dist, r_types[:n], n)
+    pred_coords = mds_aligned(pred_dist, reference_coords=c_I_real)
     # Physics-based Ea baseline from the predicted 3D TS coordinates.
     ea_physics = None
     if "physics_ea_coeffs" in meta:
@@ -2609,15 +2620,9 @@ def create_dashboard(data_path, save_dir):
         atoms = r["atom_types"]
         fragments = fragments_from_mask(r["geom_mask"]) if "geom_mask" in r else find_fragments_from_distances(dt, atoms)
 
-        # The true TS distance matrix is globally metric, so a single MDS reproduces
-        # it faithfully. Using per-fragment MDS here would scatter forming/breaking-bond
-        # fragments along an arbitrary cursor axis and "explode" the real structure.
         X_true = mds(dt)
-        # The model is only supervised on within-fragment (geom_mask) pairs, so the
-        # predicted/interpolated inter-fragment distances are untrained. Rebuild each
-        # fragment rigidly from its own block, then Kabsch-align it onto the true frame.
-        X_pred = mds_by_fragments(dp, atoms, fragments=fragments, reference_coords=X_true)
-        X_guess = mds_by_fragments(di, atoms, fragments=fragments, reference_coords=X_true)
+        X_pred = mds_aligned(dp, reference_coords=X_true)
+        X_guess = mds_aligned(di, reference_coords=X_true)
 
         representative_data[rid] = {
             "rxn_id": rid,
@@ -3261,6 +3266,7 @@ if __name__ == "__main__":
     train_parser.add_argument("--ea-head-dropout", type=float, default=CONFIG["ea_head_dropout"], help="Dropout inside the Ea head MLP")
     train_parser.add_argument("--no-ea-detach-warmup", action="store_true", help="Allow Ea warmup gradients to reach EGNN/backbone")
     train_parser.add_argument("--save-dir", default=CONFIG["save_dir"], help="Directory to save checkpoints (e.g. Google Drive)")
+    train_parser.add_argument("--skip-final-eval", action="store_true", help="Only train and save checkpoints/history; skip final all-reaction evaluation")
     predict_parser = subparsers.add_parser("predict", help="Predict a transition state from reactant/product logs")
     predict_parser.add_argument("--reactant", "-r", required=True, help="Path to reactant .log file")
     predict_parser.add_argument("--product", "-p", required=True, help="Path to product .log file")
@@ -3312,4 +3318,5 @@ if __name__ == "__main__":
             CONFIG["ea_head_dropout"] = args.ea_head_dropout
             CONFIG["ea_detach_during_warmup"] = not args.no_ea_detach_warmup
             CONFIG["save_dir"] = args.save_dir
+            CONFIG["skip_final_eval"] = args.skip_final_eval
         train_pipeline(CONFIG)

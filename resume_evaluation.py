@@ -124,7 +124,7 @@ def run_resumed_evaluation(args):
     val_indices = indices[n_train:]
     stats = stats_from_checkpoint_or_samples(metadata, samples, train_indices)
 
-    eval_dataset = p.ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, augment=False)
+    eval_dataset = p.ReactionDataset(config, samples, atom_vocab, atom_types_map, stats)
     loader_kwargs = {
         "batch_size": config["batch_size"],
         "num_workers": config["num_workers"],
@@ -163,9 +163,9 @@ def run_resumed_evaluation(args):
                 _ea,
                 de_rxn,
                 energy_feats,
-                _active_pair_mask,
                 _risk_pair_mask,
                 _risk_score,
+                _risk_penalty,
                 _complexity_flag,
                 _risky_chem_flag,
             ) = p.move_batch_to_device(batch, device)
@@ -220,22 +220,13 @@ def run_resumed_evaluation(args):
         pred_dist = p.clamp_steric_collisions(pred_dist, atom_types)
         c_r = np.asarray(sample["c_R"][:n], dtype=np.float64)
         c_p = np.asarray(sample["c_P"][:n], dtype=np.float64)
-        align_frags = p.choose_alignment_fragments(
-            c_r, c_p, atom_types, n, config["fragment_bond_scale"]
-        )
         c_i = (
             p.kabsch_align_reactant_fragments(
                 c_r, c_p, atom_types, n, config["fragment_bond_scale"]
             )[:n]
             + c_p[:n]
         ) / 2.0
-        all_coords_ts[rxn_id] = p.mds_by_fragments(
-            pred_dist,
-            atom_types=atom_types,
-            fragments=align_frags,
-            reference_coords=c_i,
-            bond_scale=config["fragment_bond_scale"],
-        )
+        all_coords_ts[rxn_id] = p.mds_aligned(pred_dist, reference_coords=c_i)
 
     train_samples = [samples[i] for i in train_indices]
     train_coords = [all_coords_ts[samples[i]["rxn_id"]] for i in train_indices]

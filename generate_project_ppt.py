@@ -806,7 +806,6 @@ def add_deck_slides(prs, metrics, charts):
         ["Weight decay", cfg.get("weight_decay", 1e-2)],
         ["Warmup epochs", cfg.get("warmup_epochs", 40)],
         ["Patience", cfg.get("patience", 120)],
-        ["Coordinate noise std", cfg.get("coord_noise_std", 0.05)],
         ["AMP", cfg.get("amp", True)],
     ]
     add_table(slide, 0.9, 1.48, 4.5, 4.45, ["Setting", "Value"], rows, 10.3)

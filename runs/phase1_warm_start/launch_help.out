@@ -1,0 +1,77 @@
+usage: psi_cloud_pipeline.py train [-h] [--target-reactions TARGET_REACTIONS]
+                                   [--epochs EPOCHS] [--batch-size BATCH_SIZE]
+                                   [--num-workers NUM_WORKERS]
+                                   [--val-split VAL_SPLIT]
+                                   [--split-seed SPLIT_SEED]
+                                   [--split-strategy {random,stratified}]
+                                   [--split-bins SPLIT_BINS]
+                                   [--risk-penalty-mode {binary,margin,sigmoid}]
+                                   [--risk-weight-alpha RISK_WEIGHT_ALPHA]
+                                   [--risk-weight-max RISK_WEIGHT_MAX]
+                                   [--triangle-loss-weight TRIANGLE_LOSS_WEIGHT]
+                                   [--triangle-triplet-samples TRIANGLE_TRIPLET_SAMPLES]
+                                   [--device {auto,cuda,cpu}] [--require-cuda]
+                                   [--no-amp] [--patience PATIENCE] [--lr LR]
+                                   [--ea-head-lr EA_HEAD_LR]
+                                   [--ea-loss-weight EA_LOSS_WEIGHT]
+                                   [--ea-warmup-loss-weight EA_WARMUP_LOSS_WEIGHT]
+                                   [--ea-loss-start-epoch EA_LOSS_START_EPOCH]
+                                   [--ea-warmup-epochs EA_WARMUP_EPOCHS]
+                                   [--ea-select-weight EA_SELECT_WEIGHT]
+                                   [--ea-head-dropout EA_HEAD_DROPOUT]
+                                   [--no-ea-detach-warmup]
+                                   [--save-dir SAVE_DIR]
+
+options:
+  -h, --help            show this help message and exit
+  --target-reactions TARGET_REACTIONS
+                        Maximum complete reaction triplets to train/evaluate
+  --epochs EPOCHS       Training epochs
+  --batch-size BATCH_SIZE
+                        Training batch size
+  --num-workers NUM_WORKERS
+                        DataLoader worker processes
+  --val-split VAL_SPLIT
+                        Validation fraction; 0.1 keeps 90% of data for
+                        training
+  --split-seed SPLIT_SEED
+                        Random seed for train/validation splitting
+  --split-strategy {random,stratified}
+                        Train/validation split strategy
+  --split-bins SPLIT_BINS
+                        Ea quantile bins for stratified splitting
+  --risk-penalty-mode {binary,margin,sigmoid}
+                        Sample-level risk weighting function
+  --risk-weight-alpha RISK_WEIGHT_ALPHA
+                        Scale applied to continuous risk penalty weights
+  --risk-weight-max RISK_WEIGHT_MAX
+                        Maximum continuous risk loss multiplier
+  --triangle-loss-weight TRIANGLE_LOSS_WEIGHT
+                        Weight for triangle-inequality PINN loss
+  --triangle-triplet-samples TRIANGLE_TRIPLET_SAMPLES
+                        Triplets sampled per batch for triangle loss; 0 uses
+                        all
+  --device {auto,cuda,cpu}
+                        Training device
+  --require-cuda        Fail instead of falling back to CPU
+  --no-amp              Disable CUDA mixed precision
+  --patience PATIENCE   Early stopping patience
+  --lr LR               Learning rate
+  --ea-head-lr EA_HEAD_LR
+                        Learning rate for the Ea head
+  --ea-loss-weight EA_LOSS_WEIGHT
+                        Full joint normalized-Ea loss weight
+  --ea-warmup-loss-weight EA_WARMUP_LOSS_WEIGHT
+                        Detached-feature Ea loss weight before joint warmup
+                        ends
+  --ea-loss-start-epoch EA_LOSS_START_EPOCH
+                        First epoch that trains the Ea head
+  --ea-warmup-epochs EA_WARMUP_EPOCHS
+                        Epochs before Ea gradients can reach EGNN/backbone
+  --ea-select-weight EA_SELECT_WEIGHT
+                        Ea contribution to validation checkpoint selection
+  --ea-head-dropout EA_HEAD_DROPOUT
+                        Dropout inside the Ea head MLP
+  --no-ea-detach-warmup
+                        Allow Ea warmup gradients to reach EGNN/backbone
+  --save-dir SAVE_DIR   Directory to save checkpoints (e.g. Google Drive)
