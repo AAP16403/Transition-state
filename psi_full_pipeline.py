@@ -645,6 +645,7 @@ CONFIG = {
     "fragment_bond_scale": 1.45,
     "hartree_to_kcal": 627.509,
     "skip_negative_ea": True,
+    "coord_noise": 0.05,
 }
 
 def resolve_device(config):
@@ -1055,7 +1056,7 @@ class ReactionDataset(Dataset):
     Returns the raw Ea target (kcal/mol) and the z-scored de_rxn feature for the
     learned Ea head; Ea is normalized inside the training loop using ea_mean/std.
     """
-    def __init__(self, config, samples, atom_vocab, atom_types_map, stats):
+    def __init__(self, config, samples, atom_vocab, atom_types_map, stats, is_train=False):
         self.config = config
         self.samples = samples
         self.atom_vocab = atom_vocab
@@ -1066,6 +1067,7 @@ class ReactionDataset(Dataset):
         self.de_rxn_std = stats["de_rxn_std"]
         self.efeat_mean = stats["efeat_mean"]
         self.efeat_std = stats["efeat_std"]
+        self.is_train = is_train
 
     def __len__(self): return len(self.samples)
 
@@ -1079,6 +1081,12 @@ class ReactionDataset(Dataset):
         n = s["n_atoms"]
         c_R = s["c_R"].copy()
         c_P = s["c_P"].copy()
+        
+        if self.is_train and self.config.get("coord_noise", 0.0) > 0.0:
+            noise_std = self.config["coord_noise"]
+            c_R[:n] += np.random.normal(scale=noise_std, size=(n, 3)).astype(np.float32)
+            c_P[:n] += np.random.normal(scale=noise_std, size=(n, 3)).astype(np.float32)
+            
         # Distance matrices are rotation/translation invariant, so no alignment
         # of the coordinates is needed before computing them.
         D_R = compute_distance_matrix(c_R)
@@ -2065,8 +2073,8 @@ def train_pipeline(config):
     n_total = len(samples)
     train_indices, val_indices, split_report = make_train_val_split(samples, config)
     stats = compute_normalization(samples, train_indices)
-    train_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats)
-    eval_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats)
+    train_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, is_train=True)
+    eval_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, is_train=False)
     train_subset = Subset(train_dataset, train_indices)
     val_subset = Subset(eval_dataset, val_indices)
     loader_kwargs = {
@@ -2086,7 +2094,9 @@ def train_pipeline(config):
     optimizer = build_optimizer(model, config)
     if hasattr(model, "ea_head"):
         print(f"Learning rates: base={config['lr']:.2e}, ea_head={config['ea_head_lr']:.2e}")
-    scheduler = CosineAnnealingWarmup(optimizer, warmup_epochs=config["warmup_epochs"], total_epochs=config["epochs"])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=30, min_lr=1e-6
+    )
     use_amp = config["amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     metadata = {
@@ -2150,12 +2160,7 @@ def train_pipeline(config):
     for epoch in range(start_epoch, config["epochs"] + 1):
         train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
         val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
-        scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
-        current_ea_lr = optimizer.param_groups[-1]['lr']
-        # Geometry is the primary selection signal; once joint Ea is active,
-        # blend in normalized Ea error so checkpointing does not ignore a
-        # still-improving head. ea_select_weight keeps geometry dominant.
+        
         ea_active = epoch > config["ea_warmup_epochs"]
         if epoch == config["ea_warmup_epochs"] + 1:
             best_val_loss = float('inf')
@@ -2165,6 +2170,11 @@ def train_pipeline(config):
         val_select = val_metrics["geom"]
         if ea_active:
             val_select = val_select + config["ea_select_weight"] * val_metrics["ea_norm"]
+
+        scheduler.step(val_select)
+        current_lr = optimizer.param_groups[0]['lr']
+        current_ea_lr = optimizer.param_groups[-1]['lr']
+
         history.append({
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
