@@ -604,7 +604,7 @@ CONFIG = {
     # Disabled by default so Phase 1 warm-start runs remain isolated. When
     # enabled, the Ea SmoothL1 loss is sample-weighted by raw Ea (kcal/mol)
     # to reduce regression-to-mean on rare high-barrier reactions.
-    "ea_tail_weighting_enabled": False,
+    "ea_tail_weighting_enabled": True,
     "ea_tail_weight_mode": "piecewise",
     "ea_tail_weight_bins": [80.0, 100.0, 120.0],
     "ea_tail_weight_values": [1.0, 1.5, 2.0, 2.5],
@@ -1952,12 +1952,19 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 valid_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
                 eye = torch.eye(N, device=mask.device, dtype=mask.dtype).unsqueeze(0)
                 m2d = valid_mask * (1.0 - eye)
-                denom = m2d.sum().clamp(min=1)
+                
+                # Inverse Distance Weighting: 1.0 / (DTS + 1.0)
+                # This ensures small chemical bonds receive gradients equal in magnitude
+                # to large inter-fragment distances, preventing fragment "melting".
+                dist_weights = 1.0 / (DTS * m2d + 1.0)
+                m2d_weighted = m2d * dist_weights
+                denom_weighted = m2d_weighted.sum().clamp(min=1)
+                
                 # Main geometry loss on the EGNN-refined distances.
-                l_geom = F.huber_loss(p_DTS * m2d, DTS * m2d, reduction='sum', delta=0.5) / denom
+                l_geom = F.huber_loss(p_DTS * m2d_weighted, DTS * m2d_weighted, reduction='sum', delta=0.5) / denom_weighted
                 # Auxiliary loss on the coarse (pre-EGNN) distances trains the
                 # geometry head directly, giving the EGNN a stable MDS seed.
-                l_geom_coarse = F.huber_loss(p_DTS_coarse * m2d, DTS * m2d, reduction='sum', delta=0.5) / denom
+                l_geom_coarse = F.huber_loss(p_DTS_coarse * m2d_weighted, DTS * m2d_weighted, reduction='sum', delta=0.5) / denom_weighted
 
                 # --- PINN Matrix-wise Cross Check ---
                 # Physics constraint 1: Spectator bonds (abs(DR - DP) < threshold) shouldn't change.
@@ -2094,8 +2101,8 @@ def train_pipeline(config):
     optimizer = build_optimizer(model, config)
     if hasattr(model, "ea_head"):
         print(f"Learning rates: base={config['lr']:.2e}, ea_head={config['ea_head_lr']:.2e}")
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=30, min_lr=1e-6
+    scheduler = CosineAnnealingWarmup(
+        optimizer, warmup_epochs=100, total_epochs=config["epochs"], min_lr=1e-6
     )
     use_amp = config["amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -2171,7 +2178,7 @@ def train_pipeline(config):
         if ea_active:
             val_select = val_select + config["ea_select_weight"] * val_metrics["ea_norm"]
 
-        scheduler.step(val_select)
+        scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         current_ea_lr = optimizer.param_groups[-1]['lr']
 

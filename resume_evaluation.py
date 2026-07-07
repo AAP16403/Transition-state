@@ -118,10 +118,7 @@ def run_resumed_evaluation(args):
     n_total = len(samples)
     n_val = max(1, int(n_total * config["val_split"]))
     n_train = n_total - n_val
-    rng = torch.Generator().manual_seed(config["split_seed"])
-    indices = torch.randperm(n_total, generator=rng).tolist()
-    train_indices = indices[:n_train]
-    val_indices = indices[n_train:]
+    train_indices, val_indices, _ = p.make_train_val_split(samples, config)
     stats = stats_from_checkpoint_or_samples(metadata, samples, train_indices)
 
     eval_dataset = p.ReactionDataset(config, samples, atom_vocab, atom_types_map, stats)

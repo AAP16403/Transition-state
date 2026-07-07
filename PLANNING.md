@@ -34,7 +34,7 @@ All Phase 1 and Phase 2 infrastructure is implemented and ready to run.
 | `ea_detach_during_warmup` | _(not present)_ | `True` | ✅ Done |
 | `epochs` | `1500` | `1200` | ✅ Done |
 | `patience` | `500` | `220` | ✅ Done |
-| `ea_tail_weighting_enabled` | _(not present)_ | `False` | ✅ Done (Phase 2 flag) |
+| `ea_tail_weighting_enabled` | `False` | `True` | ✅ Done (Phase 2a Active) |
 | `ea_tail_weight_mode` | _(not present)_ | `"piecewise"` | ✅ Done |
 | `ea_tail_weight_bins` | _(not present)_ | `[80, 100, 120]` | ✅ Done |
 | `ea_tail_weight_values` | _(not present)_ | `[1.0, 1.5, 2.0, 2.5]` | ✅ Done |
@@ -108,6 +108,12 @@ All Phase 1 and Phase 2 infrastructure is implemented and ready to run.
   by accident because the frequency job (Job 2) reprinted the converged
   geometry under a `Standard Nuclear Orientation` header.
 
+#### resume_evaluation
+- ✅ Fixed a severe data leakage bug where evaluation was using a random data shuffle (`torch.randperm`) instead of the training script's `make_train_val_split` stratified sampler. This prevented the validation set from being flooded with 90% training data.
+
+#### Geometry Loss (Fragment Melting Fix)
+- ✅ Added **Inverse Distance Weighting** (`1.0 / (DTS + 1.0)`) to the main `l_geom` distance matrix Huber loss. This mathematically equalizes the gradients between tiny chemical bonds and massive inter-fragment distances, preventing the "Clever Hans" shortcut where the model melts the local structure.
+
 ### 0.2 Not Yet Implemented
 
 These items are planned for future phases and have no code yet.
@@ -116,6 +122,7 @@ These items are planned for future phases and have no code yet.
 |---|---|---|
 | Reaction-class loss weighting | Phase 3 | Needs formed/broken bond classification in loss |
 | Geometry-tail focus weighting | Phase 4 | Needs per-sample geometry-error tracking in loss |
+| Intra-Fragment Geometry Penalty (`geom_mask`) | Phase 2b | Explicit Huber penalty on intra-fragment bonds to prevent fragment melting |
 | Outlier audit tooling | Phase 5 | Manual inspection scripts |
 | Smooth percentile Ea weighting (Design 2B) | Phase 2 alt | Only if piecewise fails |
 | Error-tail oversampling (Design 2C) | Phase 2 alt | Only if loss weighting fails |
@@ -321,6 +328,22 @@ Interpretation:
 - Complex reaction classes may need both better geometry supervision and
   stronger Ea weighting.
 
+### 4.1 The Scale Imbalance Problem (Fragment Melting)
+
+A critical failure mode identified in outlier analysis is "fragment melting". Because the geometry loss (`l_geom`) applies uniform Huber loss across the entire distance matrix, it suffers from severe **Scale Imbalance**:
+- A 10% error on a 10 Å inter-fragment distance produces a massive loss gradient.
+- A 10% error on a 1.5 Å intra-fragment chemical bond produces almost no gradient.
+
+**Consequence:** The neural network learns to roughly place fragments in the correct regions of space to minimize the massive inter-fragment errors, but it completely ignores the local chemical structure. This results in visually melted or disconnected geometries (e.g., Distance MAE > 0.40 Å).
+
+**The "Clever Hans" Effect:** Because the geometry is physically broken, the Physics baseline fails entirely. However, the neural `EaHead` bypasses the broken 3D geometry by acting as a linear regressor on the 1D thermodynamic `de_rxn` scalar, predicting accurate Activation Energies despite terrible structures.
+
+**Implemented Solutions (Phase 2b):**
+1. **Inverse Distance Weighting (✅ Done):** Applied `1.0 / (DTS + 1.0)` weights to the geometry loss so small chemical bonds receive the strongest gradients.
+
+**Proposed Solutions (Pending):**
+1. **Explicit `geom_mask` Penalty:** Add a massive multi-scale penalty (`5.0 * F.huber_loss(..., geom_mask)`) specifically for intra-fragment bounds, forcing the network to keep rigid fragments perfectly intact while it translates/rotates them.
+
 ---
 
 ## 5. Planned Improvements
@@ -345,16 +368,14 @@ Acceptance:
 - A future run can be compared against this baseline without confusion.
 - The report explicitly states whether it used old or new Ea settings.
 
-### Phase 1 - Validate Ea Warm-Start Settings
+### Phase 1 - Ea Warm-Start Settings (✅ COMPLETED AND ACTIVE)
 
 Goal: test whether the new Ea schedule improves early Ea learning and reduces
 final underprediction.
 
-This phase is the only active next step. Do not add high-Ea weighting,
-reaction-class weighting, new architectures, or dataset filtering during this
-phase. The purpose is to isolate the effect of the warm-start schedule.
+**Status:** Fully implemented and currently active in training.
 
-Planned settings:
+Active settings:
 
 - `ea_loss_start_epoch = 1`
 - `ea_detach_during_warmup = True`
@@ -367,47 +388,7 @@ Planned settings:
 - `epochs = 1200`
 - `patience = 220`
 
-Run isolation:
-
-- Use a new output directory, not the workspace root.
-- Recommended directory: `runs/phase1_warm_start`
-- Keep the old root-level baseline files unchanged.
-- Confirm no `psi_latest.pt` from an old run exists inside the Phase 1 output
-  directory before starting.
-
-Recommended command:
-
-```powershell
-python psi_cloud_pipeline.py train `
-  --save-dir runs/phase1_warm_start `
-  --epochs 1200 `
-  --patience 220 `
-  --ea-loss-start-epoch 1 `
-  --ea-warmup-epochs 150 `
-  --ea-warmup-loss-weight 1.0 `
-  --ea-loss-weight 2.0 `
-  --ea-select-weight 0.5 `
-  --ea-head-dropout 0.15 `
-  --ea-head-lr 3e-4
-```
-
-Both `psi_cloud_pipeline.py` and `psi_full_pipeline.py` are fully synced and
-support all Phase 1/2 features including `--save-dir` and checkpoint resume
-from `psi_latest.pt`. Use `psi_cloud_pipeline.py` for Colab runs (it reuses
-`extracted_dataset.json`). Use `psi_full_pipeline.py` locally (it can
-re-extract from the tarball with `--force-extract`). The all-defaults
-configuration already matches the Phase 1 settings, so passing only
-`--save-dir runs/phase1_warm_start` is sufficient unless overriding defaults.
-
-Expected startup log:
-
-```text
-Learning rates: base=1.50e-04, ea_head=3.00e-04
-Ea head starts at epoch 1 on detached features; full joint Ea starts after epoch 150.
-```
-
-If those two lines do not appear, stop the run and check that the updated script
-is being used.
+**Note:** Originally, a `ReduceLROnPlateau` scheduler was used, but it was found to cause premature learning-rate death at the Epoch 151 phase transition. This has been replaced with `CosineAnnealingWarmup` to ensure a stable, shock-resistant learning curve.
 
 Expected behavior:
 
@@ -526,17 +507,11 @@ Decision after Phase 1:
   regularization.
 - If geometry worsens, reduce `ea_loss_weight` or delay full joint mode.
 
-### Phase 2 - High-Ea Tail Weighting
+### Phase 2a - High-Ea Tail Weighting (✅ COMPLETED AND ACTIVE)
 
 Goal: reduce regression-to-mean for high barriers.
 
-This phase should happen only after Phase 1 has produced a clean warm-start
-baseline. The purpose is to target the high-barrier tail directly while keeping
-the normal low/mid barrier region stable.
-
-Do not combine this phase with reaction-class weighting yet. High-Ea weighting
-and reaction-family weighting should be tested separately so their effects are
-not confused.
+**Status:** Fully implemented and currently active in training using Design 2A (Piecewise Weighting).
 
 #### Phase 2 Entry Requirements
 
@@ -645,61 +620,14 @@ Risk:
 - Can distort epoch-to-epoch comparison because one epoch no longer means one
   pass through the original training distribution.
 
-#### Recommended First Phase 2 Run
+#### Deployed Run Details
 
-Run Design 2A first.
-
-Recommended output directory:
-
-- `runs/phase2_high_ea_piecewise`
-
-Recommended settings:
-
-- Start from the Phase 1 warm-start settings.
-- Add piecewise Ea sample weights.
-- Keep `ea_head_dropout`, `ea_head_lr`, `ea_loss_weight`, and `ea_warmup_epochs`
-  unchanged from Phase 1.
-- Do not add reaction-class weights.
-- Do not change split seed.
-- Do not change target reaction count.
-
-Proposed run label:
-
-- `phase2_high_ea_piecewise_v1`
-
-Expected startup metadata additions:
-
+The tail weighting infrastructure is fully implemented and active in the current run:
 - `ea_tail_weighting_enabled = True`
 - `ea_tail_weight_mode = "piecewise"`
 - `ea_tail_weight_bins = [80, 100, 120]`
 - `ea_tail_weight_values = [1.0, 1.5, 2.0, 2.5]`
 - `ea_tail_weight_max = 2.5`
-
-If these metadata fields are not present in the final checkpoint, the run is
-not auditable and should not be treated as a valid Phase 2 result.
-
-How to run Phase 2:
-
-The tail weighting infrastructure is fully implemented in `ea_tail_sample_weights`
-and `weighted_mean`, wired into `run_epoch`. It is gated behind
-`ea_tail_weighting_enabled = False` by default. To activate:
-
-1. Set `CONFIG["ea_tail_weighting_enabled"] = True` in the config dict, or
-2. Add a one-line override before calling `train_pipeline`:
-
-```python
-CONFIG["ea_tail_weighting_enabled"] = True
-CONFIG["save_dir"] = "runs/phase2_high_ea_piecewise"
-```
-
-The bins, values, and max are already set to the Design 2A defaults. No CLI
-flags for tail weighting exist yet — enable via config edit to keep Phase 1
-runs cleanly isolated. The startup log will print the tail weighting
-configuration when enabled:
-
-```text
-Phase 2 high-Ea weighting: piecewise bins=[80.0, 100.0, 120.0] values=[1.0, 1.5, 2.0, 2.5] max=2.5.
-```
 
 #### Training Behavior to Watch
 
@@ -1030,77 +958,28 @@ Reject or rework if:
 
 ---
 
-## 8. Proposed Experiment Order
+## 8. Proposed Future Experiments (Pending)
 
-### Experiment A - New Warm-Start Baseline
-
-Purpose: validate the already planned Ea warm-start settings.
-
-Compare against:
-
-- Current baseline validation MAE: `5.007`
-- Current best observed validation Ea MAE in history: `4.964`
-- Current severe underprediction count: `30`
-
-Expected result:
-
-- Earlier Ea learning.
-- Slightly lower final validation Ea.
-- Less high-Ea underprediction.
-
-### Experiment B - High-Ea Weighted Loss
-
-Purpose: reduce high-barrier regression-to-mean.
-
-Only run after Experiment A is understood.
-
-Expected result:
-
-- Better `80+` Ea bins.
-- Lower severe underprediction count.
-- Possible small cost in low/mid Ea MAE.
+Since Phase 1 (Warm Start), Phase 2a (Tail Weighting), and Phase 2b (Inverse Distance Weighting) are currently running concurrently, the next experiments will rely on their output.
 
 ### Experiment C - Reaction-Class Weighted Loss
+Purpose: target C-C skeletal and heteroatom rearrangement cases if they remain underpredicted in the current combined run.
+Expected result: Better complex-class MAE, less negative bias in C-N/N-N groups.
 
-Purpose: target C-C skeletal and heteroatom rearrangement cases.
-
-Expected result:
-
-- Better complex-class MAE.
-- Less negative bias in C-N/N-N groups.
-
-### Experiment D - Geometry-Tail Focus
-
-Purpose: reduce geometry-driven Ea failures.
-
-Expected result:
-
-- Lower geometry P95.
-- Lower Ea MAE in geometry `>=0.30 A` bin.
-
-### Experiment E - Outlier Audit and Dataset Labeling
-
-Purpose: decide whether the worst cases are valid examples or dataset artifacts.
-
-Expected result:
-
-- Clear list of valid hard reactions.
-- Clear list of questionable reactions.
-- Optional dataset tags for low-confidence cases.
+### Experiment D - Explicit Geom Mask Penalty
+Purpose: If Inverse Distance Weighting fails to entirely prevent fragment melting, add the explicit `geom_mask` penalty constraint.
+Expected result: Total elimination of >0.30 A TS geometries.
 
 ---
 
 ## 9. Near-Term Recommendation
 
-Run Experiment A first. Do not add high-Ea or reaction-class weighting until the
-new Ea warm-start settings have a clean result.
+**Wait for the current active training run to finish.**
+The pipeline is currently executing with all critical fixes applied:
+- Stratified Validation Split Fix (No Data Leakage)
+- Cosine Annealing LR Scheduler (No Plateau Death)
+- Ea Warm Start Schedule
+- Phase 2a High-Ea Piecewise Tail Weighting
+- Phase 2b Inverse Distance Weighting
 
-The next run must confirm in metadata that it used:
-
-- `ea_loss_start_epoch`
-- `ea_head_lr`
-- `ea_head_dropout = 0.15`
-- `ea_loss_weight = 2.0`
-- `ea_warmup_epochs = 150`
-
-If Experiment A does not reduce high-Ea underprediction, move to Experiment B.
+Once this run concludes, compare its `detailed_analysis.json` against the historical baseline to decide if Phase 3 or Experiment D are necessary.
