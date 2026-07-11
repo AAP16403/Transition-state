@@ -45,6 +45,26 @@ def stats_from_checkpoint_or_samples(metadata, samples, train_indices):
     print("Checkpoint metadata is missing normalization stats; recomputing from train split.")
     return p.compute_normalization(samples, train_indices)
 
+def configure_atom_angle_features_from_checkpoint(config, metadata):
+    """Match model/input feature width to the checkpoint being evaluated."""
+    if metadata and "atom_phys_dim" in metadata:
+        atom_phys_dim = int(metadata["atom_phys_dim"])
+    elif metadata and "aphys_mean" in metadata:
+        atom_phys_dim = len(metadata["aphys_mean"])
+    else:
+        atom_phys_dim = p.get_atom_phys_dim(config)
+
+    if atom_phys_dim == p.ATOM_BASE_PHYS_DIM:
+        config["atom_angle_features_enabled"] = False
+    elif atom_phys_dim == p.ATOM_PHYS_DIM:
+        config["atom_angle_features_enabled"] = True
+    else:
+        raise ValueError(
+            f"Unsupported checkpoint atom descriptor width {atom_phys_dim}. "
+            f"Expected {p.ATOM_BASE_PHYS_DIM} or {p.ATOM_PHYS_DIM}."
+        )
+    return atom_phys_dim
+
 
 def print_stats(name, records):
     if not records:
@@ -76,6 +96,7 @@ def run_resumed_evaluation(args):
 
     config = dict(p.CONFIG)
     config.update(metadata.get("config_snapshot", {}))
+    atom_phys_dim = configure_atom_angle_features_from_checkpoint(config, metadata)
     config["force_extract"] = False
     if args.dataset_json is not None:
         config["dataset_json"] = args.dataset_json
@@ -93,6 +114,7 @@ def run_resumed_evaluation(args):
 
     if not os.path.exists(config["dataset_json"]):
         raise FileNotFoundError(f"Dataset JSON not found: {config['dataset_json']}")
+    os.makedirs(config["save_dir"], exist_ok=True)
 
     device = p.resolve_device(config)
     p.configure_torch_runtime(device)
@@ -103,6 +125,7 @@ def run_resumed_evaluation(args):
     print("=" * 70)
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Dataset:    {config['dataset_json']}")
+    print(f"Atom descriptor width: {atom_phys_dim}")
 
     history_path = args.history or os.path.join(config["save_dir"], "training_history.json")
     best_history = load_history_best(history_path)

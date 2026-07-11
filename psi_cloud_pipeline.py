@@ -100,12 +100,221 @@ def bond_angles_from_coords(coords, atom_types, n, bond_scale=1.45):
                 angles[(i, j, k)] = float(np.degrees(np.arccos(cos)))
     return angles
 
+def bond_angle_cosines_by_center(coords, atom_types, n, bond_scale=1.45):
+    """Angle cosines grouped by central atom, using a coord-derived bond graph."""
+    adjacency = bond_adjacency_from_coords(coords, atom_types, n, bond_scale)
+    centered = [[] for _ in range(n)]
+    triplets = {}
+    for j in range(n):
+        nbrs = sorted(adjacency[j])
+        for a in range(len(nbrs)):
+            for b in range(a + 1, len(nbrs)):
+                i, k = nbrs[a], nbrs[b]
+                v1 = coords[i] - coords[j]
+                v2 = coords[k] - coords[j]
+                n1 = np.linalg.norm(v1)
+                n2 = np.linalg.norm(v2)
+                if n1 < 1e-9 or n2 < 1e-9:
+                    continue
+                cos = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+                centered[j].append(cos)
+                triplets[(i, j, k)] = cos
+    return centered, triplets
+
 def _stats4(values):
     """(mean, std, min, max) over a list/array, all 0.0 when empty."""
     arr = np.asarray(list(values), dtype=np.float64)
     if arr.size == 0:
         return 0.0, 0.0, 0.0, 0.0
     return float(arr.mean()), float(arr.std()), float(arr.min()), float(arr.max())
+
+# =============================================================================
+# Reaction-center angle features (targeted at forming/breaking bonds)
+# =============================================================================
+
+def _reaction_center_atoms(D_R, D_P, atom_types, n, bond_scale=1.45):
+    """Identify atoms involved in forming/breaking bonds.
+
+    Returns the set of reaction-center atom indices, plus the sets of
+    formed and broken bond pairs (i, j) with i < j.
+    """
+    bonds_R = bond_set_from_distance_matrix(D_R, atom_types, n, bond_scale)
+    bonds_P = bond_set_from_distance_matrix(D_P, atom_types, n, bond_scale)
+    formed = set(bonds_P) - set(bonds_R)
+    broken = set(bonds_R) - set(bonds_P)
+    rc_atoms = set()
+    for (i, j) in formed | broken:
+        rc_atoms.add(i)
+        rc_atoms.add(j)
+    return rc_atoms, formed, broken
+
+
+def _rc_bond_angles(coords, atom_types, n, rc_atoms, bond_scale=1.45):
+    """Bond angles only at reaction-center atoms (central atom in rc_atoms)."""
+    all_angles = bond_angles_from_coords(coords, atom_types, n, bond_scale)
+    rc_angles = {k: v for k, v in all_angles.items() if k[1] in rc_atoms}
+    return rc_angles
+
+
+def _best_dihedral_across_bond(coords, atom_types, n, bond_pair, adjacency):
+    """Compute a single representative dihedral i-a-b-j across bond (a,b).
+
+    Picks the neighbor pair (i of a, j of b) with the heaviest atoms
+    to get the most chemically meaningful dihedral.
+
+    Returns (cos_phi, sin_phi) as a periodicity-safe encoding.
+    """
+    a, b = bond_pair
+    nbrs_a = [x for x in adjacency[a] if x != b and x < n]
+    nbrs_b = [x for x in adjacency[b] if x != a and x < n]
+    if not nbrs_a or not nbrs_b:
+        return 0.0, 0.0  # degenerate — no neighbors to define a dihedral
+
+    # Pick heaviest neighbor on each side for chemical relevance
+    i = max(nbrs_a, key=lambda x: atomic_mass(atom_types[x]))
+    j = max(nbrs_b, key=lambda x: atomic_mass(atom_types[x]))
+
+    # Dihedral i-a-b-j
+    b1 = coords[a] - coords[i]
+    b2 = coords[b] - coords[a]
+    b3 = coords[j] - coords[b]
+    n1 = np.cross(b1, b2)
+    n2 = np.cross(b2, b3)
+    n1_norm = np.linalg.norm(n1)
+    n2_norm = np.linalg.norm(n2)
+    if n1_norm < 1e-9 or n2_norm < 1e-9:
+        return 1.0, 0.0  # degenerate → 0 degrees
+    n1 /= n1_norm
+    n2 /= n2_norm
+    b2_hat = b2 / max(np.linalg.norm(b2), 1e-9)
+    cos_phi = float(np.clip(np.dot(n1, n2), -1.0, 1.0))
+    sin_phi = float(np.clip(np.dot(np.cross(n1, n2), b2_hat), -1.0, 1.0))
+    return cos_phi, sin_phi
+
+
+def _pyramidalization_angle(coords, center, neighbors):
+    """Out-of-plane angle for a trigonal center (degrees).
+
+    For a center atom with ≥3 neighbors, measures average deviation from
+    planarity. Captures sp2↔sp3 distortion at the reactive atom.
+    """
+    if len(neighbors) < 3:
+        return 0.0
+    # Take first 3 neighbors (sorted by index for reproducibility)
+    nbrs = sorted(neighbors)[:3]
+    v1 = coords[nbrs[0]] - coords[center]
+    v2 = coords[nbrs[1]] - coords[center]
+    v3 = coords[nbrs[2]] - coords[center]
+    # Normal to the plane of the 3 neighbor vectors
+    plane_normal = np.cross(v1 - v2, v1 - v3)
+    pn_norm = np.linalg.norm(plane_normal)
+    if pn_norm < 1e-9:
+        return 0.0
+    plane_normal /= pn_norm
+    # Average deviation from planarity
+    angles = []
+    for v in [v1, v2, v3]:
+        v_norm = np.linalg.norm(v)
+        if v_norm < 1e-9:
+            continue
+        sin_angle = abs(np.dot(v / v_norm, plane_normal))
+        angles.append(float(np.degrees(np.arcsin(np.clip(sin_angle, 0.0, 1.0)))))
+    return float(np.mean(angles)) if angles else 0.0
+
+
+def _rc_angle_features(cR, cP, atom_types, n, bond_scale=1.45):
+    """Compute 8 reaction-center angle features from R and P geometries.
+
+    These target the exact gap in the existing feature set: no per-atom or
+    per-triplet angle information at the reactive atoms. All angles use
+    cos/sin encoding to handle periodicity.
+
+    Features (8D):
+      [0] rc_angle_R_mean    — mean cos(bond angle) at reacting atoms in R
+      [1] rc_angle_P_mean    — mean cos(bond angle) at reacting atoms in P
+      [2] rc_angle_change_max — max |Δangle| at any reacting-atom center, R→P
+      [3] rc_dihedral_forming_cos — cos(dihedral) across forming bond region
+      [4] rc_dihedral_forming_sin — sin(dihedral) across forming bond region
+      [5] rc_dihedral_breaking_cos — cos(dihedral) across breaking bond region
+      [6] rc_dihedral_breaking_sin — sin(dihedral) across breaking bond region
+      [7] rc_pyramidalization  — avg out-of-plane angle at reacting atoms (deg)
+    """
+    # Need distance matrices to identify forming/breaking bonds
+    D_R = np.zeros((n, n), dtype=np.float64)
+    D_P = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dr = np.linalg.norm(cR[i] - cR[j])
+            dp = np.linalg.norm(cP[i] - cP[j])
+            D_R[i, j] = D_R[j, i] = dr
+            D_P[i, j] = D_P[j, i] = dp
+
+    rc_atoms, formed, broken = _reaction_center_atoms(
+        D_R, D_P, atom_types, n, bond_scale
+    )
+
+    # --- Feature 0-1: Mean cos(bond angle) at reacting atoms in R and P ---
+    rc_ang_R = _rc_bond_angles(cR, atom_types, n, rc_atoms, bond_scale)
+    rc_ang_P = _rc_bond_angles(cP, atom_types, n, rc_atoms, bond_scale)
+    if rc_ang_R:
+        rc_angle_R_mean = float(np.mean([np.cos(np.radians(a)) for a in rc_ang_R.values()]))
+    else:
+        rc_angle_R_mean = 0.0
+    if rc_ang_P:
+        rc_angle_P_mean = float(np.mean([np.cos(np.radians(a)) for a in rc_ang_P.values()]))
+    else:
+        rc_angle_P_mean = 0.0
+
+    # --- Feature 2: Max angle change at any reacting-atom center ----------
+    common_rc = set(rc_ang_R) & set(rc_ang_P)
+    if common_rc:
+        rc_changes = np.array([abs(rc_ang_R[t] - rc_ang_P[t]) for t in common_rc],
+                              dtype=np.float64)
+        rc_angle_change_max = float(rc_changes.max())
+    else:
+        rc_angle_change_max = 0.0
+
+    # --- Features 3-6: Dihedrals across forming/breaking bonds ------------
+    # Use the *product* adjacency for formed bonds, *reactant* for broken
+    adj_R = bond_adjacency_from_coords(cR, atom_types, n, bond_scale)
+    adj_P = bond_adjacency_from_coords(cP, atom_types, n, bond_scale)
+
+    # Forming bonds: average dihedral in P geometry (where bond exists)
+    form_cos_list, form_sin_list = [], []
+    for (a, b) in formed:
+        c, s = _best_dihedral_across_bond(cP, atom_types, n, (a, b), adj_P)
+        form_cos_list.append(c)
+        form_sin_list.append(s)
+    rc_dih_form_cos = float(np.mean(form_cos_list)) if form_cos_list else 0.0
+    rc_dih_form_sin = float(np.mean(form_sin_list)) if form_sin_list else 0.0
+
+    # Breaking bonds: average dihedral in R geometry (where bond exists)
+    break_cos_list, break_sin_list = [], []
+    for (a, b) in broken:
+        c, s = _best_dihedral_across_bond(cR, atom_types, n, (a, b), adj_R)
+        break_cos_list.append(c)
+        break_sin_list.append(s)
+    rc_dih_break_cos = float(np.mean(break_cos_list)) if break_cos_list else 0.0
+    rc_dih_break_sin = float(np.mean(break_sin_list)) if break_sin_list else 0.0
+
+    # --- Feature 7: Pyramidalization at reacting atoms --------------------
+    # Average across R and P to capture the sp2↔sp3 distortion trend
+    pyram_vals = []
+    for atom_idx in rc_atoms:
+        nbrs_R = [x for x in adj_R[atom_idx] if x < n]
+        nbrs_P = [x for x in adj_P[atom_idx] if x < n]
+        pR = _pyramidalization_angle(cR, atom_idx, nbrs_R)
+        pP = _pyramidalization_angle(cP, atom_idx, nbrs_P)
+        pyram_vals.append((pR + pP) / 2.0)
+    rc_pyramidalization = float(np.mean(pyram_vals)) if pyram_vals else 0.0
+
+    return np.array([
+        rc_angle_R_mean, rc_angle_P_mean, rc_angle_change_max,
+        rc_dih_form_cos, rc_dih_form_sin,
+        rc_dih_break_cos, rc_dih_break_sin,
+        rc_pyramidalization,
+    ], dtype=np.float32)
+
 
 def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=1.45):
     """Construct the energy-head input feature vector from reactant + product only.
@@ -114,9 +323,10 @@ def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=
     (predict_transition_state) so the two can never drift out of sync. All
     inputs are available before the TS is known. Returns float32 of fixed length.
 
-    Feature groups (20D total):
+    Feature groups (28D total):
       [0:10]  reaction energetics + composition
       [10:20] bond-angle statistics for reactant, product, and their change
+      [20:28] reaction-center angle features (targeted at forming/breaking bonds)
 
     Note: per-atom atomic descriptors (EN, Z, Mass) have been moved out of this
     global vector and are now attached directly to each atom in PSICore via
@@ -149,6 +359,9 @@ def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=
         ang_change_mean = 0.0
         ang_change_max = 0.0
 
+    # --- reaction-center angle features (8D) -----------------------------
+    rc_feats = _rc_angle_features(cR, cP, types, n, bond_scale)
+
     feats = np.array([
         # reaction energetics + composition (10 features)
         de_rxn, de_rxn_signed, float(diff_norms.mean()), float(diff_norms.std()),
@@ -158,23 +371,90 @@ def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=
         aR_mean, aR_std, aR_min, aR_max,
         aP_mean, aP_std, aP_min, aP_max,
         ang_change_mean, ang_change_max,
+        # reaction-center angle features (8 features)
+        rc_feats[0], rc_feats[1], rc_feats[2],
+        rc_feats[3], rc_feats[4],
+        rc_feats[5], rc_feats[6],
+        rc_feats[7],
     ], dtype=np.float32)
     return feats
 
-ATOM_PHYS_DIM = 3  # electronegativity, atomic number, mass
-ENERGY_FEAT_DIM = 20  # reaction energetics + composition + bond-angle statistics
+ATOM_BASE_PHYS_DIM = 3  # electronegativity, atomic number, mass
+ATOM_ANGLE_DIM = 8  # per-atom R/P angle-count, angle-cos stats, and angle-change stats
+ATOM_PHYS_DIM = ATOM_BASE_PHYS_DIM + ATOM_ANGLE_DIM
+ENERGY_FEAT_DIM = 28  # reaction energetics + composition + bond-angle statistics + RC angles
+ATOM_PHYS_FEATURE_NAMES = [
+    "electronegativity",
+    "atomic_number",
+    "atomic_mass",
+    "angle_count_R",
+    "angle_cos_mean_R",
+    "angle_cos_std_R",
+    "angle_count_P",
+    "angle_cos_mean_P",
+    "angle_cos_std_P",
+    "angle_cos_change_mean",
+    "angle_cos_change_max",
+]
 
-def build_atom_physical_features(atom_types, n, max_atoms):
-    """Per-atom physical descriptors: [EN, Z, Mass] for each atom, zero-padded.
+def get_atom_phys_dim(config=None):
+    if config is not None and not config.get("atom_angle_features_enabled", True):
+        return ATOM_BASE_PHYS_DIM
+    return ATOM_PHYS_DIM
+
+def _angle_count_mean_std(values):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return 0.0, 0.0, 0.0
+    return float(arr.size), float(arr.mean()), float(arr.std())
+
+def build_atom_angle_features(atom_types, n, max_atoms, c_R, c_P, bond_scale=1.45):
+    """Per-atom local angle summaries derived from reactant/product coordinates."""
+    feats = np.zeros((max_atoms, ATOM_ANGLE_DIM), dtype=np.float32)
+    if c_R is None or c_P is None:
+        return feats
+
+    types = list(atom_types[:n])
+    cR = np.asarray(c_R, dtype=np.float64)[:n]
+    cP = np.asarray(c_P, dtype=np.float64)[:n]
+    centered_R, triplets_R = bond_angle_cosines_by_center(cR, types, n, bond_scale)
+    centered_P, triplets_P = bond_angle_cosines_by_center(cP, types, n, bond_scale)
+
+    common_by_center = [[] for _ in range(n)]
+    for triplet in set(triplets_R) & set(triplets_P):
+        common_by_center[triplet[1]].append(abs(triplets_R[triplet] - triplets_P[triplet]))
+
+    for j in range(n):
+        feats[j, 0:3] = _angle_count_mean_std(centered_R[j])
+        feats[j, 3:6] = _angle_count_mean_std(centered_P[j])
+        changes = np.asarray(common_by_center[j], dtype=np.float64)
+        if changes.size:
+            feats[j, 6] = float(changes.mean())
+            feats[j, 7] = float(changes.max())
+    return feats
+
+def build_atom_physical_features(
+    atom_types, n, max_atoms, c_R=None, c_P=None, bond_scale=1.45, include_angles=True
+):
+    """Per-atom descriptors, optionally including coord-derived angle summaries.
 
     These features are attached directly to each atom node in PSICore so the
     Transformer can reason about *which* atom has which property spatially,
     rather than receiving only global min/max/mean statistics.
     """
-    feats = np.zeros((max_atoms, ATOM_PHYS_DIM), dtype=np.float32)
+    dim = ATOM_PHYS_DIM if include_angles else ATOM_BASE_PHYS_DIM
+    feats = np.zeros((max_atoms, dim), dtype=np.float32)
     for i in range(n):
         t = atom_types[i]
-        feats[i] = [electronegativity(t), float(atomic_number(t)), atomic_mass(t)]
+        feats[i, :ATOM_BASE_PHYS_DIM] = [
+            electronegativity(t),
+            float(atomic_number(t)),
+            atomic_mass(t),
+        ]
+    if include_angles:
+        feats[:, ATOM_BASE_PHYS_DIM:] = build_atom_angle_features(
+            atom_types, n, max_atoms, c_R, c_P, bond_scale
+        )
     return feats
 
 def compute_distance_matrix(coords):
@@ -528,6 +808,7 @@ CONFIG = {
     "n_gaussians": 32,
     "gauss_start": 0.4,
     "gauss_stop": 6.0,
+    "atom_angle_features_enabled": True,
     "atom_embed_dim": 32,
     "gru_hidden": 128,
     "gru_layers": 2,
@@ -610,8 +891,28 @@ CONFIG = {
 }
 
 def resolve_device(config):
-    print("WARNING: Forcing CUDA device, CPU fallback removed.")
-    return torch.device("cuda")
+    requested = str(config.get("device", "auto")).lower()
+    require_cuda = bool(config.get("require_cuda", False))
+    cuda_available = torch.cuda.is_available()
+
+    if requested == "cuda":
+        if not cuda_available:
+            raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is False.")
+        return torch.device("cuda")
+
+    if requested == "cpu":
+        if require_cuda:
+            raise RuntimeError("CPU was requested, but require_cuda=True.")
+        return torch.device("cpu")
+
+    if requested != "auto":
+        raise ValueError(f"Unknown device setting '{requested}'. Use 'auto', 'cuda', or 'cpu'.")
+
+    if cuda_available:
+        return torch.device("cuda")
+    if require_cuda:
+        raise RuntimeError("CUDA is required, but torch.cuda.is_available() is False.")
+    return torch.device("cpu")
 
 def configure_torch_runtime(device):
     if device.type == "cuda":
@@ -707,7 +1008,13 @@ def build_reaction_samples(config):
                 atom_types, n, c_R_aligned_init, c_P, e_r, e_p, config["fragment_bond_scale"]
             )
             atom_phys = build_atom_physical_features(
-                atom_types, n, config["max_atoms"]
+                atom_types,
+                n,
+                config["max_atoms"],
+                c_R,
+                c_P,
+                config["fragment_bond_scale"],
+                include_angles=config.get("atom_angle_features_enabled", True),
             )
             D_R_raw = compute_distance_matrix(c_R)
             D_P_raw = compute_distance_matrix(c_P)
@@ -926,6 +1233,7 @@ def make_train_val_split(samples, config):
         print(f"  Warning: duplicate rxn_id values found: {integrity['duplicate_rxn_ids']}")
 
     split_path = os.path.join(config["save_dir"], "split_diagnostics.json")
+    os.makedirs(os.path.dirname(split_path) or ".", exist_ok=True)
     with open(split_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
     print(f"Split diagnostics saved to {split_path}")
@@ -942,14 +1250,14 @@ def compute_normalization(samples, indices):
     if not indices:
         raise ValueError("Cannot compute normalization without at least one training sample.")
 
-    # Atom-physics normalization: collect all *valid* (non-padding) atom rows
+    # Atom descriptor normalization: collect all *valid* (non-padding) atom rows
     # across training samples and compute per-feature mean/std.
     all_aphys_rows = []
     for i in indices:
         s = samples[i]
         n = s["n_atoms"]
-        all_aphys_rows.append(s["atom_phys_raw"][:n])  # (n, 3)
-    all_aphys = np.concatenate(all_aphys_rows, axis=0)   # (total_atoms, 3)
+        all_aphys_rows.append(s["atom_phys_raw"][:n])
+    all_aphys = np.concatenate(all_aphys_rows, axis=0)
     aphys_mean = all_aphys.mean(axis=0).astype(np.float32)
     aphys_std = all_aphys.std(axis=0).astype(np.float32)
     aphys_std[aphys_std < 1e-6] = 1.0
@@ -969,7 +1277,7 @@ def compute_normalization(samples, indices):
     print(f"Ea range (train split): [{all_ea.min():.2f}, {all_ea.max():.2f}] kcal/mol")
     print(f"de_rxn stats (train split): mean={de_rxn_mean:.2f}, std={de_rxn_std:.2f} kcal/mol")
     print(f"Atom-phys stats (train): mean={aphys_mean}, std={aphys_std}")
-    # Energy-feature normalization: z-score the 20D reaction descriptor vector.
+    # Energy-feature normalization: z-score the 28D reaction descriptor vector.
     all_efeats = np.array([samples[i]["energy_feats_raw"] for i in indices], dtype=np.float32)
     efeat_mean = all_efeats.mean(axis=0).astype(np.float32)
     efeat_std = all_efeats.std(axis=0).astype(np.float32)
@@ -1016,7 +1324,19 @@ class ReactionDataset(Dataset):
         D_R = compute_distance_matrix(c_R)
         D_P = compute_distance_matrix(c_P)
         D_I = (D_R + D_P) / 2.0
-        aphys_norm = (s["atom_phys_raw"] - self.aphys_mean) / self.aphys_std
+        if self.config.get("atom_angle_features_enabled", True):
+            atom_phys_raw = build_atom_physical_features(
+                s.get("atom_types", self.atom_types_map.get(s.get("rxn_id"), [])),
+                n,
+                self.config["max_atoms"],
+                c_R,
+                c_P,
+                self.config["fragment_bond_scale"],
+                include_angles=True,
+            )
+        else:
+            atom_phys_raw = s["atom_phys_raw"]
+        aphys_norm = (atom_phys_raw - self.aphys_mean) / self.aphys_std
         de_rxn_norm = (s["de_rxn_raw"] - self.de_rxn_mean) / self.de_rxn_std
         efeat_norm = (s["energy_feats_raw"] - self.efeat_mean) / self.efeat_std
         risk_penalty = continuous_risk_penalty(
@@ -1092,8 +1412,9 @@ class PSICore(nn.Module):
         d_model = gru_hidden * 2
         self.atom_embed = nn.Embedding(num_atom_types + 1, atom_dim, padding_idx=0)
         self.gaussian = GaussianEmbedding(K, config["gauss_start"], config["gauss_stop"])
-        # Per-atom feature width = learnable embedding + physical descriptors (EN, Z, Mass)
-        atom_feat_dim = atom_dim + ATOM_PHYS_DIM
+        self.atom_phys_dim = get_atom_phys_dim(config)
+        # Per-atom feature width = learnable embedding + explicit atom descriptors.
+        atom_feat_dim = atom_dim + self.atom_phys_dim
         self.input_proj = nn.Sequential(
             nn.Linear(N * K + atom_feat_dim, d_model),
             nn.LayerNorm(d_model),
@@ -1121,8 +1442,8 @@ class PSICore(nn.Module):
     def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys):
         B, N, _ = D_R.shape
         atom_emb = self.atom_embed(atom_ids)
-        # Concatenate learnable embedding with explicit physical descriptors
-        atom_feat = torch.cat([atom_emb, atom_phys], dim=-1)  # [B, N, atom_dim + 3]
+        # Concatenate learnable embedding with explicit atom descriptors.
+        atom_feat = torch.cat([atom_emb, atom_phys], dim=-1)
         emb_R = self.gaussian(D_R).view(B, N, -1)
         emb_I = self.gaussian(D_I).view(B, N, -1)
         emb_P = self.gaussian(D_P).view(B, N, -1)
@@ -1146,8 +1467,8 @@ class GeometryHead(nn.Module):
     def __init__(self, d_model, atom_embed_dim, atom_phys_dim=ATOM_PHYS_DIM, dropout=0.25, delta_clamp=3.0):
         super().__init__()
         self.delta_clamp = delta_clamp
-        # Pairwise features: transformer features (i,j) + atom embeddings (i,j)
-        # + physical descriptors (i,j) + raw distances (R,I,P)
+        # Pairwise features: transformer features (i,j) + atom descriptors (i,j)
+        # + raw distances (R,I,P)
         pair_dim = d_model * 2 + (atom_embed_dim + atom_phys_dim) * 2 + 3
         self.net = nn.Sequential(
             nn.Linear(pair_dim, 256),
@@ -1164,8 +1485,8 @@ class GeometryHead(nn.Module):
 
     def forward(self, features, atom_emb, atom_phys, D_R, D_I, D_P, mask):
         B, N, D = features.shape
-        # Concatenate learnable atom embedding with physical descriptors
-        atom_feat = torch.cat([atom_emb, atom_phys], dim=-1)  # [B, N, atom_dim + 3]
+        # Concatenate learnable atom embedding with explicit atom descriptors.
+        atom_feat = torch.cat([atom_emb, atom_phys], dim=-1)
         atom_feat_dim = atom_feat.shape[-1]
         fi = features.unsqueeze(2).expand(B, N, N, D)
         fj = features.unsqueeze(1).expand(B, N, N, D)
@@ -1566,7 +1887,7 @@ class EGNN(nn.Module):
     """E(n)-equivariant refiner: chemical-property vector + TS coords -> coords.
 
     The node features come entirely from chemistry (learned atom embedding +
-    physical descriptors EN/Z/Mass); the coordinates come from the MDS embedding
+    atom descriptors); the coordinates come from the MDS embedding
     of the geometry head's predicted TS distance matrix. Stacked EGCL layers nudge
     the coordinates into a refined transition-state geometry.
     """
@@ -1677,14 +1998,15 @@ class PSI(nn.Module):
         atom_dim = config["atom_embed_dim"]
         drop = config["dropout"]
         delta_clamp = config["delta_clamp"]
+        atom_phys_dim = get_atom_phys_dim(config)
         self.core = PSICore(config, num_atom_types)
-        self.geom_head = GeometryHead(d_model, atom_dim, ATOM_PHYS_DIM, drop, delta_clamp)
-        # EGNN coordinate refiner. Node features = chemical-property vector
-        # (learned atom embedding + physical descriptors); coordinates come from
+        self.geom_head = GeometryHead(d_model, atom_dim, atom_phys_dim, drop, delta_clamp)
+        # EGNN coordinate refiner. Node features = learnable atom embedding
+        # plus explicit atom descriptors; coordinates come from
         # the MDS embedding of the geometry head's predicted TS distance matrix.
         self.egnn_enabled = config.get("egnn_enabled", True)
         if self.egnn_enabled:
-            node_in_dim = atom_dim + ATOM_PHYS_DIM
+            node_in_dim = atom_dim + atom_phys_dim
             self.egnn = EGNN(
                 node_in_dim,
                 hidden=config["egnn_hidden"],
@@ -1693,7 +2015,7 @@ class PSI(nn.Module):
                 dropout=drop,
             )
             # Learned Ea head on the EGNN's refined per-atom features (h_ts)
-            # plus 20D energy descriptor (composition, bond-angle stats).
+            # plus 28D energy descriptor (composition, bond-angle stats, RC angles).
             self.ea_head = EaHead(
                 node_dim=config["egnn_hidden"],
                 hidden=config["egnn_hidden"],
@@ -1720,7 +2042,7 @@ class PSI(nn.Module):
         Args:
             de_rxn: [B] z-scored signed reaction energy, fed to the Ea head.
                     May be None at geometry-only call sites; Ea is then None.
-            energy_feats: [B, 20] z-scored molecular descriptor vector
+            energy_feats: [B, 28] z-scored molecular descriptor vector
                     (composition, bond-angle stats) for the Ea head.
         Returns:
             D_TS_pred:    [B, N, N] EGNN-refined TS distances (or coarse if EGNN off)
@@ -2023,6 +2345,12 @@ def train_pipeline(config):
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     metadata = {
         "atom_vocab": atom_vocab,
+        "atom_phys_dim": get_atom_phys_dim(config),
+        "atom_phys_feature_names": (
+            ATOM_PHYS_FEATURE_NAMES
+            if config.get("atom_angle_features_enabled", True)
+            else ATOM_PHYS_FEATURE_NAMES[:ATOM_BASE_PHYS_DIM]
+        ),
         "aphys_mean": stats["aphys_mean"].tolist(),
         "aphys_std": stats["aphys_std"].tolist(),
         "ea_mean": stats["ea_mean"],
@@ -2060,24 +2388,35 @@ def train_pipeline(config):
     if os.path.exists(latest_model_path):
         print(f"Resuming from checkpoint {latest_model_path}...")
         ckpt = torch.load(latest_model_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        start_epoch = ckpt["epoch"] + 1
-        best_val_loss = ckpt["best_val_loss"]
-        patience_counter = ckpt["patience_counter"]
-        history = ckpt.get("history", [])
         try:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        except (KeyError, ValueError) as exc:
-            print(f"Checkpoint model loaded, but optimizer/scheduler state was reset: {exc}")
+            model.load_state_dict(ckpt["model_state_dict"])
+        except RuntimeError as exc:
+            details = "\n".join(str(exc).splitlines()[:6])
+            print(
+                "Existing checkpoint was not resumed because its model shape does not match "
+                f"the current atom descriptor width ({get_atom_phys_dim(config)}):\n{details}"
+            )
             best_val_loss = float('inf')
             patience_counter = 0
-            scheduler.last_epoch = start_epoch - 1
-            lrs = scheduler.get_lr()
-            for group, lr in zip(optimizer.param_groups, lrs):
-                group["lr"] = lr
-            scheduler._last_lr = lrs
-        print(f"Resumed at epoch {start_epoch} (best val_select: {best_val_loss:.4f})")
+            history = []
+        else:
+            start_epoch = ckpt["epoch"] + 1
+            best_val_loss = ckpt["best_val_loss"]
+            patience_counter = ckpt["patience_counter"]
+            history = ckpt.get("history", [])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except (KeyError, ValueError) as exc:
+                print(f"Checkpoint model loaded, but optimizer/scheduler state was reset: {exc}")
+                best_val_loss = float('inf')
+                patience_counter = 0
+                scheduler.last_epoch = start_epoch - 1
+                lrs = scheduler.get_lr()
+                for group, lr in zip(optimizer.param_groups, lrs):
+                    group["lr"] = lr
+                scheduler._last_lr = lrs
+            print(f"Resumed at epoch {start_epoch} (best val_select: {best_val_loss:.4f})")
 
     for epoch in range(start_epoch, config["epochs"] + 1):
         train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
@@ -2325,6 +2664,21 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     num_atom_types = max(atom_vocab.values())
     aphys_mean = np.array(meta["aphys_mean"], dtype=np.float32)
     aphys_std = np.array(meta["aphys_std"], dtype=np.float32)
+    atom_phys_dim = int(meta.get("atom_phys_dim", len(aphys_mean)))
+    if atom_phys_dim != len(aphys_mean) or atom_phys_dim != len(aphys_std):
+        raise ValueError(
+            "Checkpoint atom descriptor stats are inconsistent: "
+            f"atom_phys_dim={atom_phys_dim}, mean={len(aphys_mean)}, std={len(aphys_std)}."
+        )
+    if atom_phys_dim == ATOM_BASE_PHYS_DIM:
+        checkpoint_angle_features = False
+    elif atom_phys_dim == ATOM_PHYS_DIM:
+        checkpoint_angle_features = True
+    else:
+        raise ValueError(
+            f"Unsupported checkpoint atom descriptor width {atom_phys_dim}. "
+            f"Expected {ATOM_BASE_PHYS_DIM} or {ATOM_PHYS_DIM}."
+        )
     # Ea / de_rxn normalization stats for the learned head (older checkpoints
     # without a learned head won't have these -> neural Ea is then skipped).
     ea_mean = meta.get("ea_mean")
@@ -2358,19 +2712,29 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         if atom_type not in atom_vocab:
             raise KeyError(f"Atom type '{atom_type}' not in training vocab {sorted(atom_vocab)}.")
         atom_ids[i] = atom_vocab[atom_type]
-    atom_phys = build_atom_physical_features(r_types, n, config["max_atoms"])
+    atom_phys = build_atom_physical_features(
+        r_types,
+        n,
+        config["max_atoms"],
+        c_R,
+        c_P,
+        config["fragment_bond_scale"],
+        include_angles=checkpoint_angle_features,
+    )
     atom_phys_norm = (atom_phys - aphys_mean) / aphys_std
     # Signed reaction energy (kcal/mol) -> z-scored input to the learned Ea head.
     e_r = reactant["energy"] * config["hartree_to_kcal"]
     e_p = product["energy"] * config["hartree_to_kcal"]
     de_rxn = e_p - e_r
     de_rxn_norm = (de_rxn - de_rxn_mean) / de_rxn_std
-    # 20D energy descriptor (composition, bond-angle stats) for the Ea head.
+    # 28D energy descriptor (composition, bond-angle stats, RC angles) for the Ea head.
     energy_feats = build_energy_features(
         r_types, n, c_R_aligned, c_P, e_r, e_p, config["fragment_bond_scale"]
     )
     energy_feats_norm = (energy_feats - efeat_mean) / efeat_std
-    model = PSI(config, num_atom_types).to(device)
+    model_config = dict(config)
+    model_config["atom_angle_features_enabled"] = checkpoint_angle_features
+    model = PSI(model_config, num_atom_types).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     with torch.no_grad():
@@ -3231,6 +3595,20 @@ def create_dashboard(data_path, save_dir):
 
     print(f"Interactive dashboard generated successfully: {output_html}")
 
+def exit_cleanly_after_cuda_cli_train(config):
+    """Avoid a Windows CUDA teardown crash after successful CLI training."""
+    requested = str(config.get("device", "auto")).lower()
+    if os.name != "nt" or requested == "cpu" or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
 # =============================================================================
 # Command-line interface
 # =============================================================================
@@ -3320,3 +3698,4 @@ if __name__ == "__main__":
             CONFIG["save_dir"] = args.save_dir
             CONFIG["skip_final_eval"] = args.skip_final_eval
         train_pipeline(CONFIG)
+        exit_cleanly_after_cuda_cli_train(CONFIG)

@@ -92,6 +92,194 @@ def _stats4(values):
         return 0.0, 0.0, 0.0, 0.0
     return float(arr.mean()), float(arr.std()), float(arr.min()), float(arr.max())
 
+# =============================================================================
+# Reaction-center angle features (targeted at forming/breaking bonds)
+# =============================================================================
+
+def _reaction_center_atoms(D_R, D_P, atom_types, n, bond_scale=1.45):
+    """Identify atoms involved in forming/breaking bonds.
+
+    Returns the set of reaction-center atom indices, plus the sets of
+    formed and broken bond pairs (i, j) with i < j.
+    """
+    bonds_R = bond_set_from_distance_matrix(D_R, atom_types, n, bond_scale)
+    bonds_P = bond_set_from_distance_matrix(D_P, atom_types, n, bond_scale)
+    formed = set(bonds_P) - set(bonds_R)
+    broken = set(bonds_R) - set(bonds_P)
+    rc_atoms = set()
+    for (i, j) in formed | broken:
+        rc_atoms.add(i)
+        rc_atoms.add(j)
+    return rc_atoms, formed, broken
+
+
+def _rc_bond_angles(coords, atom_types, n, rc_atoms, bond_scale=1.45):
+    """Bond angles only at reaction-center atoms (central atom in rc_atoms)."""
+    all_angles = bond_angles_from_coords(coords, atom_types, n, bond_scale)
+    rc_angles = {k: v for k, v in all_angles.items() if k[1] in rc_atoms}
+    return rc_angles
+
+
+def _best_dihedral_across_bond(coords, atom_types, n, bond_pair, adjacency):
+    """Compute a single representative dihedral i-a-b-j across bond (a,b).
+
+    Picks the neighbor pair (i of a, j of b) with the heaviest atoms
+    to get the most chemically meaningful dihedral.
+
+    Returns (cos_phi, sin_phi) as a periodicity-safe encoding.
+    """
+    a, b = bond_pair
+    nbrs_a = [x for x in adjacency[a] if x != b and x < n]
+    nbrs_b = [x for x in adjacency[b] if x != a and x < n]
+    if not nbrs_a or not nbrs_b:
+        return 0.0, 0.0  # degenerate — no neighbors to define a dihedral
+
+    # Pick heaviest neighbor on each side for chemical relevance
+    i = max(nbrs_a, key=lambda x: atomic_mass(atom_types[x]))
+    j = max(nbrs_b, key=lambda x: atomic_mass(atom_types[x]))
+
+    # Dihedral i-a-b-j
+    b1 = coords[a] - coords[i]
+    b2 = coords[b] - coords[a]
+    b3 = coords[j] - coords[b]
+    n1 = np.cross(b1, b2)
+    n2 = np.cross(b2, b3)
+    n1_norm = np.linalg.norm(n1)
+    n2_norm = np.linalg.norm(n2)
+    if n1_norm < 1e-9 or n2_norm < 1e-9:
+        return 1.0, 0.0  # degenerate → 0 degrees
+    n1 /= n1_norm
+    n2 /= n2_norm
+    b2_hat = b2 / max(np.linalg.norm(b2), 1e-9)
+    cos_phi = float(np.clip(np.dot(n1, n2), -1.0, 1.0))
+    sin_phi = float(np.clip(np.dot(np.cross(n1, n2), b2_hat), -1.0, 1.0))
+    return cos_phi, sin_phi
+
+
+def _pyramidalization_angle(coords, center, neighbors):
+    """Out-of-plane angle for a trigonal center (degrees).
+
+    For a center atom with ≥3 neighbors, measures average deviation from
+    planarity. Captures sp2↔sp3 distortion at the reactive atom.
+    """
+    if len(neighbors) < 3:
+        return 0.0
+    # Take first 3 neighbors (sorted by index for reproducibility)
+    nbrs = sorted(neighbors)[:3]
+    v1 = coords[nbrs[0]] - coords[center]
+    v2 = coords[nbrs[1]] - coords[center]
+    v3 = coords[nbrs[2]] - coords[center]
+    # Normal to the plane of the 3 neighbor vectors
+    plane_normal = np.cross(v1 - v2, v1 - v3)
+    pn_norm = np.linalg.norm(plane_normal)
+    if pn_norm < 1e-9:
+        return 0.0
+    plane_normal /= pn_norm
+    # Average deviation from planarity
+    angles = []
+    for v in [v1, v2, v3]:
+        v_norm = np.linalg.norm(v)
+        if v_norm < 1e-9:
+            continue
+        sin_angle = abs(np.dot(v / v_norm, plane_normal))
+        angles.append(float(np.degrees(np.arcsin(np.clip(sin_angle, 0.0, 1.0)))))
+    return float(np.mean(angles)) if angles else 0.0
+
+
+def _rc_angle_features(cR, cP, atom_types, n, bond_scale=1.45):
+    """Compute 8 reaction-center angle features from R and P geometries.
+
+    These target the exact gap in the existing feature set: no per-atom or
+    per-triplet angle information at the reactive atoms. All angles use
+    cos/sin encoding to handle periodicity.
+
+    Features (8D):
+      [0] rc_angle_R_mean    — mean cos(bond angle) at reacting atoms in R
+      [1] rc_angle_P_mean    — mean cos(bond angle) at reacting atoms in P
+      [2] rc_angle_change_max — max |Δangle| at any reacting-atom center, R→P
+      [3] rc_dihedral_forming_cos — cos(dihedral) across forming bond region
+      [4] rc_dihedral_forming_sin — sin(dihedral) across forming bond region
+      [5] rc_dihedral_breaking_cos — cos(dihedral) across breaking bond region
+      [6] rc_dihedral_breaking_sin — sin(dihedral) across breaking bond region
+      [7] rc_pyramidalization  — avg out-of-plane angle at reacting atoms (deg)
+    """
+    # Need distance matrices to identify forming/breaking bonds
+    D_R = np.zeros((n, n), dtype=np.float64)
+    D_P = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dr = np.linalg.norm(cR[i] - cR[j])
+            dp = np.linalg.norm(cP[i] - cP[j])
+            D_R[i, j] = D_R[j, i] = dr
+            D_P[i, j] = D_P[j, i] = dp
+
+    rc_atoms, formed, broken = _reaction_center_atoms(
+        D_R, D_P, atom_types, n, bond_scale
+    )
+
+    # --- Feature 0-1: Mean cos(bond angle) at reacting atoms in R and P ---
+    rc_ang_R = _rc_bond_angles(cR, atom_types, n, rc_atoms, bond_scale)
+    rc_ang_P = _rc_bond_angles(cP, atom_types, n, rc_atoms, bond_scale)
+    if rc_ang_R:
+        rc_angle_R_mean = float(np.mean([np.cos(np.radians(a)) for a in rc_ang_R.values()]))
+    else:
+        rc_angle_R_mean = 0.0
+    if rc_ang_P:
+        rc_angle_P_mean = float(np.mean([np.cos(np.radians(a)) for a in rc_ang_P.values()]))
+    else:
+        rc_angle_P_mean = 0.0
+
+    # --- Feature 2: Max angle change at any reacting-atom center ----------
+    common_rc = set(rc_ang_R) & set(rc_ang_P)
+    if common_rc:
+        rc_changes = np.array([abs(rc_ang_R[t] - rc_ang_P[t]) for t in common_rc],
+                              dtype=np.float64)
+        rc_angle_change_max = float(rc_changes.max())
+    else:
+        rc_angle_change_max = 0.0
+
+    # --- Features 3-6: Dihedrals across forming/breaking bonds ------------
+    # Use the *product* adjacency for formed bonds, *reactant* for broken
+    adj_R = bond_adjacency_from_coords(cR, atom_types, n, bond_scale)
+    adj_P = bond_adjacency_from_coords(cP, atom_types, n, bond_scale)
+
+    # Forming bonds: average dihedral in P geometry (where bond exists)
+    form_cos_list, form_sin_list = [], []
+    for (a, b) in formed:
+        c, s = _best_dihedral_across_bond(cP, atom_types, n, (a, b), adj_P)
+        form_cos_list.append(c)
+        form_sin_list.append(s)
+    rc_dih_form_cos = float(np.mean(form_cos_list)) if form_cos_list else 0.0
+    rc_dih_form_sin = float(np.mean(form_sin_list)) if form_sin_list else 0.0
+
+    # Breaking bonds: average dihedral in R geometry (where bond exists)
+    break_cos_list, break_sin_list = [], []
+    for (a, b) in broken:
+        c, s = _best_dihedral_across_bond(cR, atom_types, n, (a, b), adj_R)
+        break_cos_list.append(c)
+        break_sin_list.append(s)
+    rc_dih_break_cos = float(np.mean(break_cos_list)) if break_cos_list else 0.0
+    rc_dih_break_sin = float(np.mean(break_sin_list)) if break_sin_list else 0.0
+
+    # --- Feature 7: Pyramidalization at reacting atoms --------------------
+    # Average across R and P to capture the sp2↔sp3 distortion trend
+    pyram_vals = []
+    for atom_idx in rc_atoms:
+        nbrs_R = [x for x in adj_R[atom_idx] if x < n]
+        nbrs_P = [x for x in adj_P[atom_idx] if x < n]
+        pR = _pyramidalization_angle(cR, atom_idx, nbrs_R)
+        pP = _pyramidalization_angle(cP, atom_idx, nbrs_P)
+        pyram_vals.append((pR + pP) / 2.0)
+    rc_pyramidalization = float(np.mean(pyram_vals)) if pyram_vals else 0.0
+
+    return np.array([
+        rc_angle_R_mean, rc_angle_P_mean, rc_angle_change_max,
+        rc_dih_form_cos, rc_dih_form_sin,
+        rc_dih_break_cos, rc_dih_break_sin,
+        rc_pyramidalization,
+    ], dtype=np.float32)
+
+
 def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=1.45):
     """Construct the energy-head input feature vector from reactant + product only.
 
@@ -99,9 +287,10 @@ def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=
     (predict_transition_state) so the two can never drift out of sync. All
     inputs are available before the TS is known. Returns float32 of fixed length.
 
-    Feature groups (20D total):
+    Feature groups (28D total):
       [0:10]  reaction energetics + composition
       [10:20] bond-angle statistics for reactant, product, and their change
+      [20:28] reaction-center angle features (targeted at forming/breaking bonds)
 
     Note: per-atom atomic descriptors (EN, Z, Mass) have been moved out of this
     global vector and are now attached directly to each atom in PSICore via
@@ -134,6 +323,9 @@ def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=
         ang_change_mean = 0.0
         ang_change_max = 0.0
 
+    # --- reaction-center angle features (8D) -----------------------------
+    rc_feats = _rc_angle_features(cR, cP, types, n, bond_scale)
+
     feats = np.array([
         # reaction energetics + composition (10 features)
         de_rxn, de_rxn_signed, float(diff_norms.mean()), float(diff_norms.std()),
@@ -143,11 +335,16 @@ def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=
         aR_mean, aR_std, aR_min, aR_max,
         aP_mean, aP_std, aP_min, aP_max,
         ang_change_mean, ang_change_max,
+        # reaction-center angle features (8 features)
+        rc_feats[0], rc_feats[1], rc_feats[2],
+        rc_feats[3], rc_feats[4],
+        rc_feats[5], rc_feats[6],
+        rc_feats[7],
     ], dtype=np.float32)
     return feats
 
 ATOM_PHYS_DIM = 3  # electronegativity, atomic number, mass
-ENERGY_FEAT_DIM = 20  # reaction energetics + composition + bond-angle statistics
+ENERGY_FEAT_DIM = 28  # reaction energetics + composition + bond-angle statistics + RC angles
 
 def build_atom_physical_features(atom_types, n, max_atoms):
     """Per-atom physical descriptors: [EN, Z, Mass] for each atom, zero-padded.
@@ -1033,7 +1230,7 @@ def compute_normalization(samples, indices):
     print(f"Ea range (train split): [{all_ea.min():.2f}, {all_ea.max():.2f}] kcal/mol")
     print(f"de_rxn stats (train split): mean={de_rxn_mean:.2f}, std={de_rxn_std:.2f} kcal/mol")
     print(f"Atom-phys stats (train): mean={aphys_mean}, std={aphys_std}")
-    # Energy-feature normalization: z-score the 20D reaction descriptor vector.
+    # Energy-feature normalization: z-score the 28D reaction descriptor vector.
     all_efeats = np.array([samples[i]["energy_feats_raw"] for i in indices], dtype=np.float32)
     efeat_mean = all_efeats.mean(axis=0).astype(np.float32)
     efeat_std = all_efeats.std(axis=0).astype(np.float32)
@@ -1769,7 +1966,7 @@ class PSI(nn.Module):
                 dropout=drop,
             )
             # Learned Ea head on the EGNN's refined per-atom features (h_ts)
-            # plus 20D energy descriptor (composition, bond-angle stats).
+            # plus 28D energy descriptor (composition, bond-angle stats, RC angles).
             self.ea_head = EaHead(
                 node_dim=config["egnn_hidden"],
                 hidden=config["egnn_hidden"],
@@ -1796,7 +1993,7 @@ class PSI(nn.Module):
         Args:
             de_rxn: [B] z-scored signed reaction energy, fed to the Ea head.
                     May be None at geometry-only call sites; Ea is then None.
-            energy_feats: [B, 20] z-scored molecular descriptor vector
+            energy_feats: [B, 28] z-scored molecular descriptor vector
                     (composition, bond-angle stats) for the Ea head.
         Returns:
             D_TS_pred:    [B, N, N] EGNN-refined TS distances (or coarse if EGNN off)
@@ -2431,7 +2628,7 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     e_p = product["energy"] * config["hartree_to_kcal"]
     de_rxn = e_p - e_r
     de_rxn_norm = (de_rxn - de_rxn_mean) / de_rxn_std
-    # 20D energy descriptor (composition, bond-angle stats) for the Ea head.
+    # 28D energy descriptor (composition, bond-angle stats, RC angles) for the Ea head.
     energy_feats = build_energy_features(
         r_types, n, c_R_aligned, c_P, e_r, e_p, config["fragment_bond_scale"]
     )
@@ -3205,7 +3402,7 @@ def create_dashboard(data_path, save_dir):
     }} else {{
       viewer = $3Dmol.createViewer("mol-viewer", {{ backgroundColor: "#0c101b" }});
     }}
-
+    
     function updateViewer() {{
       const rid = select.value;
       const r = repData[rid];
