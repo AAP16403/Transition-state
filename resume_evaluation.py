@@ -72,11 +72,14 @@ def print_stats(name, records):
     d_maes = [r["dist_MAE"] for r in records]
     ea_metrics = p.energy_metrics(records, "Ea_pred")
     phys_metrics = p.energy_metrics(records, "Ea_pred_physics")
+    sigmas = [r.get("Ea_sigma_kcal") for r in records if r.get("Ea_sigma_kcal") is not None]
     print(f"\n{name} ({len(records)} reactions):")
     print(
         f"  Ea MAE (neural):       {ea_metrics['MAE']:6.2f} kcal/mol"
         f"   |  R2: {ea_metrics['R2']:7.4f}   r: {ea_metrics['Pearson']:7.4f}"
     )
+    if sigmas:
+        print(f"  Ea sigma (mean):       {float(np.mean(sigmas)):6.2f} kcal/mol   |  learned uncertainty")
     print(
         f"  Ea MAE (physics):      {phys_metrics['MAE']:6.2f} kcal/mol"
         f"   |  R2: {phys_metrics['R2']:7.4f}   (baseline)"
@@ -96,6 +99,9 @@ def run_resumed_evaluation(args):
 
     config = dict(p.CONFIG)
     config.update(metadata.get("config_snapshot", {}))
+    checkpoint_ea_dim = p.infer_ea_head_output_dim(checkpoint_cpu["model_state_dict"])
+    if checkpoint_ea_dim is not None:
+        config["ea_uncertainty_enabled"] = checkpoint_ea_dim == 2
     atom_phys_dim = configure_atom_angle_features_from_checkpoint(config, metadata)
     config["force_extract"] = False
     if args.dataset_json is not None:
@@ -165,6 +171,7 @@ def run_resumed_evaluation(args):
 
     pred_dists_map = {}
     ea_neural_map = {}
+    ea_sigma_map = {}
     geom_results = []
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
     val_rxn_ids = {samples[vi]["rxn_id"] for vi in val_indices}
@@ -194,8 +201,12 @@ def run_resumed_evaluation(args):
                     _dr, di, dp_in, mask, atom_ids, atom_phys, de_rxn, energy_feats
                 )
             ea_pred_kcal = None
+            ea_sigma_kcal = None
             if ea_pred_norm is not None:
-                ea_pred_kcal = ea_pred_norm.float().cpu().numpy() * ea_std + ea_mean
+                ea_mean_norm, ea_log_var = p.split_ea_prediction(ea_pred_norm, config)
+                ea_pred_kcal = ea_mean_norm.float().cpu().numpy() * ea_std + ea_mean
+                if ea_log_var is not None:
+                    ea_sigma_kcal = torch.exp(0.5 * ea_log_var.float()).cpu().numpy() * ea_std
             for i in range(len(batch["rxn_id"])):
                 rxn_id = batch["rxn_id"][i]
                 n = int(mask[i].sum().item())
@@ -209,6 +220,8 @@ def run_resumed_evaluation(args):
                 pred_dists_map[rxn_id] = pred_np
                 if ea_pred_kcal is not None:
                     ea_neural_map[rxn_id] = float(ea_pred_kcal[i])
+                if ea_sigma_kcal is not None:
+                    ea_sigma_map[rxn_id] = float(ea_sigma_kcal[i])
                 geom_results.append(
                     {
                         "rxn_id": rxn_id,
@@ -268,12 +281,14 @@ def run_resumed_evaluation(args):
             c_r, c_ts_pred, c_p, sample["atom_types"], n, de_rxn
         )
         ea_pred = ea_neural_map.get(rxn_id, ea_physics)
+        ea_sigma = ea_sigma_map.get(rxn_id)
         results.append(
             {
                 **geom_row,
                 "Ea_true": ea_true,
                 "Ea_pred": ea_pred,
                 "Ea_error": abs(ea_pred - ea_true),
+                "Ea_sigma_kcal": ea_sigma,
                 "Ea_pred_physics": ea_physics,
                 "Ea_error_physics": abs(ea_physics - ea_true),
             }

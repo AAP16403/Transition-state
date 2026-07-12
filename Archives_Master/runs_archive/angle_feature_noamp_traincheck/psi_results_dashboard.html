@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PSI Transition State Prediction Dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/3dmol@2.4.2/build/3Dmol-min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <style>
+    body {
+      background-color: #080c14;
+      color: #cbd5e1;
+      font-family: 'Outfit', sans-serif;
+      margin: 0;
+      padding: 0;
+    }
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 2rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      padding-bottom: 1.5rem;
+    }
+    .header-left h1 {
+      font-size: 2.2rem;
+      font-weight: 700;
+      margin: 0;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .header-left p {
+      margin: 0.25rem 0 0 0;
+      color: #64748b;
+      font-size: 0.95rem;
+    }
+    .badge-top {
+      background: rgba(59, 130, 246, 0.1);
+      border: 1px solid rgba(59, 130, 246, 0.2);
+      color: #60a5fa;
+      padding: 0.35rem 0.75rem;
+      border-radius: 9999px;
+      font-weight: 600;
+      font-size: 0.85rem;
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    .card {
+      background: rgba(17, 24, 39, 0.7);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 12px;
+      padding: 1.5rem;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+    }
+    .stat-card {
+      position: relative;
+      overflow: hidden;
+    }
+    .stat-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; width: 4px; height: 100%;
+      background: #3b82f6;
+    }
+    .stat-card.energy::before { background: #8b5cf6; }
+    .stat-card.geom::before { background: #10b981; }
+    .stat-card.corr::before { background: #f59e0b; }
+
+    .stat-val {
+      font-size: 2.2rem;
+      font-weight: 700;
+      color: #ffffff;
+      margin-top: 0.5rem;
+    }
+    .stat-label {
+      font-size: 0.85rem;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+    }
+    .charts-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    .chart-title {
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: #ffffff;
+      margin-top: 0;
+      margin-bottom: 1rem;
+    }
+    .viewer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+    .dropdown-container {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    label {
+      font-size: 0.9rem;
+      color: #94a3b8;
+    }
+    select {
+      background: #1e293b;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #e2e8f0;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      outline: none;
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: 600;
+    }
+    .viewer-layout {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 1.5rem;
+    }
+    .viewer-info-card {
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 8px;
+      padding: 1.25rem;
+      border: 1px solid rgba(255, 255, 255, 0.04);
+    }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 0.75rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+      padding-bottom: 0.5rem;
+    }
+    .info-row:last-child {
+      border-bottom: none;
+      margin-bottom: 0;
+      padding-bottom: 0;
+    }
+    .info-label {
+      color: #94a3b8;
+      font-size: 0.9rem;
+    }
+    .info-val {
+      font-weight: 600;
+      color: #ffffff;
+    }
+    .legend-container {
+      margin-top: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .legend-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+    .legend-line {
+      flex-grow: 1;
+      border-bottom: 1px dashed rgba(255, 255, 255, 0.1);
+    }
+    .table-container {
+      overflow-x: auto;
+      margin-top: 1rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+    th, td {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      font-size: 0.9rem;
+    }
+    th {
+      color: #94a3b8;
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.8rem;
+      letter-spacing: 0.05em;
+    }
+    tr:hover {
+      background: rgba(255, 255, 255, 0.02);
+    }
+    .badge {
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .badge-train { background: rgba(59, 130, 246, 0.15); color: #60a5fa; }
+    .badge-val { background: rgba(139, 92, 246, 0.15); color: #a78bfa; }
+    .badge-tier {
+      padding: 0.15rem 0.4rem;
+      font-size: 0.75rem;
+      font-weight: 700;
+      border-radius: 4px;
+    }
+    .badge-tier.Best { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+    .badge-tier.Median { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
+    .badge-tier.Worst { background: rgba(239, 68, 68, 0.15); color: #f87171; }
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    table.metrics-table { width: 100%; border-collapse: collapse; }
+    table.metrics-table th, table.metrics-table td {
+      padding: 0.55rem 0.85rem;
+      text-align: right;
+      font-size: 0.9rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    table.metrics-table th:first-child, table.metrics-table td:first-child { text-align: left; }
+    table.metrics-table thead th {
+      color: #94a3b8; text-transform: uppercase; font-size: 0.78rem; letter-spacing: 0.05em;
+    }
+    table.metrics-table td { color: #ffffff; font-weight: 600; }
+    table.metrics-table th.col-val { color: #a78bfa; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="header-left">
+        <h1>PSI Results Dashboard</h1>
+        <p>Transition State prediction & activation energy regression analysis</p>
+      </div>
+      <div>
+        <span class="badge-top">Dataset Size: 8 Reactions</span>
+      </div>
+    </header>
+
+    <div class="stats-grid">
+      <div class="card stat-card">
+        <div class="stat-label">Total Triplets</div>
+        <div class="stat-val">8</div>
+      </div>
+      <div class="card stat-card energy">
+        <div class="stat-label">Ea MAE</div>
+        <div class="stat-val">9.95 <span style="font-size: 1rem; font-weight: normal; color: #94a3b8;">kcal/mol</span></div>
+      </div>
+      <div class="card stat-card corr">
+        <div class="stat-label">Ea Correlation (R)</div>
+        <div class="stat-val">-0.0617</div>
+      </div>
+      <div class="card stat-card geom">
+        <div class="stat-label">Avg Distance MAE</div>
+        <div class="stat-val">0.2115 <span style="font-size: 1rem; font-weight: normal; color: #94a3b8;">Å</span></div>
+      </div>
+    </div>
+
+    <div class="metrics-grid">
+      <div class="card">
+        <div class="chart-title">Energy (Ea) Regression Metrics</div>
+        <table class="metrics-table">
+          <thead>
+            <tr><th>Metric</th><th>Train</th><th class="col-val">Val</th><th>All</th></tr>
+          </thead>
+          <tbody>
+            <tr><td style='color:#94a3b8;'>R² (neural)</td><td>0.003</td><td>-1.422</td><td>-0.027</td></tr><tr><td style='color:#94a3b8;'>Pearson R (neural)</td><td>0.791</td><td>-1.000</td><td>-0.062</td></tr><tr><td style='color:#94a3b8;'>MAE (kcal/mol)</td><td>11.51</td><td>5.25</td><td>9.95</td></tr><tr><td style='color:#94a3b8;'>RMSE (kcal/mol)</td><td>12.47</td><td>5.27</td><td>11.11</td></tr><tr><td style='color:#94a3b8;'>MAPE</td><td>31.8%</td><td>13.6%</td><td>27.3%</td></tr><tr><td style='color:#94a3b8;'>Count</td><td>6</td><td>2</td><td>8</td></tr><tr><td style='color:#94a3b8;'>R² (physics baseline)</td><td>0.128</td><td>-12.023</td><td>-0.158</td></tr><tr><td style='color:#94a3b8;'>MAE physics (kcal/mol)</td><td>11.18</td><td>11.84</td><td>11.35</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="chart-title">Geometry (Distance) Metrics</div>
+        <table class="metrics-table">
+          <thead>
+            <tr><th>Metric</th><th>Train</th><th class="col-val">Val</th><th>All</th></tr>
+          </thead>
+          <tbody>
+            <tr><td style='color:#94a3b8;'>R²</td><td>0.911</td><td>0.808</td><td>0.898</td></tr><tr><td style='color:#94a3b8;'>MAE (Å)</td><td>0.2021</td><td>0.2610</td><td>0.2149</td></tr><tr><td style='color:#94a3b8;'>RMSE (Å)</td><td>0.3171</td><td>0.3763</td><td>0.3310</td></tr><tr><td style='color:#94a3b8;'>Guess MAE (Å)</td><td>0.1820</td><td>0.2219</td><td>0.1907</td></tr><tr><td style='color:#94a3b8;'>Improvement vs Guess</td><td>-11.0%</td><td>-17.6%</td><td>-12.7%</td></tr><tr><td style='color:#94a3b8;'>Pairs</td><td>258</td><td>72</td><td>330</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="charts-grid">
+      <div class="card">
+        <div class="chart-title">Ea: Actual vs. Predicted</div>
+        <div id="ea-scatter" style="height: 400px;"></div>
+      </div>
+      <div class="card">
+        <div class="chart-title">Geometry: Distance MAE Improvement</div>
+        <div id="geom-histogram" style="height: 400px;"></div>
+      </div>
+    </div>
+
+    <div class="card molecular-viewer-card">
+      <div class="viewer-header">
+        <div class="chart-title" style="margin-bottom: 0;">Interactive 3D Transition State Alignment</div>
+        <div class="dropdown-container">
+          <label for="rxn-select">Select Reaction Case Study:</label>
+          <select id="rxn-select" onchange="updateViewer()">
+          </select>
+        </div>
+      </div>
+      <div class="viewer-layout">
+        <div id="mol-viewer" style="height: 500px; background: #0c101b; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.03);"></div>
+        <div class="viewer-info-card">
+          <div class="chart-title" style="font-size: 1rem; border-bottom: 1px solid rgba(255, 255, 255, 0.06); padding-bottom: 0.5rem; margin-bottom: 0.75rem;">Case Study Details</div>
+
+          <div class="info-row">
+            <span class="info-label">Reaction ID</span>
+            <span class="info-val" id="case-id">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Performance Tier</span>
+            <span id="case-tier">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Atom Count</span>
+            <span class="info-val" id="case-atoms">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Distance MAE (AI)</span>
+            <span class="info-val" id="case-dist-mae">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Ea True</span>
+            <span class="info-val" id="case-ea-true">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Ea Predicted</span>
+            <span class="info-val" id="case-ea-pred" style="color: #60a5fa;">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Ea Error</span>
+            <span class="info-val" id="case-ea-error">-</span>
+          </div>
+
+          <div class="legend-container">
+            <div class="legend-item">
+              <div class="legend-dot" style="background: #10b981;"></div>
+              <span class="info-label">Ground Truth TS</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-dot" style="background: #3b82f6;"></div>
+              <span class="info-label">AI Predicted TS</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-dot" style="background: rgba(239, 68, 68, 0.4); border: 1px dashed #ef4444;"></div>
+              <span class="info-label">Interpolated Guess</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="chart-title">Worst 10 Geometry Predictions (Diagnostics)</div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Reaction ID</th>
+              <th>Split</th>
+              <th>Atoms</th>
+              <th>Guess MAE (Å)</th>
+              <th>AI Predicted MAE (Å)</th>
+              <th>Ea True (kcal)</th>
+              <th>Ea Pred (kcal)</th>
+              <th>Ea Error (kcal)</th>
+            </tr>
+          </thead>
+          <tbody id="worst-table-body">
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const reactions = [{"rxn_id": "rxn000000", "split": "val", "Ea_true": 35.16, "Ea_pred": 40.04, "Ea_error": 4.88, "dist_MAE": 0.3473, "guess_MAE": 0.3241, "n_atoms": 9}, {"rxn_id": "rxn000001", "split": "train", "Ea_true": 26.58, "Ea_pred": 40.02, "Ea_error": 13.43, "dist_MAE": 0.1852, "guess_MAE": 0.1486, "n_atoms": 9}, {"rxn_id": "rxn000002", "split": "train", "Ea_true": 33.89, "Ea_pred": 40.05, "Ea_error": 6.16, "dist_MAE": 0.1552, "guess_MAE": 0.1177, "n_atoms": 9}, {"rxn_id": "rxn000003", "split": "train", "Ea_true": 25.4, "Ea_pred": 40.01, "Ea_error": 14.6, "dist_MAE": 0.1749, "guess_MAE": 0.1652, "n_atoms": 9}, {"rxn_id": "rxn000004", "split": "train", "Ea_true": 47.33, "Ea_pred": 40.06, "Ea_error": 7.26, "dist_MAE": 0.2191, "guess_MAE": 0.21, "n_atoms": 9}, {"rxn_id": "rxn000005", "split": "train", "Ea_true": 48.02, "Ea_pred": 40.03, "Ea_error": 8.0, "dist_MAE": 0.1974, "guess_MAE": 0.1665, "n_atoms": 9}, {"rxn_id": "rxn000006", "split": "val", "Ea_true": 41.93, "Ea_pred": 36.31, "Ea_error": 5.62, "dist_MAE": 0.1748, "guess_MAE": 0.1198, "n_atoms": 13}, {"rxn_id": "rxn000007", "split": "train", "Ea_true": 59.67, "Ea_pred": 40.07, "Ea_error": 19.6, "dist_MAE": 0.2383, "guess_MAE": 0.229, "n_atoms": 13}];
+    const repData = {"rxn000002": {"rxn_id": "rxn000002", "atom_types": ["C", "C", "N", "O", "N", "N", "H", "H", "H"], "coords_true": [[-1.3910384875681594, -0.08285790240693118, 0.07756963887279693], [0.007702705162789613, -0.37364697828544646, -0.20918495211660884], [0.8731372926643457, -1.3544494792796218, -0.19126449179658397], [2.1463750994565047, -0.6305563458751835, 0.029368780931355216], [1.9140341821419324, 0.7142757855052976, 0.11581314780755239], [0.6693434300547957, 0.8583122314676516, -0.1135596234301692], [-1.942635873572833, -0.8228926901725527, 0.6585392997540533], [-1.9614954138330103, 0.3541442224509052, -0.7480049803360197], [-0.31542293450636594, 1.3376711565958836, 0.38072318031362334]], "coords_pred": [[-1.4154205322265625, -0.21148855984210968, 0.1391223818063736], [0.009112797677516937, -0.31559500098228455, -0.18169237673282623], [0.88506019115448, -1.1068081855773926, 0.4980011582374573], [2.1204330921173096, -0.6427834033966064, 0.16833338141441345], [2.0207743644714355, 0.5458977818489075, -0.5326604247093201], [0.7601739168167114, 0.7725299596786499, -0.6215372085571289], [-1.902725100517273, -0.8259230852127075, -0.20119866728782654], [-1.9033198356628418, 0.45666685700416565, -0.3373907506465912], [-0.5740888118743896, 1.3275036811828613, 1.069022536277771]], "coords_guess": [[-1.4170622825622559, -0.21918727457523346, -0.10675875097513199], [0.011657286435365677, -0.3036106824874878, 0.20094068348407745], [0.8788011074066162, -1.136162519454956, -0.4395175874233246], [2.1182289123535156, -0.652930498123169, -0.15600645542144775], [2.0274391174316406, 0.5773117542266846, 0.47050702571868896], [0.7680532932281494, 0.8095886707305908, 0.561808168888092], [-1.8994933366775513, -0.8109083771705627, 0.2777940630912781], [-1.898810625076294, 0.4776653051376343, 0.3334609866142273], [-0.5888134837150574, 1.258233666419983, -1.142228126525879]], "bonds_true": [[0, 1], [0, 6], [0, 7], [1, 2], [1, 5], [2, 3], [3, 4], [4, 5], [5, 8]], "bonds_pred": [[0, 1], [0, 6], [0, 7], [1, 2], [1, 5], [2, 3], [3, 4], [4, 5]], "bonds_guess": [[0, 1], [0, 6], [0, 7], [1, 2], [1, 5], [2, 3], [3, 4], [4, 5]], "dist_MAE": 0.15523959530724418, "Ea_true": 33.889811231276724, "Ea_pred": 40.05135726928711, "Ea_error": 6.1615460380103855, "tier": "Best"}, "rxn000006": {"rxn_id": "rxn000006", "atom_types": ["C", "O", "C", "C", "O", "H", "H", "H", "H", "H", "H", "H", "H"], "coords_true": [[-1.9949304931488225, -0.06625108326641752, -0.03715621446927259], [-0.8827316574425715, -0.25834988661924546, 0.8298619746287247], [0.9150726617752567, 0.8186064506543878, 0.014504624544458201], [1.9014604999872884, -0.2766491414276104, -0.04731500087122278], [0.9553692918657668, -1.200257125358441, -0.4975682387587585], [-2.7569171706597797, -0.8420901783289683, 0.1478226410076852], [-2.443937971593362, 0.9143503377349157, 0.17366838630415582], [-1.7001392897998484, -0.1112958694559086, -1.0984301287279636], [0.4973781077106379, 1.1617350912809532, -0.9288585534304624], [0.6590541049618805, 1.3748958447904276, 0.9122208456612843], [2.721389937486757, -0.08372358994786963, -0.7688817873289264], [2.354657084553125, -0.5006497910654393, 0.9384863308546267], [-0.22572510569632723, -0.9303210589907832, 0.3616451205856678]], "coords_pred": [[-2.1174545288085938, -0.029791703447699547, -0.07618633657693863], [-0.8839950561523438, -0.6340075135231018, -0.34054842591285706], [0.8815906047821045, 0.81001216173172, -0.012049333192408085], [1.8762775659561157, -0.2812999486923218, -0.13104121387004852], [1.4366530179977417, -0.7169073820114136, 1.096486210823059], [-2.703725576400757, -0.6193497180938721, 0.3040609359741211], [-2.5967214107513428, 0.27609583735466003, -1.007131576538086], [-2.0853326320648193, 0.7373189330101013, 0.6054430603981018], [1.0796594619750977, 1.6025279760360718, 0.6859683394432068], [0.45192021131515503, 1.1299396753311157, -0.7428966164588928], [2.810321807861328, 0.01627408154308796, -0.11524807661771774], [1.7332018613815308, -0.9216378331184387, -0.9765857458114624], [0.11760454624891281, -1.3691744804382324, 0.7097287774085999]], "coords_guess": [[-2.1105825901031494, 0.03315116465091705, 0.1860150545835495], [-0.8584730625152588, -0.3999697268009186, 0.6343494653701782], [0.8714256286621094, 0.7168002724647522, -0.40034234523773193], [1.883654236793518, -0.21349000930786133, 0.15143439173698425], [1.389054536819458, -1.153300166130066, -0.7214597463607788], [-2.707824945449829, -0.6577264070510864, 0.14411310851573944], [-2.5467567443847656, 0.7337233424186707, 0.8992806673049927], [-2.121263265609741, 0.40710216760635376, -0.7700722217559814], [1.0252890586853027, 1.103969931602478, -1.390731930732727], [0.4746439456939697, 1.338510274887085, 0.12607239186763763], [2.8120973110198975, 0.03342115134000778, -0.04380159080028534], [1.7901350259780884, -0.39879512786865234, 1.2013400793075562], [0.09860081225633621, -1.5433968305587769, -0.016197267919778824]], "bonds_true": [[0, 1], [0, 5], [0, 6], [0, 7], [1, 12], [2, 3], [2, 8], [2, 9], [3, 4], [3, 10], [3, 11]], "bonds_pred": [[0, 1], [0, 5], [0, 6], [0, 7], [2, 3], [2, 4], [2, 8], [2, 9], [3, 4], [3, 10], [3, 11]], "bonds_guess": [[0, 1], [0, 5], [0, 6], [0, 7], [2, 3], [2, 4], [2, 8], [2, 9], [3, 4], [3, 10], [3, 11]], "dist_MAE": 0.1747660371992323, "Ea_true": 41.927473171593725, "Ea_pred": 36.30623245239258, "Ea_error": 5.621240719201147, "tier": "Best"}, "rxn000003": {"rxn_id": "rxn000003", "atom_types": ["C", "C", "N", "O", "N", "N", "H", "H", "H"], "coords_true": [[-1.3727349200766539, 0.02993601760373102, -0.0008554007805484842], [0.05993837249216664, -0.3904917521261854, 0.004099725178896841], [0.7272425289537944, -1.4100102137593589, 0.0036792236089401536], [2.616077657891822, -0.4410406635260593, -0.00411238946898622], [2.1345279596013143, 0.6807121082159531, -0.0011768268479863595], [1.0061894894259746, 1.0921922032959381, 0.003986035694518989], [-1.5811993116840273, 0.6297637556640512, 0.8938418364388381], [-1.566601523742877, 0.6587552499909316, -0.8788703134818161], [-2.0234402528615147, -0.8498167053590009, -0.02059189034185698]], "coords_pred": [[-1.458028793334961, -0.011678246781229973, -0.032759662717580795], [-0.14376218616962433, -0.4772301912307739, -0.34500852227211], [0.660239040851593, -1.4413626194000244, -0.3200656771659851], [2.742902994155884, -0.43808093667030334, 0.2163683921098709], [2.287846088409424, 0.7355101108551025, 0.10921064764261246], [1.2623006105422974, 1.2622705698013306, 0.2231186479330063], [-1.4397623538970947, 0.7355849742889404, 0.7069506049156189], [-1.8807393312454224, 0.3929002285003662, -0.9282813668251038], [-2.030996084213257, -0.7579138278961182, 0.370466947555542]], "coords_guess": [[-1.4580296277999878, -0.011677398346364498, -0.03275834396481514], [-0.14376801252365112, -0.4772331416606903, -0.34500932693481445], [0.66022789478302, -1.4413596391677856, -0.3200652003288269], [2.742844581604004, -0.43807119131088257, 0.21637019515037537], [2.287827730178833, 0.7355093359947205, 0.10920879244804382], [1.26228666305542, 1.2622672319412231, 0.22311453521251678], [-1.4397345781326294, 0.7355695366859436, 0.7069380879402161], [-1.8807005882263184, 0.39289015531539917, -0.9282663464546204], [-2.030954122543335, -0.7578948736190796, 0.3704676032066345]], "bonds_true": [[0, 1], [0, 6], [0, 7], [0, 8], [1, 2], [1, 5], [3, 4], [4, 5]], "bonds_pred": [[0, 1], [0, 6], [0, 7], [0, 8], [1, 2], [3, 4], [4, 5]], "bonds_guess": [[0, 1], [0, 6], [0, 7], [0, 8], [1, 2], [3, 4], [4, 5]], "dist_MAE": 0.17492658562130398, "Ea_true": 25.40196147046368, "Ea_pred": 40.005680084228516, "Ea_error": 14.603718613764837, "tier": "Best"}, "rxn000001": {"rxn_id": "rxn000001", "atom_types": ["C", "C", "N", "O", "N", "N", "H", "H", "H"], "coords_true": [[-1.107762670763708, 0.24292629991313833, -0.01623195113719765], [0.36807417472043535, -0.019879124925651442, -0.04537083562701524], [0.7751769894935757, -1.4320714939352663, 0.5062214145947981], [0.9693936469860643, -2.2313640323719075, -0.36393413557057586], [2.1842145681119427, 1.6187813804114057, -0.03264659042211792], [1.2906614049298337, 0.8760717157742887, -0.022999210721859793], [-1.3028431545497459, 1.3120138720748675, -0.1675057851983526], [-1.6271909234815933, -0.3166567289563368, -0.8086706214030593], [-1.5497240354468038, -0.04982188798453783, 0.9511377154853795]], "coords_pred": [[-1.172021508216858, 0.235833540558815, -0.006742845755070448], [0.2720172703266144, 0.0041530863381922245, -0.08358640223741531], [0.8113464713096619, -1.2255675792694092, -0.27928751707077026], [1.1913504600524902, -1.7574456930160522, 0.21807701885700226], [2.3010337352752686, 0.9788501262664795, -0.04461628571152687], [1.2088251113891602, 0.9314084649085999, 0.13041098415851593], [-1.3967549800872803, 1.1701059341430664, -0.39343246817588806], [-1.5385465621948242, 0.17225632071495056, 1.028854250907898], [-1.6772499084472656, -0.5095941424369812, -0.5696767568588257]], "coords_guess": [[-1.1720253229141235, 0.2358330637216568, -0.006743838544934988], [0.2720111608505249, 0.004152163863182068, -0.08358555287122726], [0.8113371729850769, -1.2255648374557495, -0.27928516268730164], [1.191319465637207, -1.7574207782745361, 0.21807606518268585], [2.3010079860687256, 0.9788485169410706, -0.0446150042116642], [1.2088170051574707, 0.9314084053039551, 0.1304115355014801], [-1.3967304229736328, 1.1700773239135742, -0.39342615008354187], [-1.5385197401046753, 0.1722489446401596, 1.028838872909546], [-1.6772171258926392, -0.5095828175544739, -0.5696707963943481]], "bonds_true": [[0, 1], [0, 6], [0, 7], [0, 8], [1, 2], [1, 5], [2, 3], [4, 5]], "bonds_pred": [[0, 1], [0, 6], [0, 7], [0, 8], [1, 2], [1, 3], [1, 5], [2, 3], [4, 5]], "bonds_guess": [[0, 1], [0, 6], [0, 7], [0, 8], [1, 2], [1, 5], [2, 3], [4, 5]], "dist_MAE": 0.1852307054731581, "Ea_true": 26.582452987539202, "Ea_pred": 40.017269134521484, "Ea_error": 13.434816146982282, "tier": "Best"}, "rxn000005": {"rxn_id": "rxn000005", "atom_types": ["C", "C", "N", "O", "N", "N", "H", "H", "H"], "coords_true": [[-1.4293976752081705, 0.06262845401492045, -0.002198147962428754], [0.34441359010134537, -0.059458158693896604, 0.017021316991462893], [-0.06471758643445966, -1.2246780018274976, 0.017650228210754678], [2.6773156938468285, -0.7250729180869532, -0.013137732675396979], [2.509696983554531, 0.47410205995193855, -0.005814025456587904], [1.1499371995686636, 0.9590020994578953, 0.013422983455160553], [-1.5572197396959508, 0.6104757515926492, 0.9345114970287385], [-1.5030085203318224, 0.6789472459978317, -0.9027543062723221], [-2.127019945400964, -0.7759465324068866, -0.05870181331938031]], "coords_pred": [[-1.479698896408081, 0.04519335553050041, -0.07863691449165344], [0.41876381635665894, 0.08798195421695709, 0.4564301669597626], [0.16752614080905914, -1.0347390174865723, 0.1777559220790863], [2.3692142963409424, -0.7658703327178955, -0.5031659603118896], [2.598505973815918, 0.4535980820655823, -0.0667913556098938], [1.4332269430160522, 0.892711341381073, 0.5425518155097961], [-1.7977287769317627, 0.16349302232265472, -0.9661371111869812], [-1.6027804613113403, 0.7336997389793396, -0.10121733695268631], [-2.1070289611816406, -0.5760681629180908, 0.5392107367515564]], "coords_guess": [[-1.4789875745773315, 0.06095962971448898, 0.08134548366069794], [0.4146411418914795, -0.003167220624163747, -0.4685010612010956], [0.16684119403362274, -1.049677848815918, 0.026160195469856262], [2.374171495437622, -0.6549712419509888, 0.6220762729644775], [2.598571538925171, 0.45565280318260193, -0.04593347758054733], [1.4275981187820435, 0.7683916687965393, -0.7189809679985046], [-1.7892485857009888, 0.3504810929298401, 0.9314332604408264], [-1.6024316549301147, 0.7407225370407104, -0.029805611819028854], [-2.1111557483673096, -0.6683914065361023, -0.39779409766197205]], "bonds_true": [[0, 1], [0, 2], [0, 6], [0, 7], [0, 8], [1, 2], [1, 5], [3, 4], [4, 5]], "bonds_pred": [[0, 1], [0, 2], [0, 6], [0, 7], [0, 8], [1, 2], [1, 5], [3, 4], [4, 5]], "bonds_guess": [[0, 1], [0, 2], [0, 6], [0, 7], [0, 8], [1, 2], [1, 5], [3, 4], [4, 5]], "dist_MAE": 0.19743098153008354, "Ea_true": 48.02472580323974, "Ea_pred": 40.02754211425781, "Ea_error": 7.997183688981927, "tier": "Best"}, "rxn000004": {"rxn_id": "rxn000004", "atom_types": ["C", "C", "N", "O", "N", "N", "H", "H", "H"], "coords_true": [[-1.3629360093911886, 0.28963084386115046, -0.0006314205567434978], [0.10772829876651742, 0.28940361584055807, -0.003278556555176103], [0.26481873846539145, -1.0015642983589128, -0.0023436860176873696], [2.240737224793957, -0.7225439456540835, 3.163633711763799e-05], [2.2693755438791636, 0.5396928395399825, 0.001516914270623821], [1.1196414625094118, 1.1873673740927855, -0.0015649953955410515], [-1.8972243125589892, 0.3757299208272652, 0.9434455756924942], [-0.8381525421297376, -1.3294663394707622, 0.003667372056253074], [-1.9039884043345263, 0.3717499893220165, -0.9408428398313395]], "coords_pred": [[-1.387297511100769, 0.2981451451778412, 0.08757377415895462], [0.03895285353064537, 0.2679307460784912, -0.19344843924045563], [0.6501057744026184, -0.7984372973442078, -0.8063710331916809], [2.0012803077697754, -0.6453136205673218, -0.5128058791160583], [2.122941255569458, 0.4745228886604309, 0.40801435708999634], [0.9787106513977051, 0.8796074390411377, 0.657425045967102], [-1.7423030138015747, 1.1021682024002075, 0.4807864725589752], [-0.6960786581039429, -1.4837818145751953, 0.6819771528244019], [-1.9663116931915283, -0.09484175592660904, -0.8031514883041382]], "coords_guess": [[-1.386056900024414, 0.3152858316898346, 0.02455667033791542], [0.029135894030332565, 0.13268430531024933, 0.3037583827972412], [0.627983808517456, -1.103271484375, 0.3143162131309509], [1.987398386001587, -0.8360785841941833, 0.1885586380958557], [2.1316282749176025, 0.5945498943328857, -0.033265456557273865], [0.9933512210845947, 1.0815627574920654, -0.08506172150373459], [-1.734354853630066, 1.2111940383911133, 0.07986435294151306], [-0.6556863188743591, -0.9271295070648193, -1.3644148111343384], [-1.9933995008468628, -0.4687972962856293, 0.5716876983642578]], "bonds_true": [[0, 1], [0, 2], [0, 6], [0, 8], [1, 2], [1, 5], [2, 7], [3, 4], [4, 5]], "bonds_pred": [[0, 1], [0, 6], [0, 8], [1, 2], [1, 5], [2, 3], [3, 4], [4, 5]], "bonds_guess": [[0, 1], [0, 6], [0, 8], [1, 2], [1, 5], [2, 3], [3, 4], [4, 5]], "dist_MAE": 0.21905260615878636, "Ea_true": 47.3276477669192, "Ea_pred": 40.06475830078125, "Ea_error": 7.262889466137949, "tier": "Median"}, "rxn000007": {"rxn_id": "rxn000007", "atom_types": ["C", "O", "C", "C", "O", "H", "H", "H", "H", "H", "H", "H", "H"], "coords_true": [[-2.024679331699275, -0.1643476918816857, -0.11148228349964305], [-0.8983821887726365, 0.4001719192842033, -0.7648353178142757], [0.14483579484834222, 0.6371847942943842, 0.14667965657626314], [1.4778533623669436, 0.5886245805237892, -0.3514714603391567], [1.8929771018704444, -1.046029309869692, 0.5664610077015767], [-2.817273590401674, -0.26055007847213085, -0.8634924533400935], [-2.385443963434613, 0.48259631513532225, 0.7100373246155811], [-1.7916987854756599, -1.1569581851140043, 0.3167702044839759], [0.7108854069274549, -0.5370972903673581, 0.7326782504078355], [-0.07128319429332011, 1.3916694984105493, 0.9178810332886362], [2.2603180966193643, 1.1479406579867677, 0.15968546573596362], [1.6896524762979412, 0.30059778253039726, -1.3802723775171488], [1.8122388151466908, -1.7838029924605425, -0.0786390502995128]], "coords_pred": [[-1.8532540798187256, -0.27199867367744446, -0.042103782296180725], [-0.6051649451255798, 0.022646944969892502, -0.6326460242271423], [0.23275554180145264, 0.8174580931663513, 0.19865170121192932], [1.6060609817504883, 0.7744852304458618, -0.31220027804374695], [1.5390897989273071, -1.63575279712677, 0.009765133261680603], [-2.436652421951294, -0.846303403377533, -0.7718766331672668], [-2.3572499752044678, 0.6370233297348022, 0.22671715915203094], [-1.7420018911361694, -0.8704066276550293, 0.8354105949401855], [0.7711271643638611, -0.7838218212127686, 1.2789970636367798], [-0.16562339663505554, 1.6145774126052856, 0.5685977339744568], [2.2583935260772705, 1.4191607236862183, 0.2501712739467621], [1.867453694343567, 0.6349188685417175, -0.9952694177627563], [0.885066032409668, -1.511987328529358, -0.6142144799232483]], "coords_guess": [[-1.85324227809906, -0.2719976305961609, -0.04210391268134117], [-0.6051562428474426, 0.022645428776741028, -0.6326369643211365], [0.23275399208068848, 0.8174567222595215, 0.19865140318870544], [1.6060506105422974, 0.7744830250740051, -0.31219998002052307], [1.5390586853027344, -1.6357306241989136, 0.009768287651240826], [-2.4365763664245605, -0.8462790846824646, -0.7718561291694641], [-2.357179880142212, 0.6370037198066711, 0.22671008110046387], [-1.7419500350952148, -0.8703826665878296, 0.835389256477356], [0.7711088061332703, -0.7838074564933777, 1.278969407081604], [-0.1656220704317093, 1.614535927772522, 0.5685852766036987], [2.2583186626434326, 1.4191243648529053, 0.25016242265701294], [1.867396593093872, 0.6348995566368103, -0.9952436685562134], [0.8850396275520325, -1.5119513273239136, -0.6141954660415649]], "bonds_true": [[0, 1], [0, 5], [0, 6], [0, 7], [1, 2], [2, 3], [2, 8], [2, 9], [3, 4], [3, 10], [3, 11], [4, 8], [4, 12]], "bonds_pred": [[0, 1], [0, 5], [0, 6], [0, 7], [1, 2], [2, 3], [2, 9], [3, 10], [3, 11], [4, 12]], "bonds_guess": [[0, 1], [0, 5], [0, 6], [0, 7], [1, 2], [2, 3], [2, 9], [3, 10], [3, 11], [4, 12]], "dist_MAE": 0.23826317909436348, "Ea_true": 59.673634832325405, "Ea_pred": 40.07297134399414, "Ea_error": 19.600663488331264, "tier": "Median"}, "rxn000000": {"rxn_id": "rxn000000", "atom_types": ["C", "C", "N", "O", "N", "N", "H", "H", "H"], "coords_true": [[-1.3639540899788376, 0.2872076814541365, -0.0006269176772285758], [0.10584103123144879, 0.2885216143753759, -0.009911923969557292], [0.2647677635289862, -1.0024819166899137, -0.015658406370070335], [2.2425541357219454, -0.7189917317570067, 0.000726076440042507], [2.2675495370105905, 0.5432670123677721, 0.006927377090556019], [1.1162563659381826, 1.1885043239422368, -0.002267104936184877], [-1.914492628349728, 0.3840190286100779, -0.9333908163499617], [-1.8880196060511403, 0.3687703824892541, 0.9503097818403566], [-0.8305025090514498, -1.338816394791932, 0.0038919339320490566]], "coords_pred": [[-1.1196846961975098, 0.38504016399383545, -0.07348234206438065], [0.02041976898908615, -0.330219566822052, 0.2862413227558136], [0.5583798885345459, -1.5495847463607788, 0.27951687574386597], [2.353555202484131, -0.16479812562465668, -0.3845963180065155], [1.8890880346298218, 0.9475305676460266, -0.2563057243824005], [0.7331703901290894, 0.8163619637489319, 0.38765448331832886], [-1.3804798126220703, 0.7269150018692017, -1.003371000289917], [-1.6416765451431274, 0.8818960189819336, 0.7110320329666138], [-1.4127721786499023, -1.7131413221359253, 0.05331069603562355]], "coords_guess": [[-1.119685411453247, 0.38504087924957275, -0.07348567992448807], [0.020413987338542938, -0.33022111654281616, 0.2862463593482971], [0.5583667159080505, -1.5495787858963013, 0.27951931953430176], [2.3535075187683105, -0.1647956371307373, -0.3845972418785095], [1.889069676399231, 0.9475216269493103, -0.2563082277774811], [0.7331624031066895, 0.8163570165634155, 0.38765767216682434], [-1.3804519176483154, 0.7268984317779541, -1.0033563375473022], [-1.6416412591934204, 0.8818808197975159, 0.7110141515731812], [-1.4127416610717773, -1.713103175163269, 0.05331003665924072]], "bonds_true": [[0, 1], [0, 2], [0, 6], [0, 7], [1, 2], [1, 5], [2, 8], [3, 4], [4, 5]], "bonds_pred": [[0, 1], [0, 5], [0, 6], [0, 7], [1, 2], [1, 5], [3, 4], [4, 5]], "bonds_guess": [[0, 1], [0, 5], [0, 6], [0, 7], [1, 2], [1, 5], [3, 4], [4, 5]], "dist_MAE": 0.34726492563883465, "Ea_true": 35.16018512955455, "Ea_pred": 40.04408645629883, "Ea_error": 4.8839013267442795, "tier": "Worst"}};
+    const worst10 = [{"rxn_id": "rxn000000", "split": "val", "Ea_true": 35.16, "Ea_pred": 40.04, "Ea_error": 4.88, "dist_MAE": 0.3473, "guess_MAE": 0.3241, "n_atoms": 9}, {"rxn_id": "rxn000007", "split": "train", "Ea_true": 59.67, "Ea_pred": 40.07, "Ea_error": 19.6, "dist_MAE": 0.2383, "guess_MAE": 0.229, "n_atoms": 13}, {"rxn_id": "rxn000004", "split": "train", "Ea_true": 47.33, "Ea_pred": 40.06, "Ea_error": 7.26, "dist_MAE": 0.2191, "guess_MAE": 0.21, "n_atoms": 9}, {"rxn_id": "rxn000005", "split": "train", "Ea_true": 48.02, "Ea_pred": 40.03, "Ea_error": 8.0, "dist_MAE": 0.1974, "guess_MAE": 0.1665, "n_atoms": 9}, {"rxn_id": "rxn000001", "split": "train", "Ea_true": 26.58, "Ea_pred": 40.02, "Ea_error": 13.43, "dist_MAE": 0.1852, "guess_MAE": 0.1486, "n_atoms": 9}, {"rxn_id": "rxn000003", "split": "train", "Ea_true": 25.4, "Ea_pred": 40.01, "Ea_error": 14.6, "dist_MAE": 0.1749, "guess_MAE": 0.1652, "n_atoms": 9}, {"rxn_id": "rxn000006", "split": "val", "Ea_true": 41.93, "Ea_pred": 36.31, "Ea_error": 5.62, "dist_MAE": 0.1748, "guess_MAE": 0.1198, "n_atoms": 13}, {"rxn_id": "rxn000002", "split": "train", "Ea_true": 33.89, "Ea_pred": 40.05, "Ea_error": 6.16, "dist_MAE": 0.1552, "guess_MAE": 0.1177, "n_atoms": 9}];
+
+    const trainScatter = {
+      x: [], y: [], text: [], mode: 'markers',
+      name: 'Train Set',
+      marker: { color: '#3b82f6', opacity: 0.6, size: 7 }
+    };
+    const valScatter = {
+      x: [], y: [], text: [], mode: 'markers',
+      name: 'Val Set',
+      marker: { color: '#8b5cf6', opacity: 0.8, size: 8 }
+    };
+
+    for (let r of reactions) {
+      let t = `ID: ${r.rxn_id}<br>True: ${r.Ea_true} kcal<br>Pred: ${r.Ea_pred} kcal<br>Error: ${r.Ea_error} kcal`;
+      if (r.split === 'train') {
+        trainScatter.x.push(r.Ea_true);
+        trainScatter.y.push(r.Ea_pred);
+        trainScatter.text.push(t);
+      } else {
+        valScatter.x.push(r.Ea_true);
+        valScatter.y.push(r.Ea_pred);
+        valScatter.text.push(t);
+      }
+    }
+
+    const minEa = Math.min(...reactions.map(r => r.Ea_true));
+    const maxEa = Math.max(...reactions.map(r => r.Ea_true));
+    const refLine = {
+      x: [minEa, maxEa], y: [minEa, maxEa],
+      mode: 'lines', name: 'y=x Ref',
+      line: { color: 'rgba(255,255,255,0.2)', dash: 'dash', width: 1.5 }
+    };
+
+    const scatterLayout = {
+      plot_bgcolor: 'transparent',
+      paper_bgcolor: 'transparent',
+      margin: { l: 50, r: 20, t: 20, b: 50 },
+      xaxis: { title: 'True Ea (kcal/mol)', gridcolor: 'rgba(255,255,255,0.05)', tickcolor: '#94a3b8' },
+      yaxis: { title: 'Predicted Ea (kcal/mol)', gridcolor: 'rgba(255,255,255,0.05)', tickcolor: '#94a3b8' },
+      legend: { font: { color: '#cbd5e1' } },
+      hovermode: 'closest'
+    };
+    Plotly.newPlot('ea-scatter', [trainScatter, valScatter, refLine], scatterLayout);
+
+    const guessHist = {
+      x: reactions.map(r => r.guess_MAE),
+      type: 'histogram', name: 'Initial Guess MAE',
+      opacity: 0.5, marker: { color: '#ef4444' },
+      xbins: { size: 0.02 }
+    };
+    const aiHist = {
+      x: reactions.map(r => r.dist_MAE),
+      type: 'histogram', name: 'AI Predicted MAE',
+      opacity: 0.6, marker: { color: '#10b981' },
+      xbins: { size: 0.02 }
+    };
+
+    const histLayout = {
+      plot_bgcolor: 'transparent',
+      paper_bgcolor: 'transparent',
+      margin: { l: 50, r: 20, t: 20, b: 50 },
+      xaxis: { title: 'Distance MAE (Å)', gridcolor: 'rgba(255,255,255,0.05)', tickcolor: '#94a3b8' },
+      yaxis: { title: 'Count', gridcolor: 'rgba(255,255,255,0.05)', tickcolor: '#94a3b8' },
+      barmode: 'overlay',
+      legend: { font: { color: '#cbd5e1' } }
+    };
+    Plotly.newPlot('geom-histogram', [guessHist, aiHist], histLayout);
+
+    const select = document.getElementById('rxn-select');
+    for (let rid in repData) {
+      let opt = document.createElement('option');
+      opt.value = rid;
+      opt.text = `${rid} [${repData[rid].tier} tier: MAE=${repData[rid].dist_MAE.toFixed(4)}Å]`;
+      select.appendChild(opt);
+    }
+
+    // Initialize 3Dmol viewer (guard against the CDN failing to load)
+    let viewer = null;
+    if (typeof $3Dmol === 'undefined') {
+      document.getElementById('mol-viewer').innerHTML =
+        '<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#f87171;text-align:center;padding:1rem;">' +
+        '3Dmol.js failed to load (check network / CDN). 3D structures cannot be displayed.</div>';
+    } else {
+      viewer = $3Dmol.createViewer("mol-viewer", { backgroundColor: "#0c101b" });
+    }
+
+    function updateViewer() {
+      const rid = select.value;
+      const r = repData[rid];
+
+      document.getElementById('case-id').innerText = r.rxn_id;
+      document.getElementById('case-atoms').innerText = r.atom_types.length;
+      document.getElementById('case-dist-mae').innerText = r.dist_MAE.toFixed(4) + ' Å';
+      document.getElementById('case-ea-true').innerText = r.Ea_true.toFixed(2) + ' kcal/mol';
+      document.getElementById('case-ea-pred').innerText = r.Ea_pred.toFixed(2) + ' kcal/mol';
+      document.getElementById('case-ea-error').innerText = r.Ea_error.toFixed(2) + ' kcal/mol';
+
+      const tierBadge = document.getElementById('case-tier');
+      tierBadge.className = `badge badge-tier ${r.tier}`;
+      tierBadge.innerText = r.tier;
+
+      if (!viewer) return;
+      viewer.clear();
+
+      function makeXYZString(atomTypes, coords) {
+        let lines = [atomTypes.length, "PSI TS Prediction"];
+        for (let i = 0; i < atomTypes.length; i++) {
+          lines.push(`${atomTypes[i]} ${coords[i][0]} ${coords[i][1]} ${coords[i][2]}`);
+        }
+        return lines.join("\n");
+      }
+
+      const mTrue = viewer.addModel(makeXYZString(r.atom_types, r.coords_true), "xyz");
+      viewer.setStyle({model: mTrue.getID()}, {
+        stick: {color: '#10b981', radius: 0.12},
+        sphere: {color: '#10b981', radius: 0.3}
+      });
+
+      const mPred = viewer.addModel(makeXYZString(r.atom_types, r.coords_pred), "xyz");
+      viewer.setStyle({model: mPred.getID()}, {
+        stick: {color: '#3b82f6', radius: 0.08},
+        sphere: {color: '#3b82f6', radius: 0.22}
+      });
+
+      const mGuess = viewer.addModel(makeXYZString(r.atom_types, r.coords_guess), "xyz");
+      viewer.setStyle({model: mGuess.getID()}, {
+        stick: {color: '#f87171', radius: 0.05, opacity: 0.4},
+        sphere: {color: '#f87171', radius: 0.15, opacity: 0.4}
+      });
+
+      r.atom_types.forEach((type, idx) => {
+        viewer.addLabel(`${type}${idx}`, {
+          position: {x: r.coords_true[idx][0], y: r.coords_true[idx][1], z: r.coords_true[idx][2]},
+          backgroundColor: 'rgba(12,16,27,0.8)',
+          fontColor: '#cbd5e1',
+          fontSize: 10,
+          backgroundOpacity: 0.8,
+          borderThickness: 0,
+          alignment: 'center'
+        });
+      });
+
+      viewer.zoomTo();
+      viewer.render();
+    }
+
+
+    if (select.options.length > 0) {
+      updateViewer();
+    }
+
+    const tableBody = document.getElementById('worst-table-body');
+    for (let r of worst10) {
+      let tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="font-weight: 600; color: #ffffff;">${r.rxn_id}</td>
+        <td><span class="badge badge-${r.split}">${r.split.toUpperCase()}</span></td>
+        <td>${r.n_atoms}</td>
+        <td>${r.guess_MAE.toFixed(4)}</td>
+        <td style="color: #f87171; font-weight: 600;">${r.dist_MAE.toFixed(4)}</td>
+        <td>${r.Ea_true.toFixed(2)}</td>
+        <td>${r.Ea_pred.toFixed(2)}</td>
+        <td style="font-weight: 600;">${r.Ea_error.toFixed(2)}</td>
+      `;
+      tableBody.appendChild(tr);
+    }
+  </script>
+</body>
+</html>

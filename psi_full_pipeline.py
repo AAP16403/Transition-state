@@ -794,14 +794,17 @@ CONFIG = {
     "ea_warmup_epochs": 150,        # after this, Ea gradients can reach EGNN/backbone
     "ea_select_weight": 0.5,        # Ea contribution to checkpoint selection
     "ea_head_dropout": 0.15,        # dropout inside the Ea head MLP
-    "ea_head_lr": 3e-4,             # faster LR for the scalar Ea head
+    "ea_head_lr": 3e-4,             # faster LR for the Ea mean/variance head
     "ea_head_weight_decay": 1e-3,
+    "ea_uncertainty_enabled": True, # predict normalized Ea mean + log-variance
+    "ea_log_var_init": 0.0,         # initial sigma ~= 1 normalized Ea std
+    "ea_log_var_min": -5.0,         # lower clamp for Gaussian NLL stability
+    "ea_log_var_max": 4.0,          # upper clamp still allows very uncertain outliers
     "ea_detach_during_warmup": True,
     # --- Phase 2: optional high-Ea tail weighting ------------------------
-    # Disabled by default so Phase 1 warm-start runs remain isolated. When
-    # enabled, the Ea SmoothL1 loss is sample-weighted by raw Ea (kcal/mol)
-    # to reduce regression-to-mean on rare high-barrier reactions.
-    "ea_tail_weighting_enabled": True,
+    # Disabled by default with Gaussian NLL uncertainty: the learned variance
+    # now handles high-barrier outliers without multiplying their gradients.
+    "ea_tail_weighting_enabled": False,
     "ea_tail_weight_mode": "piecewise",
     "ea_tail_weight_bins": [80.0, 100.0, 120.0],
     "ea_tail_weight_values": [1.0, 1.5, 2.0, 2.5],
@@ -816,13 +819,15 @@ CONFIG = {
     "device": "cuda",
     "require_cuda": True,
     "amp": True,
-    "epochs": 1200,
+    "epochs": 800,
+    "swa_enabled": True,
+    "swa_start": 200,
     "print_every": 25,
     "val_split": 0.1,
     "split_seed": 42,
     "split_strategy": "stratified",
     "split_bins": 5,
-    "patience": 220,
+    "patience": 120,
     "spectator_threshold": 0.15,
     "spectator_tol": 0.05,
     "risk_penalty_mode": "margin",
@@ -832,7 +837,7 @@ CONFIG = {
     "risk_sigmoid_k": 1.25,
     "risk_weight_alpha": 0.5,
     "risk_weight_max": 3.0,
-    "risk_ea_loss_weight": 0.5,      # extra normalized-Ea loss on high-risk reaction classes
+    "risk_ea_loss_weight": 0.5,      # extra Ea objective weight on high-risk reaction classes
     "risk_geom_loss_weight": 0.2,    # extra geometry loss on active/formed/broken risky pairs
     "triangle_loss_weight": 0.05,
     "triangle_coarse_weight": 0.25,
@@ -842,7 +847,7 @@ CONFIG = {
     "fragment_bond_scale": 1.45,
     "hartree_to_kcal": 627.509,
     "skip_negative_ea": True,
-    "coord_noise": 0.05,
+    "coord_noise": 0.01,
 }
 
 def resolve_device(config):
@@ -1873,15 +1878,20 @@ class EaHead(nn.Module):
     attention-pool those per-atom features into a reactive-region descriptor,
     concatenate a masked mean descriptor for global context, append the signed
     reaction energy (z-scored de_rxn -- the Bell-Evans-Polanyi driver), and
-    regress a *normalized* Ea. The gradient flows back into the EGNN, so the
+    regress a *normalized* Ea mean plus optional log-variance. The gradient flows back into the EGNN, so the
     same message-passing that places the TS atoms also learns the
     structure->energy relationship ("learn physics using the EGNN").
 
-    Output is the normalized Ea; callers denormalize with ea_mean/ea_std.
+    Output is [normalized Ea mean, log-variance] when uncertainty is enabled,
+    otherwise a scalar normalized Ea for legacy checkpoints.
     """
-    def __init__(self, node_dim, hidden, energy_feat_dim=0, dropout=0.25):
+    def __init__(
+        self, node_dim, hidden, energy_feat_dim=0, dropout=0.25,
+        uncertainty_enabled=True, log_var_init=0.0,
+    ):
         super().__init__()
         self.energy_feat_dim = int(energy_feat_dim)
+        self.uncertainty_enabled = bool(uncertainty_enabled)
         self.attn = nn.Sequential(
             nn.Linear(node_dim, hidden // 2),
             nn.GELU(),
@@ -1889,9 +1899,12 @@ class EaHead(nn.Module):
         )
         # Input: attention-pooled + mean-pooled EGNN features + de_rxn + descriptors
         in_dim = 2 * node_dim + 1 + self.energy_feat_dim
-        final = nn.Linear(hidden // 2, 1)
+        out_dim = 2 if self.uncertainty_enabled else 1
+        final = nn.Linear(hidden // 2, out_dim)
         nn.init.xavier_uniform_(final.weight, gain=0.1)
         nn.init.zeros_(final.bias)
+        if self.uncertainty_enabled:
+            nn.init.constant_(final.bias[1], float(log_var_init))
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.GELU(),
@@ -1932,7 +1945,8 @@ class EaHead(nn.Module):
         elif energy_feats is not None and energy_feats.numel() > 0:
             raise ValueError("energy_feats were provided but this EaHead was built with energy_feat_dim=0")
         feat = torch.cat(parts, dim=-1)
-        return self.net(feat).squeeze(-1)                        # [B] normalized Ea
+        out = self.net(feat)
+        return out if self.uncertainty_enabled else out.squeeze(-1)
 
 
 class PSI(nn.Module):
@@ -1972,6 +1986,8 @@ class PSI(nn.Module):
                 hidden=config["egnn_hidden"],
                 energy_feat_dim=ENERGY_FEAT_DIM,
                 dropout=config.get("ea_head_dropout", drop),
+                uncertainty_enabled=config.get("ea_uncertainty_enabled", True),
+                log_var_init=config.get("ea_log_var_init", 0.0),
             )
 
     @staticmethod
@@ -1998,8 +2014,9 @@ class PSI(nn.Module):
         Returns:
             D_TS_pred:    [B, N, N] EGNN-refined TS distances (or coarse if EGNN off)
             D_TS_coarse:  [B, N, N] pre-EGNN coarse distances (for aux loss)
-            ea_pred_norm: [B] normalized Ea from the EaHead, or None if the head
-                          is absent (EGNN off) or de_rxn was not supplied.
+            ea_pred_norm: [B] normalized Ea or [B, 2] mean/log-variance from the
+                          EaHead, or None if the head is absent (EGNN off) or
+                          de_rxn was not supplied.
             detach_ea_features: stop Ea gradients at h_ts while still training
                           the Ea head. Used during Ea warm-start.
         """
@@ -2050,7 +2067,7 @@ class CosineAnnealingWarmup(torch.optim.lr_scheduler._LRScheduler):
 
 
 def build_optimizer(model, config):
-    """Use a faster, lighter-decayed optimizer group for the scalar Ea head."""
+    """Use a faster, lighter-decayed optimizer group for the Ea head."""
     ea_params = list(model.ea_head.parameters()) if hasattr(model, "ea_head") else []
     if not ea_params:
         return torch.optim.AdamW(
@@ -2101,6 +2118,95 @@ def weighted_mean(values, weights):
     return (values * weights).sum() / weights.sum().clamp(min=1.0)
 
 
+def split_ea_prediction(ea_pred, config):
+    """Return normalized Ea mean and optional clamped log-variance."""
+    if ea_pred is None:
+        return None, None
+    if ea_pred.dim() == 1:
+        return ea_pred, None
+    if ea_pred.size(-1) == 1:
+        return ea_pred.squeeze(-1), None
+    ea_mean_norm = ea_pred[..., 0]
+    ea_log_var = ea_pred[..., 1].clamp(
+        min=float(config.get("ea_log_var_min", -5.0)),
+        max=float(config.get("ea_log_var_max", 4.0)),
+    )
+    return ea_mean_norm, ea_log_var
+
+
+def gaussian_ea_nll(ea_mean_norm, ea_log_var, ea_target_norm):
+    """Gaussian NLL in normalized Ea units, without the constant term."""
+    residual2 = (ea_mean_norm.float() - ea_target_norm.float()).pow(2)
+    log_var = ea_log_var.float()
+    return 0.5 * (torch.exp(-log_var) * residual2 + log_var)
+
+
+def infer_ea_head_output_dim(state_dict):
+    weight = state_dict.get("ea_head.net.6.weight")
+    if isinstance(weight, torch.Tensor) and weight.dim() >= 1:
+        return int(weight.shape[0])
+    return None
+
+
+def adapt_ea_head_state_dict(state_dict, target_state, config):
+    """Copy a legacy scalar Ea head into the mean row of the uncertainty head."""
+    adapted = dict(state_dict)
+    migrated = False
+    w_key, b_key = "ea_head.net.6.weight", "ea_head.net.6.bias"
+    if w_key not in adapted or w_key not in target_state:
+        return adapted, migrated
+
+    old_w, new_w = adapted[w_key], target_state[w_key]
+    if tuple(old_w.shape) == tuple(new_w.shape):
+        return adapted, migrated
+
+    can_migrate_scalar_to_uncertainty = (
+        old_w.dim() == 2
+        and new_w.dim() == 2
+        and old_w.shape[0] == 1
+        and new_w.shape[0] == 2
+        and old_w.shape[1] == new_w.shape[1]
+        and config.get("ea_uncertainty_enabled", True)
+    )
+    if not can_migrate_scalar_to_uncertainty:
+        return adapted, migrated
+
+    merged_w = new_w.detach().clone()
+    merged_w[0].copy_(old_w[0].to(device=merged_w.device, dtype=merged_w.dtype))
+    adapted[w_key] = merged_w
+    if b_key in adapted and b_key in target_state:
+        old_b, new_b = adapted[b_key], target_state[b_key]
+        if old_b.numel() == 1 and new_b.numel() == 2:
+            merged_b = new_b.detach().clone()
+            merged_b[0].copy_(old_b[0].to(device=merged_b.device, dtype=merged_b.dtype))
+            merged_b[1].fill_(float(config.get("ea_log_var_init", 0.0)))
+            adapted[b_key] = merged_b
+    return adapted, True
+
+
+def load_checkpoint_model_state(model, checkpoint_state, config):
+    target_state = model.state_dict()
+    adapted_state, migrated = adapt_ea_head_state_dict(checkpoint_state, target_state, config)
+    try:
+        model.load_state_dict(adapted_state)
+        return {"exact": True, "migrated": migrated, "skipped": []}
+    except RuntimeError as exc:
+        compatible = {}
+        skipped = []
+        for key, value in adapted_state.items():
+            if key in target_state and tuple(value.shape) == tuple(target_state[key].shape):
+                compatible[key] = value
+            else:
+                skipped.append(key)
+        model.load_state_dict(compatible, strict=False)
+        return {
+            "exact": False,
+            "migrated": migrated,
+            "skipped": skipped,
+            "error": "\n".join(str(exc).splitlines()[:4]),
+        }
+
+
 def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True):
     """Joint geometry + Ea training loop.
 
@@ -2115,7 +2221,8 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         model.eval()
     total_loss, total_geom, total_triangle = 0.0, 0.0, 0.0
     total_ea_mae, total_ea_norm, total_ea_weighted_norm = 0.0, 0.0, 0.0
-    total_ea_tail_weight, n_batches = 0.0, 0
+    total_ea_nll, total_ea_weighted_nll = 0.0, 0.0
+    total_ea_tail_weight, total_ea_log_var, total_ea_sigma_norm, n_batches = 0.0, 0.0, 0.0, 0
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
     ea_started = epoch >= config.get("ea_loss_start_epoch", config["ea_warmup_epochs"] + 1)
     ea_joint = epoch > config["ea_warmup_epochs"]
@@ -2215,23 +2322,31 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                     l_risk_geom = (risk_geom_abs * risk_pair_weight).sum() / risk_pair_denom
                     loss = loss + config["risk_geom_loss_weight"] * l_risk_geom
 
-                # Learned Ea loss on the normalized target. During warm-start it
-                # trains the head on detached features; after warmup it becomes
-                # a joint EGNN/backbone objective.
+                # Learned Ea loss on the normalized target. With uncertainty
+                # enabled, Gaussian NLL lets high-residual samples reduce their
+                # precision instead of sending large gradients into the EGNN.
                 if ea_pred_norm is not None:
+                    ea_mean_norm, ea_log_var = split_ea_prediction(ea_pred_norm, config)
                     ea_target_norm = (Ea - ea_mean) / ea_std
-                    ea_abs = F.smooth_l1_loss(ea_pred_norm, ea_target_norm, reduction='none')
+                    ea_abs = F.smooth_l1_loss(ea_mean_norm, ea_target_norm, reduction='none')
+                    if ea_log_var is not None:
+                        ea_objective = gaussian_ea_nll(ea_mean_norm, ea_log_var, ea_target_norm)
+                    else:
+                        ea_objective = ea_abs
                     ea_tail_weight = ea_tail_sample_weights(Ea.float(), config)
                     l_ea = ea_abs.mean()
                     l_ea_weighted = weighted_mean(ea_abs, ea_tail_weight)
+                    l_ea_nll = ea_objective.mean()
+                    l_ea_weighted_nll = weighted_mean(ea_objective, ea_tail_weight)
                     if ea_w > 0.0:
-                        loss = loss + ea_w * l_ea_weighted
+                        loss = loss + ea_w * l_ea_weighted_nll
                         if ea_joint and risk_sample.sum() > 0:
                             risk_weight = risk_scale * risk_sample
-                            l_risk_ea = (ea_abs * risk_weight).sum() / risk_weight.sum().clamp(min=1.0)
+                            l_risk_ea = (ea_objective * risk_weight).sum() / risk_weight.sum().clamp(min=1.0)
                             loss = loss + config["risk_ea_loss_weight"] * l_risk_ea
                 else:
-                    l_ea = l_ea_weighted = ea_tail_weight = None
+                    l_ea = l_ea_weighted = l_ea_nll = l_ea_weighted_nll = ea_tail_weight = None
+                    ea_mean_norm = ea_log_var = ea_target_norm = None
             if is_train:
                 # Guard against a non-finite batch corrupting the weights: skip
                 # the step entirely rather than relying solely on GradScaler.
@@ -2249,9 +2364,14 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
             if l_ea is not None:
                 total_ea_norm += l_ea.item()
                 total_ea_weighted_norm += l_ea_weighted.item()
+                total_ea_nll += l_ea_nll.item()
+                total_ea_weighted_nll += l_ea_weighted_nll.item()
                 total_ea_tail_weight += ea_tail_weight.mean().item()
+                if ea_log_var is not None:
+                    total_ea_log_var += ea_log_var.detach().mean().item()
+                    total_ea_sigma_norm += torch.exp(0.5 * ea_log_var.detach()).mean().item()
                 # Denormalized Ea MAE (kcal/mol) for human-readable tracking.
-                total_ea_mae += (ea_pred_norm.detach() - ea_target_norm).abs().mean().item() * ea_std
+                total_ea_mae += (ea_mean_norm.detach() - ea_target_norm).abs().mean().item() * ea_std
             n_batches += 1
     nb = max(n_batches, 1)
     return {
@@ -2261,7 +2381,12 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         "ea_mae": total_ea_mae / nb,
         "ea_norm": total_ea_norm / nb,
         "ea_weighted_norm": total_ea_weighted_norm / nb,
+        "ea_nll": total_ea_nll / nb,
+        "ea_weighted_nll": total_ea_weighted_nll / nb,
         "ea_tail_weight": total_ea_tail_weight / nb,
+        "ea_log_var": total_ea_log_var / nb,
+        "ea_sigma_norm": total_ea_sigma_norm / nb,
+        "ea_sigma_kcal": (total_ea_sigma_norm / nb) * ea_std,
     }
 
 def train_pipeline(config):
@@ -2299,7 +2424,7 @@ def train_pipeline(config):
     if hasattr(model, "ea_head"):
         print(f"Learning rates: base={config['lr']:.2e}, ea_head={config['ea_head_lr']:.2e}")
     scheduler = CosineAnnealingWarmup(
-        optimizer, warmup_epochs=100, total_epochs=config["epochs"], min_lr=1e-6
+        optimizer, warmup_epochs=config["warmup_epochs"], total_epochs=config["epochs"], min_lr=1e-6
     )
     use_amp = config["amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -2309,6 +2434,10 @@ def train_pipeline(config):
         "aphys_std": stats["aphys_std"].tolist(),
         "ea_mean": stats["ea_mean"],
         "ea_std": stats["ea_std"],
+        "ea_uncertainty_enabled": bool(config.get("ea_uncertainty_enabled", True)),
+        "ea_head_output_dim": 2 if config.get("ea_uncertainty_enabled", True) else 1,
+        "ea_log_var_min": float(config.get("ea_log_var_min", -5.0)),
+        "ea_log_var_max": float(config.get("ea_log_var_max", 4.0)),
         "de_rxn_mean": stats["de_rxn_mean"],
         "de_rxn_std": stats["de_rxn_std"],
         "efeat_mean": stats["efeat_mean"].tolist(),
@@ -2324,6 +2453,11 @@ def train_pipeline(config):
         f"  Ea head starts at epoch {config['ea_loss_start_epoch']} on detached features; "
         f"full joint Ea starts after epoch {config['ea_warmup_epochs']}."
     )
+    if config.get("ea_uncertainty_enabled", True):
+        print(
+            f"  Ea uncertainty: Gaussian NLL with log_var clamp "
+            f"[{config['ea_log_var_min']}, {config['ea_log_var_max']}]."
+        )
     if config.get("ea_tail_weighting_enabled", False):
         print(
             f"  Phase 2 high-Ea weighting: {config['ea_tail_weight_mode']} "
@@ -2338,32 +2472,60 @@ def train_pipeline(config):
     best_model_path = os.path.join(config["save_dir"], "psi_best.pt")
     latest_model_path = os.path.join(config["save_dir"], "psi_latest.pt")
     start_epoch = 1
+    resumed_training_state = False
+    ckpt = None
 
     if os.path.exists(latest_model_path):
         print(f"Resuming from checkpoint {latest_model_path}...")
         ckpt = torch.load(latest_model_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        start_epoch = ckpt["epoch"] + 1
-        best_val_loss = ckpt["best_val_loss"]
-        patience_counter = ckpt["patience_counter"]
-        history = ckpt.get("history", [])
-        try:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        except (KeyError, ValueError) as exc:
-            print(f"Checkpoint model loaded, but optimizer/scheduler state was reset: {exc}")
-            best_val_loss = float('inf')
-            patience_counter = 0
-            scheduler.last_epoch = start_epoch - 1
-            lrs = scheduler.get_lr()
-            for group, lr in zip(optimizer.param_groups, lrs):
-                group["lr"] = lr
-            scheduler._last_lr = lrs
-        print(f"Resumed at epoch {start_epoch} (best val_select: {best_val_loss:.4f})")
+        load_info = load_checkpoint_model_state(model, ckpt["model_state_dict"], config)
+        old_ea_dim = infer_ea_head_output_dim(ckpt["model_state_dict"])
+        if load_info["migrated"]:
+            print(
+                "Loaded previous scalar Ea head into the new uncertainty head "
+                f"(old output dim={old_ea_dim}); optimizer/scheduler reset."
+            )
+        elif not load_info["exact"]:
+            print("Loaded compatible checkpoint weights, but reset optimizer/scheduler due to shape changes.")
+            if load_info.get("error"):
+                print(load_info["error"])
+            if load_info["skipped"]:
+                print(f"Skipped {len(load_info['skipped'])} incompatible tensors.")
+        else:
+            start_epoch = ckpt["epoch"] + 1
+            best_val_loss = ckpt["best_val_loss"]
+            patience_counter = ckpt["patience_counter"]
+            history = ckpt.get("history", [])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                resumed_training_state = True
+                print(f"Resumed at epoch {start_epoch} (best val_select: {best_val_loss:.4f})")
+            except (KeyError, ValueError) as exc:
+                start_epoch = 1
+                best_val_loss = float('inf')
+                patience_counter = 0
+                history = []
+                print(f"Checkpoint model loaded, but optimizer/scheduler state was reset: {exc}")
+
+    from torch.optim.swa_utils import AveragedModel, SWALR
+    swa_enabled = config.get("swa_enabled", False)
+    swa_start = config.get("swa_start", config.get("epochs", 800))
+    swa_model = AveragedModel(model) if swa_enabled else None
+    swa_scheduler = SWALR(optimizer, swa_lr=config.get("lr", 1.5e-4) * 0.1) if swa_enabled else None
+    if swa_enabled and resumed_training_state:
+        if "swa_model_state_dict" in ckpt:
+            swa_model.load_state_dict(ckpt["swa_model_state_dict"])
+        if "swa_scheduler_state_dict" in ckpt and swa_scheduler is not None:
+            swa_scheduler.load_state_dict(ckpt["swa_scheduler_state_dict"])
 
     for epoch in range(start_epoch, config["epochs"] + 1):
         train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
-        val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
+        if swa_enabled and epoch >= swa_start:
+            swa_model.update_parameters(model)
+            val_metrics = run_epoch(swa_model.module, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
+        else:
+            val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
         
         ea_active = epoch > config["ea_warmup_epochs"]
         if epoch == config["ea_warmup_epochs"] + 1:
@@ -2375,7 +2537,10 @@ def train_pipeline(config):
         if ea_active:
             val_select = val_select + config["ea_select_weight"] * val_metrics["ea_norm"]
 
-        scheduler.step()
+        if swa_enabled and epoch >= swa_start:
+            swa_scheduler.step()
+        else:
+            scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         current_ea_lr = optimizer.param_groups[-1]['lr']
 
@@ -2391,21 +2556,30 @@ def train_pipeline(config):
             "train_ea_mae": train_metrics["ea_mae"],
             "train_ea_norm": train_metrics["ea_norm"],
             "train_ea_weighted_norm": train_metrics["ea_weighted_norm"],
+            "train_ea_nll": train_metrics["ea_nll"],
+            "train_ea_weighted_nll": train_metrics["ea_weighted_nll"],
             "train_ea_tail_weight": train_metrics["ea_tail_weight"],
+            "train_ea_log_var": train_metrics["ea_log_var"],
+            "train_ea_sigma_kcal": train_metrics["ea_sigma_kcal"],
             "val_ea_mae": val_metrics["ea_mae"],
             "val_ea_norm": val_metrics["ea_norm"],
             "val_ea_weighted_norm": val_metrics["ea_weighted_norm"],
+            "val_ea_nll": val_metrics["ea_nll"],
+            "val_ea_weighted_nll": val_metrics["ea_weighted_nll"],
             "val_ea_tail_weight": val_metrics["ea_tail_weight"],
+            "val_ea_log_var": val_metrics["ea_log_var"],
+            "val_ea_sigma_kcal": val_metrics["ea_sigma_kcal"],
             "lr": current_lr,
             "ea_lr": current_ea_lr,
         })
         improved = val_select < best_val_loss
         if improved:
             best_val_loss = val_select
-            torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, best_model_path)
+            best_state_dict = swa_model.module.state_dict() if (swa_enabled and epoch >= swa_start) else model.state_dict()
+            torch.save({"model_state_dict": best_state_dict, "metadata": metadata}, best_model_path)
         patience_counter = 0 if improved else patience_counter + 1
 
-        torch.save({
+        save_dict = {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
@@ -2414,7 +2588,13 @@ def train_pipeline(config):
             "patience_counter": patience_counter,
             "metadata": metadata,
             "history": history
-        }, latest_model_path)
+        }
+        if swa_enabled and swa_model is not None:
+            save_dict["swa_model_state_dict"] = swa_model.state_dict()
+            if swa_scheduler is not None:
+                save_dict["swa_scheduler_state_dict"] = swa_scheduler.state_dict()
+        torch.save(save_dict, latest_model_path)
+
         if epoch % config["print_every"] == 0 or epoch == 1 or improved:
             marker = " *" if improved else ""
             print(f"{epoch:6d} | {train_metrics['loss']:11.4f} | {val_metrics['loss']:11.4f} | "
@@ -2439,6 +2619,7 @@ def train_pipeline(config):
     # Step 1: collect predicted TS distance matrices + learned Ea for all reactions.
     pred_dists_map = {}   # rxn_id -> (n, n) numpy pred dist
     ea_neural_map = {}    # rxn_id -> learned Ea (kcal/mol, denormalized)
+    ea_sigma_map = {}     # rxn_id -> learned predictive sigma (kcal/mol)
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
     geom_results = []
     val_rxn_ids = {samples[vi]["rxn_id"] for vi in val_indices}
@@ -2452,8 +2633,12 @@ def train_pipeline(config):
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 p_DTS, _, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats)
             ea_pred_kcal = None
+            ea_sigma_kcal = None
             if ea_pred_norm is not None:
-                ea_pred_kcal = (ea_pred_norm.float().cpu().numpy() * ea_std + ea_mean)
+                ea_mean_norm, ea_log_var = split_ea_prediction(ea_pred_norm, config)
+                ea_pred_kcal = (ea_mean_norm.float().cpu().numpy() * ea_std + ea_mean)
+                if ea_log_var is not None:
+                    ea_sigma_kcal = torch.exp(0.5 * ea_log_var.float()).cpu().numpy() * ea_std
             for i in range(len(batch["rxn_id"])):
                 rxn_id = batch["rxn_id"][i]
                 n = int(mask[i].sum().item())
@@ -2468,6 +2653,8 @@ def train_pipeline(config):
                 pred_dists_map[rxn_id] = dp
                 if ea_pred_kcal is not None:
                     ea_neural_map[rxn_id] = float(ea_pred_kcal[i])
+                if ea_sigma_kcal is not None:
+                    ea_sigma_map[rxn_id] = float(ea_sigma_kcal[i])
                 geom_results.append({
                     "rxn_id": rxn_id, "split": split, "n_atoms": n,
                     "dist_MAE": d_mae, "dist_MAE_all": d_mae_all,
@@ -2524,10 +2711,12 @@ def train_pipeline(config):
         ea_physics = ea_calculator.predict_single(c_R, c_TS_pred, c_P, s["atom_types"], n, de_rxn)
         # Learned head (falls back to physics if EGNN/head disabled).
         ea_pred = ea_neural_map.get(rxn_id, ea_physics)
+        ea_sigma = ea_sigma_map.get(rxn_id)
         results.append({
             **gr,
             "Ea_true": ea_true, "Ea_pred": ea_pred,
             "Ea_error": abs(ea_pred - ea_true),
+            "Ea_sigma_kcal": ea_sigma,
             "Ea_pred_physics": ea_physics,
             "Ea_error_physics": abs(ea_physics - ea_true),
         })
@@ -2546,8 +2735,11 @@ def train_pipeline(config):
         mae_neural = float(np.mean([r["Ea_error"] for r in res_list]))
         r2_phys = _r2(ea_trues, ea_phys)
         mae_phys = float(np.mean([r["Ea_error_physics"] for r in res_list]))
+        sigmas = [r.get("Ea_sigma_kcal") for r in res_list if r.get("Ea_sigma_kcal") is not None]
         print(f"\n{name} ({len(res_list)} reactions):")
         print(f"  Ea MAE (neural):   {mae_neural:8.2f} kcal/mol   |  R²: {r2:7.4f}   r: {corr:7.4f}")
+        if sigmas:
+            print(f"  Ea sigma (mean):   {float(np.mean(sigmas)):8.2f} kcal/mol   |  learned uncertainty")
         print(f"  Ea MAE (physics):  {mae_phys:8.2f} kcal/mol   |  R²: {r2_phys:7.4f}   (baseline)")
         print(f"  Dist MAE:          {np.mean(d_maes):8.4f} Å      |  std: {np.std(d_maes):.4f} Å")
     print_stats("TRAIN SET", train_results)
@@ -2633,7 +2825,11 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         r_types, n, c_R_aligned, c_P, e_r, e_p, config["fragment_bond_scale"]
     )
     energy_feats_norm = (energy_feats - efeat_mean) / efeat_std
-    model = PSI(config, num_atom_types).to(device)
+    model_config = dict(config)
+    checkpoint_ea_dim = infer_ea_head_output_dim(state_dict)
+    if checkpoint_ea_dim is not None:
+        model_config["ea_uncertainty_enabled"] = checkpoint_ea_dim == 2
+    model = PSI(model_config, num_atom_types).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     with torch.no_grad():
@@ -2648,8 +2844,12 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         p_DTS, _, ea_pred_norm = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_aphys, t_de_rxn, t_efeats)
     # Learned Ea (denormalized); None if the checkpoint predates the head.
     ea_neural = None
+    ea_sigma_kcal = None
     if ea_pred_norm is not None and ea_mean is not None and ea_std is not None:
-        ea_neural = float(ea_pred_norm.float().cpu().item() * ea_std + ea_mean)
+        ea_mean_norm, ea_log_var = split_ea_prediction(ea_pred_norm, model_config)
+        ea_neural = float(ea_mean_norm.float().cpu().item() * ea_std + ea_mean)
+        if ea_log_var is not None:
+            ea_sigma_kcal = float(torch.exp(0.5 * ea_log_var.float()).cpu().item() * ea_std)
     pred_dist = p_DTS[0, :n, :n].cpu().numpy()
     pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
     np.fill_diagonal(pred_dist, 0.0)
@@ -2693,6 +2893,7 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         "atom_types": r_types,
         "Ea_pred": energy_pred,
         "Ea_pred_physics": ea_physics,
+        "Ea_sigma_kcal": ea_sigma_kcal,
         "Ea_source": ea_source,
         "D_I": D_I[:n, :n].tolist(),
         "D_pred": pred_dist.tolist(),
@@ -2710,6 +2911,8 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
     print("="*70)
     print(f"Atoms: {n}")
     print(f"Predicted activation energy ({ea_source}): {energy_pred:.4f} kcal/mol")
+    if ea_sigma_kcal is not None:
+        print(f"  Learned Ea sigma: {ea_sigma_kcal:.4f} kcal/mol")
     if ea_physics is not None:
         print(f"  Physics baseline: {ea_physics:.4f} kcal/mol")
     else:
@@ -3523,13 +3726,19 @@ if __name__ == "__main__":
     train_parser.add_argument("--patience", type=int, default=CONFIG["patience"], help="Early stopping patience")
     train_parser.add_argument("--lr", type=float, default=CONFIG["lr"], help="Learning rate")
     train_parser.add_argument("--ea-head-lr", type=float, default=CONFIG["ea_head_lr"], help="Learning rate for the Ea head")
-    train_parser.add_argument("--ea-loss-weight", type=float, default=CONFIG["ea_loss_weight"], help="Full joint normalized-Ea loss weight")
+    train_parser.add_argument("--ea-loss-weight", type=float, default=CONFIG["ea_loss_weight"], help="Full joint Ea objective weight")
     train_parser.add_argument("--ea-warmup-loss-weight", type=float, default=CONFIG["ea_warmup_loss_weight"], help="Detached-feature Ea loss weight before joint warmup ends")
     train_parser.add_argument("--ea-loss-start-epoch", type=int, default=CONFIG["ea_loss_start_epoch"], help="First epoch that trains the Ea head")
     train_parser.add_argument("--ea-warmup-epochs", type=int, default=CONFIG["ea_warmup_epochs"], help="Epochs before Ea gradients can reach EGNN/backbone")
     train_parser.add_argument("--ea-select-weight", type=float, default=CONFIG["ea_select_weight"], help="Ea contribution to validation checkpoint selection")
     train_parser.add_argument("--ea-head-dropout", type=float, default=CONFIG["ea_head_dropout"], help="Dropout inside the Ea head MLP")
+    train_parser.add_argument("--no-ea-uncertainty", action="store_true", help="Use legacy scalar SmoothL1 Ea regression instead of Gaussian NLL uncertainty")
+    train_parser.add_argument("--ea-log-var-min", type=float, default=CONFIG["ea_log_var_min"], help="Minimum clamped Ea log-variance for Gaussian NLL")
+    train_parser.add_argument("--ea-log-var-max", type=float, default=CONFIG["ea_log_var_max"], help="Maximum clamped Ea log-variance for Gaussian NLL")
+    train_parser.add_argument("--ea-tail-weighting", action="store_true", help="Re-enable legacy high-Ea sample weighting on the Ea objective")
     train_parser.add_argument("--no-ea-detach-warmup", action="store_true", help="Allow Ea warmup gradients to reach EGNN/backbone")
+    train_parser.add_argument("--swa-start", type=int, default=CONFIG["swa_start"], help="Epoch to start SWA")
+    train_parser.add_argument("--no-swa", action="store_true", help="Disable SWA")
     train_parser.add_argument("--save-dir", default=CONFIG["save_dir"], help="Directory to save checkpoints (e.g. runs/phase1_warm_start)")
     predict_parser = subparsers.add_parser("predict", help="Predict a transition state from reactant/product logs")
     predict_parser.add_argument("--reactant", "-r", required=True, help="Path to reactant .log file")
@@ -3578,6 +3787,12 @@ if __name__ == "__main__":
             CONFIG["ea_warmup_epochs"] = args.ea_warmup_epochs
             CONFIG["ea_select_weight"] = args.ea_select_weight
             CONFIG["ea_head_dropout"] = args.ea_head_dropout
+            CONFIG["ea_uncertainty_enabled"] = not args.no_ea_uncertainty
+            CONFIG["ea_log_var_min"] = args.ea_log_var_min
+            CONFIG["ea_log_var_max"] = args.ea_log_var_max
+            CONFIG["ea_tail_weighting_enabled"] = args.ea_tail_weighting
             CONFIG["ea_detach_during_warmup"] = not args.no_ea_detach_warmup
+            CONFIG["swa_start"] = args.swa_start
+            CONFIG["swa_enabled"] = not args.no_swa
             CONFIG["save_dir"] = args.save_dir
         train_pipeline(CONFIG)
