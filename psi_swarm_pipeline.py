@@ -4,6 +4,8 @@ import math
 import pickle
 import tarfile
 import argparse
+import h5py
+import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
@@ -481,17 +483,6 @@ def mds_aligned(D, reference_coords=None, dim=3):
 
 STERIC_FLOOR_FRAC = 0.75
 
-def covalent_radius_lookup(device=None):
-    """Covalent radius per atom-vocab id, as a tensor for the training loss.
-
-    Index matches build_atom_vocab()'s id assignment (sorted ATOMIC_NUMBER keys,
-    ids 1..V; id 0 = padding). Lets the loss compute a per-pair steric floor
-    from batched atom_ids without carrying atom-type strings onto the GPU.
-    """
-    sorted_atoms = sorted(ATOMIC_NUMBER.keys())
-    radii = [0.0] + [COVALENT_RADII.get(a, 0.76) for a in sorted_atoms]
-    return torch.tensor(radii, dtype=torch.float32, device=device)
-
 def clamp_steric_collisions(pred_dist, atom_types, floor_frac=STERIC_FLOOR_FRAC):
     n = len(atom_types)
     for i in range(n):
@@ -774,6 +765,14 @@ CONFIG = {
     "extraction_limit": 1000000,
     "target_reactions": 40000,      # RGD1 subset: ~2.5x the old b97d3 set, fast to build/train
     "force_extract": False,
+    # --- Built-sample cache ------------------------------------------------
+    # build_reaction_samples() does heavy per-reaction feature engineering
+    # (Kabsch alignment, fragment detection, risk features). Cache the built
+    # samples to disk so subsequent runs skip the rebuild. Invalidated
+    # automatically when any feature-affecting param below changes, or with
+    # --force-extract.
+    "sample_cache_enabled": True,
+    "sample_cache_path": None,      # None -> auto: <save_dir>/samples_cache_rgd1.pkl
     "max_atoms": 30,
     "n_gaussians": 32,
     "gauss_start": 0.4,
@@ -806,16 +805,19 @@ CONFIG = {
     "ea_loss_start_epoch": 1,       # train Ea head from the first epoch
     "ea_warmup_loss_weight": 1.0,   # detached-feature Ea weight before joint mode
     "ea_warmup_epochs": 0,          # 0 = Ea head and TS geometry co-train jointly from epoch 1
-                                    # (safe because ea_uncertainty is off / SmoothL1, no NLL collapse)
+                                    # (full Ea weight + Ea in checkpoint selection immediately).
+                                    # Safe here because ea_uncertainty is off (no NLL collapse).
     "ea_select_weight": 0.5,        # Ea contribution to checkpoint selection
     "ea_head_dropout": 0.15,        # dropout inside the Ea head MLP
     "ea_head_lr": 3e-4,             # faster LR for the Ea mean/variance head
     "ea_head_weight_decay": 1e-3,
-    "ea_uncertainty_enabled": False, # SmoothL1 regression (co-train-safe; no hyper-confidence collapse)
+    "ea_uncertainty_enabled": False, # predict normalized Ea mean + log-variance
     "ea_log_var_init": 0.0,         # initial sigma ~= 1 normalized Ea std
-    "ea_log_var_min": -1.5,         # lower clamp for Gaussian NLL stability (if re-enabled)
+    "ea_log_var_min": -1.5,         # lower clamp for Gaussian NLL stability
     "ea_log_var_max": 4.0,          # upper clamp still allows very uncertain outliers
-    "ea_detach_during_warmup": False,
+    "ea_detach_during_warmup": False,  # off: variance floor already tames NLL collapse; keep the
+                                        # structure->energy gradient flowing. Rip-cord: --ea-detach-warmup
+                                        # if the MoE swarm destabilizes during warmup.
     # --- Phase 2: optional high-Ea tail weighting ------------------------
     # Disabled by default with Gaussian NLL uncertainty: the learned variance
     # now handles high-barrier outliers without multiplying their gradients.
@@ -854,8 +856,6 @@ CONFIG = {
     "risk_weight_max": 3.0,
     "risk_ea_loss_weight": 0.5,      # extra Ea objective weight on high-risk reaction classes
     "risk_geom_loss_weight": 0.2,    # extra geometry loss on active/formed/broken risky pairs
-    "steric_loss_weight": 1.0,       # weight on the steric-floor soft penalty in the loss
-    "data_dir": None,                # RGD1 data dir; None -> default local path (see loader)
     "triangle_loss_weight": 0.05,
     "triangle_coarse_weight": 0.25,
     "triangle_refined_weight": 1.0,
@@ -865,6 +865,24 @@ CONFIG = {
     "hartree_to_kcal": 627.509,
     "skip_negative_ea": True,
     "coord_noise": 0.01,
+    # --- Fix 1: Active-atom gradient masking (Section 6 of Failure Analysis) ---
+    # Downweight spectator-to-spectator distances to reduce gradient pollution.
+    "active_masking_enabled": True,
+    "spectator_spectator_weight": 0.1,  # 10% gradient on static backbone pairs
+    # --- Fix 2: Hinge cross-distance boost (Section 5 of Failure Analysis) ----
+    # Upweight active-to-spectator cross-distances to preserve global rotation.
+    "hinge_boost_enabled": True,
+    "hinge_cross_weight": 3.0,          # 3x gradient on active-spectator pairs
+    # --- Fix 3: Error-tail oversampling (Section 4.2 of Failure Analysis) -----
+    # Physically oversample high-barrier reactions via WeightedRandomSampler.
+    "tail_oversampling_enabled": False,  # off: with the larger RGD1 pool the natural
+                                         # high-barrier frequency is enough; oversampling
+                                         # was a small-data crutch that distorts the train
+                                         # distribution.
+    "tail_oversample_threshold": 100.0,  # Ea above this gets oversampled
+    "tail_oversample_factor": 5.0,       # sample weight multiplier for tail
+    "tail_mid_threshold": 80.0,          # moderate boost zone starts here
+    "tail_mid_factor": 2.0,              # sample weight multiplier for mid tail
 }
 
 def resolve_device(config):
@@ -983,7 +1001,7 @@ def _build_reaction_samples_from_h5(config):
     import h5py
     import pandas as pd
 
-    DATA_DIR = config.get("data_dir") or "d:/Transition state/RGD1_Dataset"
+    DATA_DIR = "d:/Transition state/RGD1_Dataset"
     h5_path = os.path.join(DATA_DIR, "RGD1_CHNO.h5")
     csv_path = os.path.join(DATA_DIR, "DFT_reaction_info.csv")
     
@@ -2025,15 +2043,16 @@ class EaHead(nn.Module):
         return out if self.uncertainty_enabled else out.squeeze(-1)
 
 
-class PSI(nn.Module):
-    """Geometry + learned-Ea TS predictor.
+class ExpertCrossTalk(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        
+    def forward(self, expert_features):
+        consensus_feats, attn_weights = self.attention(expert_features, expert_features, expert_features)
+        return consensus_feats + expert_features, attn_weights
 
-    The model predicts a transition-state distance matrix and refines it to 3D
-    coordinates via an EGNN.  Activation energy is regressed by a small EaHead
-    on the EGNN's refined node features (trained jointly after a warmup). The
-    physics-based PhysicsEaCalculator (Marcus + Bell-Evans-Polanyi + Hammond) is
-    retained separately as a baseline for comparison, not used inside the model.
-    """
+class PSI(nn.Module):
     def __init__(self, config, num_atom_types):
         super().__init__()
         self.coord_noise = config.get("coord_noise", 0.005)
@@ -2043,33 +2062,54 @@ class PSI(nn.Module):
         delta_clamp = config["delta_clamp"]
         self.core = PSICore(config, num_atom_types)
         self.geom_head = GeometryHead(d_model, atom_dim, ATOM_PHYS_DIM, drop, delta_clamp)
-        # EGNN coordinate refiner. Node features = chemical-property vector
-        # (learned atom embedding + physical descriptors); coordinates come from
-        # the MDS embedding of the geometry head's predicted TS distance matrix.
         self.egnn_enabled = config.get("egnn_enabled", True)
+        
         if self.egnn_enabled:
+            self.num_experts = int(config.get("num_experts", 5))
+            self.top_k = int(config.get("top_k", 2))
+            if self.num_experts < 1:
+                raise ValueError("num_experts must be at least 1")
+            if not 1 <= self.top_k <= self.num_experts:
+                raise ValueError("top_k must be between 1 and num_experts")
+            self.egnn_hidden = config["egnn_hidden"]
+            self.ea_out_dim = 2 if config.get("ea_uncertainty_enabled", True) else 1
             node_in_dim = atom_dim + ATOM_PHYS_DIM
-            self.egnn = EGNN(
-                node_in_dim,
-                hidden=config["egnn_hidden"],
-                n_layers=config["egnn_layers"],
-                coord_clamp=config["egnn_coord_clamp"],
-                dropout=drop,
+            
+            # Routers consume the backbone's reaction-aware representation
+            # (pooled f), not just mean atomic composition, so experts can
+            # specialize by reaction mechanism. The energy router additionally
+            # sees the explicit reaction energetics.
+            router_hidden = max(64, self.num_experts * 8)
+            self.geom_router = nn.Sequential(
+                nn.Linear(d_model, router_hidden), nn.GELU(),
+                nn.Linear(router_hidden, self.num_experts),
             )
-            # Learned Ea head on the EGNN's refined per-atom features (h_ts)
-            # plus 28D energy descriptor (composition, bond-angle stats, RC angles).
-            self.ea_head = EaHead(
-                node_dim=config["egnn_hidden"],
-                hidden=config["egnn_hidden"],
-                energy_feat_dim=ENERGY_FEAT_DIM,
-                dropout=config.get("ea_head_dropout", drop),
-                uncertainty_enabled=config.get("ea_uncertainty_enabled", True),
-                log_var_init=config.get("ea_log_var_init", 0.0),
+            self.energy_router = nn.Sequential(
+                nn.Linear(d_model + ENERGY_FEAT_DIM + 1, router_hidden), nn.GELU(),
+                nn.Linear(router_hidden, self.num_experts),
             )
+            
+            self.egnn_swarm = nn.ModuleList([
+                EGNN(node_in_dim, hidden=config["egnn_hidden"], n_layers=config["egnn_layers"], coord_clamp=config["egnn_coord_clamp"], dropout=drop)
+                for _ in range(self.num_experts)
+            ])
+            self.ea_swarm = nn.ModuleList([
+                EaHead(node_dim=config["egnn_hidden"], hidden=config["egnn_hidden"], energy_feat_dim=ENERGY_FEAT_DIM, dropout=config.get("ea_head_dropout", drop), uncertainty_enabled=config.get("ea_uncertainty_enabled", True), log_var_init=config.get("ea_log_var_init", 0.0))
+                for _ in range(self.num_experts)
+            ])
+            self.energy_expert_adapters = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(config["egnn_hidden"]),
+                    nn.Linear(config["egnn_hidden"], config["egnn_hidden"]),
+                    nn.GELU(),
+                    nn.Linear(config["egnn_hidden"], config["egnn_hidden"]),
+                )
+                for _ in range(self.num_experts)
+            ])
+            self.cross_talk = ExpertCrossTalk(config["egnn_hidden"])
 
     @staticmethod
     def _coords_to_distance(x, mask):
-        """Masked pairwise Euclidean distance matrix from coordinates."""
         N = x.shape[1]
         diff = x.unsqueeze(2) - x.unsqueeze(1)
         dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)
@@ -2077,61 +2117,127 @@ class PSI(nn.Module):
         valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         return dist * (1.0 - eye) * valid
 
-    def forward(
-        self, D_R, D_I, D_P, mask, atom_ids, atom_phys,
-        de_rxn=None, energy_feats=None, detach_ea_features=False,
-    ):
-        """Predict TS distance matrix and (optionally) the learned Ea.
-
-        Args:
-            de_rxn: [B] z-scored signed reaction energy, fed to the Ea head.
-                    May be None at geometry-only call sites; Ea is then None.
-            energy_feats: [B, 28] z-scored molecular descriptor vector
-                    (composition, bond-angle stats) for the Ea head.
-        Returns:
-            D_TS_pred:    [B, N, N] EGNN-refined TS distances (or coarse if EGNN off)
-            D_TS_coarse:  [B, N, N] pre-EGNN coarse distances (for aux loss)
-            ea_pred_norm: [B] normalized Ea or [B, 2] mean/log-variance from the
-                          EaHead, or None if the head is absent (EGNN off) or
-                          de_rxn was not supplied.
-            detach_ea_features: stop Ea gradients at h_ts while still training
-                          the Ea head. Used during Ea warm-start.
-        """
+    def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys, de_rxn=None, energy_feats=None, detach_ea_features=False):
         f = self.core(D_R, D_I, D_P, mask, atom_ids, atom_phys)
         atom_emb = self.core.atom_embed(atom_ids)
-        # Coarse TS distance matrix from the geometry head.
         D_TS_coarse = self.geom_head(f, atom_emb, atom_phys, D_R, D_I, D_P, mask)
+        
         ea_pred_norm = None
+        aux_outputs = None
+        
         if self.egnn_enabled:
-            # Chemical properties in one vector; predicted TS coordinates in the
-            # other -- both fed to the EGNN. The MDS seed is detached so the
-            # geometry head is trained directly by the coarse-distance aux loss
-            # (keeping eigh's unstable backward out of the graph) while the EGNN
-            # learns the coordinate refinement under the main geometry loss.
+            B, N = atom_ids.shape
             node_feats = torch.cat([atom_emb, atom_phys], dim=-1)
-            # Coordinate-space MDS is numerically delicate (eigh) and runs on
-            # CPU for speed; only the eigh needs fp32/fp64.  The EGNN itself
-            # stays under the outer AMP context for full GPU throughput.
+            
             with torch.amp.autocast(device_type=D_R.device.type, enabled=False):
                 x_init = torch_mds_coords(D_TS_coarse.detach().float(), mask)
                 
-            # --- Coordinate Noise Data Augmentation ---
-            # Prevents late-stage EGNN geometry memorization (train-val gap)
             if self.training and self.coord_noise > 0.0:
                 noise = torch.randn_like(x_init) * self.coord_noise
                 x_init = x_init + (noise * mask.unsqueeze(-1))
                 
-            # h_ts is NOT detached: the Ea loss backpropagates through the
-            # EGNN, so message passing learns the structure->energy relation.
-            h_ts, x_ts = self.egnn(node_feats, x_init, mask)
-            D_TS_pred = self._coords_to_distance(x_ts, mask)
+            # Reaction-aware routing signal: pool the backbone features f, which
+            # encode R/P/TS geometry through the transformer core (not just the
+            # static per-atom composition that node_feats carries).
+            pooled_f = (f * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True)
+
+            # GEOMETRY SWARM
+            geom_logits = self.geom_router(pooled_f)
+            geom_weights, geom_indices = torch.topk(torch.softmax(geom_logits, dim=-1), self.top_k, dim=-1)
+            geom_weights = geom_weights / geom_weights.sum(dim=-1, keepdim=True)
+            
+            final_coords = torch.zeros_like(x_init)
+            consensus_h_ts = torch.zeros(B, N, self.egnn_hidden, device=x_init.device)
+            
+            # VECTORIZED GEOMETRY ROUTING
+            for expert_idx in range(self.num_experts):
+                expert_mask = (geom_indices == expert_idx)
+                batch_idx, k_idx = torch.where(expert_mask)
+                if len(batch_idx) == 0:
+                    continue
+                nf_sub = node_feats[batch_idx]
+                x_sub = x_init[batch_idx]
+                m_sub = mask[batch_idx]
+                w_sub = geom_weights[batch_idx, k_idx].view(-1, 1, 1)
+                
+                h_k, x_k = self.egnn_swarm[expert_idx](nf_sub, x_sub, m_sub)
+                
+                final_coords[batch_idx] += x_k * w_sub
+                consensus_h_ts[batch_idx] += h_k * w_sub
+            
+            D_TS_pred = self._coords_to_distance(final_coords, mask)
+            
+            # ENERGY SWARM & CROSS-TALK
             if de_rxn is not None:
-                h_ea = h_ts.detach() if detach_ea_features else h_ts
+                h_ea = consensus_h_ts.detach() if detach_ea_features else consensus_h_ts
                 ef = energy_feats.float() if energy_feats is not None else None
-                ea_pred_norm = self.ea_head(h_ea, mask, de_rxn.float(), ef)
+
+                # Energy router sees the reaction representation (pooled f) plus
+                # the explicit reaction energetics: the 28-d energy_feats and the
+                # signed reaction energy de_rxn.
+                ef_for_router = ef if ef is not None else pooled_f.new_zeros(B, ENERGY_FEAT_DIM)
+                energy_router_in = torch.cat([
+                    pooled_f,
+                    ef_for_router.to(pooled_f.dtype),
+                    de_rxn.view(B, 1).to(pooled_f.dtype),
+                ], dim=-1)
+                energy_logits = self.energy_router(energy_router_in)
+                energy_weights, energy_indices = torch.topk(torch.softmax(energy_logits, dim=-1), self.top_k, dim=-1)
+                energy_weights = energy_weights / energy_weights.sum(dim=-1, keepdim=True)
+                
+                # Cross-talk requires pooling h_ea to [B, H] to form expert representations
+                pooled_h_ea = (h_ea * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True)
+                gathered_feats = pooled_h_ea.new_zeros(B, self.top_k, self.egnn_hidden)
+                
+                # VECTORIZED ADAPTER ROUTING
+                for expert_idx in range(self.num_experts):
+                    expert_mask = (energy_indices == expert_idx)
+                    batch_idx, k_idx = torch.where(expert_mask)
+                    if len(batch_idx) == 0:
+                        continue
+                    base = pooled_h_ea[batch_idx]
+                    gathered_feats[batch_idx, k_idx, :] = base + self.energy_expert_adapters[expert_idx](base)
+                consensus_feats, cross_talk_attn = self.cross_talk(gathered_feats)
+                
+                # Expand consensus feats back to sequence length for EaHead attention pooling
+                # We simply add the consensus shift back to the original h_ea sequence
+                final_ea_pred = torch.zeros(B, self.ea_out_dim, device=x_init.device)
+                
+                # VECTORIZED ENERGY EXPERT ROUTING
+                for expert_idx in range(self.num_experts):
+                    expert_mask = (energy_indices == expert_idx)
+                    batch_idx, k_idx = torch.where(expert_mask)
+                    if len(batch_idx) == 0:
+                        continue
+                    
+                    w_sub = energy_weights[batch_idx, k_idx].unsqueeze(-1)
+                    shift_sub = consensus_feats[batch_idx, k_idx] - pooled_h_ea[batch_idx]
+                    expert_h_ea_sub = h_ea[batch_idx] + shift_sub.unsqueeze(1)
+                    
+                    m_sub = mask[batch_idx]
+                    de_rxn_sub = de_rxn[batch_idx].float()
+                    ef_sub = ef[batch_idx] if ef is not None else None
+                    
+                    ea_pred_k = self.ea_swarm[expert_idx](expert_h_ea_sub, m_sub, de_rxn_sub, ef_sub)
+                    if ea_pred_k.dim() == 1:
+                        ea_pred_k = ea_pred_k.unsqueeze(-1)
+                    final_ea_pred[batch_idx] += ea_pred_k * w_sub
+                        
+                ea_pred_norm = final_ea_pred.squeeze(-1) if self.ea_out_dim == 1 else final_ea_pred
+                
+                aux_outputs = {
+                    "geom_logits": geom_logits,
+                    "energy_logits": energy_logits,
+                    "geom_indices": geom_indices.detach(),
+                    "energy_indices": energy_indices.detach(),
+                    "geom_weights": geom_weights.detach(),
+                    "energy_weights": energy_weights.detach(),
+                    "cross_talk_attn": cross_talk_attn.detach(),
+                }
         else:
             D_TS_pred = D_TS_coarse
-        return D_TS_pred, D_TS_coarse, ea_pred_norm
+            
+        return D_TS_pred, D_TS_coarse, ea_pred_norm, aux_outputs
 
 class PlateauWarmupScheduler:
     def __init__(self, optimizer, warmup_epochs, factor=0.5, patience=20, min_lr=1e-6):
@@ -2163,8 +2269,8 @@ class PlateauWarmupScheduler:
 
 
 def build_optimizer(model, config):
-    """Use a faster, lighter-decayed optimizer group for the Ea head."""
-    ea_params = list(model.ea_head.parameters()) if hasattr(model, "ea_head") else []
+    """Use a faster, lighter-decayed optimizer group for the Ea head swarm."""
+    ea_params = list(model.ea_swarm.parameters()) if hasattr(model, "ea_swarm") else []
     if not ea_params:
         return torch.optim.AdamW(
             model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
@@ -2323,7 +2429,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     ea_started = epoch >= config.get("ea_loss_start_epoch", config["ea_warmup_epochs"] + 1)
     ea_joint = epoch > config["ea_warmup_epochs"]
     detach_ea_features = (
-        config.get("ea_detach_during_warmup", True)
+        config.get("ea_detach_during_warmup", False)
         and ea_started
         and not ea_joint
     )
@@ -2344,7 +2450,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_DTS_coarse, ea_pred_norm = model(
+                p_DTS, p_DTS_coarse, ea_pred_norm, aux_outputs = model(
                     DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats,
                     detach_ea_features=detach_ea_features,
                 )
@@ -2357,7 +2463,38 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # This ensures small chemical bonds receive gradients equal in magnitude
                 # to large inter-fragment distances, preventing fragment "melting".
                 dist_weights = 1.0 / (DTS * m2d + 1.0)
-                m2d_weighted = m2d * dist_weights
+                
+                # --- Fix 1 & 2: Active-atom masking + Hinge cross-distance boost ---
+                # Identify which atom-pairs involve actively changing distances.
+                # "active_pair" = any (i,j) where |D_R - D_P| > threshold.
+                if config.get("active_masking_enabled", False) or config.get("hinge_boost_enabled", False):
+                    active_change = (torch.abs(DR - DP) > config["spectator_threshold"]).float() * m2d
+                    # active_atom_mask: atom i is active if ANY of its pairs changed
+                    active_atom = (active_change.sum(dim=-1) > 0).float()  # (B, N)
+                    # Build pair-level classification:
+                    # active-active, active-spectator (hinge), spectator-spectator
+                    aa_i = active_atom.unsqueeze(-1)  # (B, N, 1)
+                    aa_j = active_atom.unsqueeze(-2)  # (B, 1, N)
+                    active_active_mask = aa_i * aa_j            # both atoms active
+                    spectator_spectator_mask = (1 - aa_i) * (1 - aa_j)  # both spectator
+                    hinge_mask = 1.0 - active_active_mask - spectator_spectator_mask  # cross
+                    
+                    # Build the attention-weight map:
+                    # Active-active pairs:         1.0x (full gradient, as normal)
+                    # Spectator-spectator pairs:   0.1x (muted -- gradient pollution fix)
+                    # Hinge (active-spectator):    3.0x (boosted -- global rotation fix)
+                    attn_map = torch.ones_like(m2d)
+                    if config.get("active_masking_enabled", False):
+                        ss_w = config.get("spectator_spectator_weight", 0.1)
+                        attn_map = attn_map * (1.0 - spectator_spectator_mask) + ss_w * spectator_spectator_mask
+                    if config.get("hinge_boost_enabled", False):
+                        hinge_w = config.get("hinge_cross_weight", 3.0)
+                        attn_map = attn_map * (1.0 - hinge_mask) + hinge_w * hinge_mask
+                    
+                    m2d_weighted = m2d * dist_weights * attn_map
+                else:
+                    m2d_weighted = m2d * dist_weights
+                    
                 denom_weighted = m2d_weighted.sum().clamp(min=1)
                 
                 # Main geometry loss on the EGNN-refined distances.
@@ -2367,26 +2504,16 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 l_geom_coarse = F.huber_loss(p_DTS_coarse * m2d_weighted, DTS * m2d_weighted, reduction='sum', delta=0.5) / denom_weighted
 
                 # --- PINN Matrix-wise Cross Check ---
-                # Physics constraint 1: Spectator bonds (abs(DR - DP) < threshold) shouldn't change.
-                # Target them towards the reactant/product midpoint (DI).
+                # Physics constraint 1: Spectator bonds (abs(DR - DP) < threshold) shouldn't change wildly.
+                # Target them towards the true DTS using strict MSE to prevent the EGNN Ripple Effect.
                 spectator_mask = (torch.abs(DR - DP) < config["spectator_threshold"]).float() * m2d
                 spectator_denom = spectator_mask.sum().clamp(min=1.0)
                 l_pinn_spectator = (
-                    F.mse_loss(p_DTS * spectator_mask, DI * spectator_mask, reduction='sum')
+                    F.mse_loss(p_DTS * spectator_mask, DTS * spectator_mask, reduction='sum')
                     / spectator_denom
                 )
 
-                # Physics constraint 2: steric floor. Penalize predicted TS
-                # distances below floor_frac*(r_i + r_j) so the model learns to
-                # avoid atomic clashes during training, instead of relying only
-                # on the post-hoc clamp_steric_collisions() at inference.
-                radii = covalent_radius_lookup(atom_ids.device)          # [V+1]
-                r_atom = radii[atom_ids]                                 # [B, N]
-                min_dist = STERIC_FLOOR_FRAC * (r_atom.unsqueeze(2) + r_atom.unsqueeze(1))
-                steric_violation = F.relu(min_dist.to(p_DTS.dtype) - p_DTS) * m2d
-                l_pinn_steric = steric_violation.sum() / m2d.sum().clamp(min=1.0)
-
-                l_pinn = l_pinn_spectator + config.get("steric_loss_weight", 1.0) * l_pinn_steric
+                l_pinn = l_pinn_spectator
 
                 l_triangle_refined = triangle_inequality_loss(
                     p_DTS,
@@ -2415,6 +2542,18 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                     + 0.2 * l_pinn
                     + config["triangle_loss_weight"] * l_triangle
                 )
+                
+                # --- Load Balancing Loss (MoE) ---
+                if aux_outputs is not None:
+                    # Encourage the router to distribute probability equally across all experts
+                    geom_probs = torch.softmax(aux_outputs["geom_logits"], dim=-1).mean(dim=0)
+                    energy_probs = torch.softmax(aux_outputs["energy_logits"], dim=-1).mean(dim=0)
+                    num_experts = geom_probs.shape[0]
+                    # Perfect balance means each expert gets exactly 1/num_experts probability
+                    l_balance_geom = (geom_probs * geom_probs).sum() * num_experts
+                    l_balance_energy = (energy_probs * energy_probs).sum() * num_experts
+                    # Add to total loss with a small weight to prevent collapsing without overriding physics
+                    loss = loss + 0.1 * (l_balance_geom + l_balance_energy)
 
                 risk_scale = (
                     1.0 + config["risk_weight_alpha"] * risk_penalty.float()
@@ -2519,7 +2658,38 @@ def train_pipeline(config):
     }
     if config["num_workers"] > 0:
         loader_kwargs["persistent_workers"] = True
-    train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
+    # --- Fix 3: Error-tail oversampling via WeightedRandomSampler ---
+    # Instead of piecewise loss multipliers (which cause gradient shocks),
+    # we physically oversample high-barrier reactions so the EGNN sees them
+    # more often per epoch, forcing geometric exposure.
+    if config.get("tail_oversampling_enabled", False):
+        from torch.utils.data import WeightedRandomSampler
+        sample_weights = []
+        tail_thresh = config.get("tail_oversample_threshold", 100.0)
+        mid_thresh = config.get("tail_mid_threshold", 80.0)
+        tail_factor = config.get("tail_oversample_factor", 5.0)
+        mid_factor = config.get("tail_mid_factor", 2.0)
+        for idx in train_indices:
+            ea = samples[idx]["Ea_raw"]
+            if ea >= tail_thresh:
+                sample_weights.append(tail_factor)
+            elif ea >= mid_thresh:
+                sample_weights.append(mid_factor)
+            else:
+                sample_weights.append(1.0)
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(train_indices),  # same epoch size
+            replacement=True,
+        )
+        n_tail = sum(1 for w in sample_weights if w >= tail_factor)
+        n_mid = sum(1 for w in sample_weights if mid_factor <= w < tail_factor)
+        print(f"  Tail oversampling: {n_tail} extreme (>={tail_thresh}, {tail_factor}x), "
+              f"{n_mid} mid ({mid_thresh}-{tail_thresh}, {mid_factor}x), "
+              f"{len(sample_weights) - n_tail - n_mid} base (1x)")
+        train_loader = DataLoader(train_subset, sampler=sampler, **loader_kwargs)
+    else:
+        train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_subset, shuffle=False, **loader_kwargs)
     eval_loader = DataLoader(Subset(eval_dataset, list(range(n_total))), shuffle=False, **loader_kwargs)
     num_atom_types = len(atom_vocab)
@@ -2555,8 +2725,9 @@ def train_pipeline(config):
         },
     }
     print(f"\nTraining for up to {config['epochs']} epochs (patience={config['patience']})...")
+    detach_status = "detached features" if config.get("ea_detach_during_warmup", False) else "fully attached features"
     print(
-        f"  Ea head starts at epoch {config['ea_loss_start_epoch']} on detached features; "
+        f"  Ea head starts at epoch {config['ea_loss_start_epoch']} on {detach_status}; "
         f"full joint Ea starts after epoch {config['ea_warmup_epochs']}."
     )
     if config.get("ea_uncertainty_enabled", True):
@@ -2637,6 +2808,11 @@ def train_pipeline(config):
         if config["ea_warmup_epochs"] > 0 and epoch == config["ea_warmup_epochs"] + 1:
             best_val_loss = float('inf')
             patience_counter = 0
+            # val_select gains the ea_norm term here, so its scale shifts up.
+            # Reset the plateau scheduler's internal best too, or it keeps
+            # comparing against the (lower) geometry-only best and never sees
+            # an "improvement" again. (No-op when ea_warmup_epochs=0, since Ea
+            # is in val_select from epoch 1 and there's no metric discontinuity.)
             scheduler.plateau.best = float('inf')
             print("\n--- Ea joint warmup ended. Resetting early stopping tracking ---")
 
@@ -2738,7 +2914,7 @@ def train_pipeline(config):
                 _risk_score, _risk_penalty, _complexity_flag, _risky_chem_flag,
             ) = move_batch_to_device(batch, device)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, _, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats)
+                p_DTS, _, ea_pred_norm, _ = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats)
             ea_pred_kcal = None
             ea_sigma_kcal = None
             if ea_pred_norm is not None:
@@ -2948,7 +3124,7 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         t_aphys = torch.from_numpy(atom_phys_norm).unsqueeze(0).to(device)
         t_de_rxn = torch.tensor([de_rxn_norm], dtype=torch.float32, device=device)
         t_efeats = torch.from_numpy(energy_feats_norm.astype(np.float32)).unsqueeze(0).to(device)
-        p_DTS, _, ea_pred_norm = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_aphys, t_de_rxn, t_efeats)
+        p_DTS, _, ea_pred_norm, _ = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_aphys, t_de_rxn, t_efeats)
     # Learned Ea (denormalized); None if the checkpoint predates the head.
     ea_neural = None
     ea_sigma_kcal = None
@@ -3844,11 +4020,11 @@ if __name__ == "__main__":
     train_parser.add_argument("--ea-log-var-min", type=float, default=CONFIG["ea_log_var_min"], help="Minimum clamped Ea log-variance for Gaussian NLL")
     train_parser.add_argument("--ea-log-var-max", type=float, default=CONFIG["ea_log_var_max"], help="Maximum clamped Ea log-variance for Gaussian NLL")
     train_parser.add_argument("--ea-tail-weighting", action="store_true", help="Re-enable legacy high-Ea sample weighting on the Ea objective")
-    train_parser.add_argument("--no-ea-detach-warmup", action="store_true", help="Allow Ea warmup gradients to reach EGNN/backbone")
+    train_parser.add_argument("--no-ea-detach-warmup", action="store_true", help="(default) Allow Ea warmup gradients to reach EGNN/backbone")
+    train_parser.add_argument("--ea-detach-warmup", action="store_true", help="Rip-cord: detach Ea warmup gradients from EGNN/backbone (use if the swarm destabilizes during warmup)")
     train_parser.add_argument("--swa-start", type=int, default=CONFIG["swa_start"], help="Epoch to start SWA")
     train_parser.add_argument("--no-swa", action="store_true", help="Disable SWA")
     train_parser.add_argument("--save-dir", default=CONFIG["save_dir"], help="Directory to save checkpoints (e.g. runs/phase1_warm_start)")
-    train_parser.add_argument("--data-dir", default=CONFIG.get("data_dir"), help="Directory holding RGD1_CHNO.h5 + DFT_reaction_info.csv. Default: local d:/Transition state/RGD1_Dataset. Set this to run off the hardcoded Windows path (e.g. a Kaggle input mount).")
     predict_parser = subparsers.add_parser("predict", help="Predict a transition state from reactant/product logs")
     predict_parser.add_argument("--reactant", "-r", required=True, help="Path to reactant .log file")
     predict_parser.add_argument("--product", "-p", required=True, help="Path to product .log file")
@@ -3907,10 +4083,11 @@ if __name__ == "__main__":
             CONFIG["ea_log_var_min"] = args.ea_log_var_min
             CONFIG["ea_log_var_max"] = args.ea_log_var_max
             CONFIG["ea_tail_weighting_enabled"] = args.ea_tail_weighting
-            CONFIG["ea_detach_during_warmup"] = not args.no_ea_detach_warmup
+            if args.ea_detach_warmup:
+                CONFIG["ea_detach_during_warmup"] = True
+            elif args.no_ea_detach_warmup:
+                CONFIG["ea_detach_during_warmup"] = False
             CONFIG["swa_start"] = args.swa_start
             CONFIG["swa_enabled"] = not args.no_swa
             CONFIG["save_dir"] = args.save_dir
-            if getattr(args, "data_dir", None):
-                CONFIG["data_dir"] = args.data_dir
         train_pipeline(CONFIG)

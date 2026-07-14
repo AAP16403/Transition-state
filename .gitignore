@@ -29,3 +29,15 @@ Thumbs.db
 # Large dataset and result files
 *.json
 *.xyz
+
+# Built-sample cache (rebuildable from RGD1 HDF5)
+*.pkl
+
+# Large datasets (RGD1 HDF5 + CSVs, wb97xd3) — fetched online, never committed
+*.h5
+*.csv
+RGD1_Dataset/
+
+# Training run logs and archived runs
+*.log
+Archives_Master/
