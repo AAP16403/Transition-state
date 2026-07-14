@@ -4205,7 +4205,8 @@ if __name__ == "__main__":
         args = parser.parse_args()
     if args.command == "predict":
         CONFIG["device"] = args.device
-        CONFIG["require_cuda"] = args.require_cuda
+        if args.require_cuda:
+            CONFIG["require_cuda"] = True
         predict_transition_state(CONFIG, args.reactant, args.product, args.model, args.output, args.xyz)
     elif args.command == "dashboard":
         create_dashboard(args.data, args.save_dir)
@@ -4216,7 +4217,8 @@ if __name__ == "__main__":
             CONFIG["dataset_json"] = f"extracted_{args.dataset}.json"
             CONFIG["extraction_limit"] = args.extract_limit
             CONFIG["target_reactions"] = args.target_reactions
-            CONFIG["force_extract"] = args.force_extract
+            if args.force_extract:
+                CONFIG["force_extract"] = True
             CONFIG["epochs"] = args.epochs
             CONFIG["batch_size"] = args.batch_size
             CONFIG["num_workers"] = args.num_workers
@@ -4230,8 +4232,10 @@ if __name__ == "__main__":
             CONFIG["triangle_loss_weight"] = args.triangle_loss_weight
             CONFIG["triangle_triplet_samples"] = args.triangle_triplet_samples
             CONFIG["device"] = args.device
-            CONFIG["require_cuda"] = args.require_cuda
-            CONFIG["amp"] = not args.no_amp
+            if args.require_cuda:
+                CONFIG["require_cuda"] = True
+            if args.no_amp:
+                CONFIG["amp"] = False
             CONFIG["patience"] = args.patience
             CONFIG["lr"] = args.lr
             CONFIG["ea_head_lr"] = args.ea_head_lr
@@ -4241,16 +4245,19 @@ if __name__ == "__main__":
             CONFIG["ea_warmup_epochs"] = args.ea_warmup_epochs
             CONFIG["ea_select_weight"] = args.ea_select_weight
             CONFIG["ea_head_dropout"] = args.ea_head_dropout
-            CONFIG["ea_uncertainty_enabled"] = not args.no_ea_uncertainty
+            if args.no_ea_uncertainty:
+                CONFIG["ea_uncertainty_enabled"] = False
             CONFIG["ea_log_var_min"] = args.ea_log_var_min
             CONFIG["ea_log_var_max"] = args.ea_log_var_max
-            CONFIG["ea_tail_weighting_enabled"] = args.ea_tail_weighting
+            if args.ea_tail_weighting:
+                CONFIG["ea_tail_weighting_enabled"] = True
             if args.ea_detach_warmup:
                 CONFIG["ea_detach_during_warmup"] = True
             elif args.no_ea_detach_warmup:
                 CONFIG["ea_detach_during_warmup"] = False
             CONFIG["swa_start"] = args.swa_start
-            CONFIG["swa_enabled"] = not args.no_swa
+            if args.no_swa:
+                CONFIG["swa_enabled"] = False
             CONFIG["save_dir"] = args.save_dir
             if getattr(args, "data_dir", None):
                 CONFIG["data_dir"] = args.data_dir
