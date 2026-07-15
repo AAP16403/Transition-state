@@ -822,7 +822,6 @@ CONFIG = {
     # After the geometry head predicts a TS distance matrix, we embed it to 3D
     # (differentiable MDS) and refine the coordinates with an E(n)-equivariant
     # GNN that consumes a per-atom chemical-property vector + the TS coords.
-    "egnn_enabled": True,
     "egnn_layers": 4,
     "egnn_hidden": 128,
     "egnn_coord_clamp": 2.0,  # max per-step coordinate displacement (Angstrom)
@@ -847,14 +846,6 @@ CONFIG = {
     "ea_log_var_min": -1.5,         # lower clamp for Gaussian NLL stability (if re-enabled)
     "ea_log_var_max": 4.0,          # upper clamp still allows very uncertain outliers
     "ea_detach_during_warmup": False,
-    # --- Phase 2: optional high-Ea tail weighting ------------------------
-    # Disabled by default with Gaussian NLL uncertainty: the learned variance
-    # now handles high-barrier outliers without multiplying their gradients.
-    "ea_tail_weighting_enabled": False,
-    "ea_tail_weight_mode": "piecewise",
-    "ea_tail_weight_bins": [80.0, 100.0, 120.0],
-    "ea_tail_weight_values": [1.0, 1.5, 2.0, 2.5],
-    "ea_tail_weight_max": 2.5,
     "lr": 1.5e-4,
     "weight_decay": 1e-2,
     "warmup_epochs": 40,
@@ -878,7 +869,6 @@ CONFIG = {
     # sections 5-6) layered on the inverse-distance weighting. Boost the
     # active<->spectator cross-distances (global orientation) and reactive
     # pairs; damp the static spectator backbone.
-    "geom_active_masking_enabled": True,
     "geom_hinge_cross_weight": 3.0,          # active<->spectator cross pairs
     "geom_active_pair_weight": 2.0,          # active<->active pairs
     "geom_spectator_spectator_weight": 0.25, # static backbone pairs
@@ -912,6 +902,7 @@ CONFIG = {
     "risk_geom_loss_weight": 0.2,    # extra geometry loss on active/formed/broken risky pairs
     "steric_loss_weight": 1.0,       # weight on the steric-floor soft penalty in the loss
     "data_dir": None,                # RGD1 data dir; None -> default local path (see loader)
+    "sample_cache_path": None,       # explicit sample-cache path; None -> save_dir/samples_cache_rgd1.pkl
     "triangle_loss_weight": 0.05,
     "triangle_coarse_weight": 0.25,
     "triangle_refined_weight": 1.0,
@@ -968,15 +959,15 @@ def _sample_cache_meta(config):
         "max_atoms": config["max_atoms"],
         "fragment_bond_scale": config["fragment_bond_scale"],
         "spectator_threshold": config["spectator_threshold"],
-        "skip_negative_ea": config.get("skip_negative_ea", True),
+        "skip_negative_ea": config["skip_negative_ea"],
     }
 
 
 def _samples_cache_path(config):
-    p = config.get("sample_cache_path")
+    p = config["sample_cache_path"]
     if p:
         return p
-    return os.path.join(config.get("save_dir", "."), "samples_cache_rgd1.pkl")
+    return os.path.join(config["save_dir"], "samples_cache_rgd1.pkl")
 
 
 def build_reaction_samples(config):
@@ -986,13 +977,11 @@ def build_reaction_samples(config):
     reactions than the cached pool holds (and feature params are unchanged),
     the first N deterministic samples are sliced out without rebuilding.
     """
-    target_reactions = config.get("target_reactions", 30000)
+    target_reactions = config["target_reactions"]
     cache_path = _samples_cache_path(config)
     meta = _sample_cache_meta(config)
 
-    if (config.get("sample_cache_enabled", True)
-            and not config.get("force_extract", False)
-            and os.path.exists(cache_path)):
+    if not config["force_extract"] and os.path.exists(cache_path):
         try:
             with open(cache_path, "rb") as fh:
                 cached = pickle.load(fh)
@@ -1020,17 +1009,13 @@ def build_reaction_samples(config):
     # future runs reuse this cache instead of rebuilding to chase an unreachable target.
     exhausted = len(samples) < target_reactions
 
-    if config.get("sample_cache_enabled", True):
-        try:
-            with open(cache_path, "wb") as fh:
-                pickle.dump(
-                    {"meta": meta, "samples": samples,
-                     "atom_vocab": atom_vocab, "exhausted": exhausted},
-                    fh, protocol=pickle.HIGHEST_PROTOCOL,
-                )
-            print(f"Cached {len(samples)} reaction samples to {cache_path}.")
-        except Exception as e:
-            print(f"Warning: failed to write sample cache ({e}).")
+    with open(cache_path, "wb") as fh:
+        pickle.dump(
+            {"meta": meta, "samples": samples,
+             "atom_vocab": atom_vocab, "exhausted": exhausted},
+            fh, protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    print(f"Cached {len(samples)} reaction samples to {cache_path}.")
 
     return samples, atom_vocab, atom_types_map
 
@@ -1039,7 +1024,7 @@ def _build_reaction_samples_from_h5(config):
     import h5py
     import pandas as pd
 
-    DATA_DIR = config.get("data_dir") or "d:/Transition state/RGD1_Dataset"
+    DATA_DIR = config["data_dir"] or "d:/Transition state/RGD1_Dataset"
     h5_path = os.path.join(DATA_DIR, "RGD1_CHNO.h5")
     csv_path = os.path.join(DATA_DIR, "DFT_reaction_info.csv")
     
@@ -1052,8 +1037,8 @@ def _build_reaction_samples_from_h5(config):
     
     samples = []
     atom_types_map = {}
-    target_reactions = config.get("target_reactions", 30000)
-    
+    target_reactions = config["target_reactions"]
+
     print(f"Opening HDF5 dataset at {h5_path} to extract {target_reactions} samples...")
     with h5py.File(h5_path, 'r') as f:
         for idx, row in df.iterrows():
@@ -1085,7 +1070,7 @@ def _build_reaction_samples_from_h5(config):
             
             ea = float(row['DE_F'])
             dh = float(row['DH'])
-            if config.get("skip_negative_ea", True) and ea < 0:
+            if config["skip_negative_ea"] and ea < 0:
                 continue
                 
             c_R = np.zeros((config["max_atoms"], 3), dtype=np.float32)
@@ -1253,8 +1238,8 @@ def make_train_val_split(samples, config):
     if not 0.0 < val_split < 1.0:
         raise ValueError(f"val_split must be between 0 and 1, got {val_split}.")
     n_val = min(max(1, int(round(n_total * val_split))), n_total - 1)
-    seed = int(config.get("split_seed", 42))
-    strategy = config.get("split_strategy", "random").lower()
+    seed = int(config["split_seed"])
+    strategy = config["split_strategy"].lower()
     rng = np.random.default_rng(seed)
 
     if strategy == "random":
@@ -1264,7 +1249,7 @@ def make_train_val_split(samples, config):
         train_indices = indices[n_val:].tolist()
     elif strategy == "stratified":
         ea_values = np.array([s["Ea_raw"] for s in samples], dtype=np.float64)
-        n_bins = max(1, int(config.get("split_bins", 5)))
+        n_bins = max(1, int(config["split_bins"]))
         quantiles = np.linspace(0.0, 1.0, min(n_bins, n_total) + 1)[1:-1]
         ea_edges = np.unique(np.quantile(ea_values, quantiles)) if len(quantiles) else np.array([])
         strata = {}
@@ -1393,6 +1378,14 @@ class ReactionDataset(Dataset):
 
     Returns the raw Ea target (kcal/mol) and the z-scored de_rxn feature for the
     learned Ea head; Ea is normalized inside the training loop using ea_mean/std.
+
+    Speedup: per-sample tensors (distance matrices, normalized features, risk
+    penalty) are memoized on first access, so repeat epochs are a cheap dict
+    lookup. This is done lazily -- there is no up-front pass over the whole
+    dataset -- so only the indices actually drawn by a loader are cached, and
+    the cache persists across epochs when the loader uses persistent workers.
+    When coord_noise augmentation is active the item is recomputed every epoch
+    (never cached) so fresh noise is sampled each time.
     """
     def __init__(self, config, samples, atom_vocab, atom_types_map, stats, is_train=False):
         self.config = config
@@ -1406,10 +1399,17 @@ class ReactionDataset(Dataset):
         self.efeat_mean = stats["efeat_mean"]
         self.efeat_std = stats["efeat_std"]
         self.is_train = is_train
+        self._use_noise = is_train and config["coord_noise"] > 0.0
+        # Memoized items, keyed by index. Only populated when there is no
+        # per-epoch coord-noise augmentation (otherwise every epoch differs).
+        self._cache = {}
 
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
+        if not self._use_noise and idx in self._cache:
+            return self._cache[idx]
+
         s = self.samples[idx]
         ensure_sample_risk_features(
             s,
@@ -1419,12 +1419,12 @@ class ReactionDataset(Dataset):
         n = s["n_atoms"]
         c_R = s["c_R"].copy()
         c_P = s["c_P"].copy()
-        
-        if self.is_train and self.config.get("coord_noise", 0.0) > 0.0:
+
+        if self._use_noise:
             noise_std = self.config["coord_noise"]
             c_R[:n] += np.random.normal(scale=noise_std, size=(n, 3)).astype(np.float32)
             c_P[:n] += np.random.normal(scale=noise_std, size=(n, 3)).astype(np.float32)
-            
+
         # Distance matrices are rotation/translation invariant, so no alignment
         # of the coordinates is needed before computing them.
         D_R = compute_distance_matrix(c_R)
@@ -1437,13 +1437,13 @@ class ReactionDataset(Dataset):
             s.get("formed_bonds", 0),
             s.get("broken_bonds", 0),
             s.get("risky_chem_flag", 0.0),
-            mode=self.config.get("risk_penalty_mode", "margin"),
-            safe_min=self.config.get("risk_safe_min", 1.0),
-            safe_max=self.config.get("risk_safe_max", 3.0),
-            sigmoid_center=self.config.get("risk_sigmoid_center", 4.0),
-            sigmoid_k=self.config.get("risk_sigmoid_k", 1.25),
+            mode=self.config["risk_penalty_mode"],
+            safe_min=self.config["risk_safe_min"],
+            safe_max=self.config["risk_safe_max"],
+            sigmoid_center=self.config["risk_sigmoid_center"],
+            sigmoid_k=self.config["risk_sigmoid_k"],
         )
-        return {
+        item = {
             "rxn_id": s["rxn_id"],
             "n_atoms": n,
             "D_R": torch.from_numpy(D_R),
@@ -1463,6 +1463,9 @@ class ReactionDataset(Dataset):
             "complexity_flag": torch.tensor(s["complexity_flag"], dtype=torch.float32),
             "risky_chem_flag": torch.tensor(s["risky_chem_flag"], dtype=torch.float32),
         }
+        if not self._use_noise:
+            self._cache[idx] = item
+        return item
 
 class GaussianEmbedding(nn.Module):
     def __init__(self, n_gaussians=50, start=0.4, stop=6.0):
@@ -2013,11 +2016,14 @@ class EaHead(nn.Module):
     After the EGNN message-passing, each atom's feature vector `h_ts` encodes its
     local 3D environment in the predicted TS (neighbour distances, angles). We
     attention-pool those per-atom features into a reactive-region descriptor,
-    concatenate a masked mean descriptor for global context, append the signed
-    reaction energy (z-scored de_rxn -- the Bell-Evans-Polanyi driver), and
-    regress a *normalized* Ea mean plus optional log-variance. The gradient flows back into the EGNN, so the
-    same message-passing that places the TS atoms also learns the
-    structure->energy relationship ("learn physics using the EGNN").
+    concatenate a masked mean descriptor for global context and a
+    reaction-center-focused descriptor, append the separately-encoded physics
+    stream, and regress a *normalized* Ea mean plus optional log-variance. A
+    direct linear Bell-Evans-Polanyi term adds the signed reaction energy
+    straight onto the mean so the dominant near-linear driver is not diluted
+    inside the MLP. The gradient flows back into the EGNN, so the same
+    message-passing that places the TS atoms also learns the structure->energy
+    relationship ("learn physics using the EGNN").
 
     Output is [normalized Ea mean, log-variance] when uncertainty is enabled,
     otherwise a scalar normalized Ea for legacy checkpoints.
@@ -2034,7 +2040,14 @@ class EaHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden // 2, 1),
         )
-        # --- Balanced two-stream fusion --------------------------------------
+        # Concentration of the reaction-center pool. Used as a softmax temperature
+        # on the reaction-center mask: a large value makes the pool a near-uniform
+        # mean over the forming/breaking atoms (reproducing the original
+        # reaction-center mean), while an empty mask degrades continuously to a
+        # uniform mean over all valid atoms -- always well-defined, never a zero
+        # vector, and with no conditional branch.
+        self.rc_attn_bias = nn.Parameter(torch.tensor(4.0))
+        # --- Balanced three-stream fusion ------------------------------------
         # TS geometry stream: attention-, mean-, and reaction-center-pooled EGNN
         # node features projected to `hidden`. The reaction-center pool reads the
         # forming/breaking atoms directly instead of letting spectators dilute
@@ -2073,6 +2086,12 @@ class EaHead(nn.Module):
             nn.Dropout(dropout),
             final,
         )
+        # Direct Bell-Evans-Polanyi path: a linear signed-de_rxn -> normalized Ea
+        # mean term added to the MLP output, so the dominant near-linear driver
+        # reaches the prediction without being rederived inside the deep stack.
+        self.bep = nn.Linear(1, 1)
+        nn.init.constant_(self.bep.weight, 0.5)
+        nn.init.zeros_(self.bep.bias)
 
     def forward(self, h_ts, mask, de_rxn, energy_feats, rc_mask):
         if self.energy_feat_dim > 0:
@@ -2087,25 +2106,35 @@ class EaHead(nn.Module):
                     f"energy_feats must have shape [{h_ts.size(0)}, {self.energy_feat_dim}], "
                     f"got {tuple(energy_feats.shape)}"
                 )
+        valid = mask <= 0                                        # [B, N] padding
         m = mask.unsqueeze(-1).to(h_ts.dtype)                    # [B, N, 1]
         mean_pooled = (h_ts * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
         attn_logits = self.attn(h_ts).squeeze(-1)                 # [B, N]
-        attn_logits = attn_logits.masked_fill(mask <= 0, -1e4)
+        attn_logits = attn_logits.masked_fill(valid, -1e4)
         attn_weights = torch.softmax(attn_logits, dim=1).unsqueeze(-1)
         attn_pooled = (h_ts * attn_weights * m).sum(dim=1)
-        # Reaction-center pool: mean over forming/breaking atoms only. When a
-        # reaction has no detected changed bonds the clamp yields a zero vector.
-        rm = rc_mask.unsqueeze(-1).to(h_ts.dtype)                # [B, N, 1]
-        rc_pooled = (h_ts * rm).sum(dim=1) / rm.sum(dim=1).clamp(min=1.0)
+        # Reaction-center pool as a softmax over the forming/breaking mask. With a
+        # large temperature the weights are ~uniform over the reaction-center
+        # atoms (i.e. their mean); if a reaction has no detected changed bonds the
+        # softmax simply spreads over all valid atoms. Always well-defined, never a
+        # zero vector, and no conditional fallback.
+        rc_logits = self.rc_attn_bias * rc_mask.to(h_ts.dtype)   # [B, N]
+        rc_logits = rc_logits.masked_fill(valid, -1e4)
+        rc_weights = torch.softmax(rc_logits, dim=1).unsqueeze(-1)
+        rc_pooled = (h_ts * rc_weights).sum(dim=1)
         ts = self.ts_proj(torch.cat([attn_pooled, mean_pooled, rc_pooled], dim=-1))
-        phys_parts = [de_rxn.to(dtype=h_ts.dtype).unsqueeze(-1)]
+        de_rxn_col = de_rxn.to(dtype=h_ts.dtype).unsqueeze(-1)    # [B, 1]
+        phys_parts = [de_rxn_col]
         if self.energy_feat_dim > 0:
             phys_parts.append(energy_feats.to(dtype=h_ts.dtype))
         phys = self.phys_enc(torch.cat(phys_parts, dim=-1))
         gamma, beta = self.film(phys).chunk(2, dim=-1)
         ts_mod = ts * (1.0 + gamma) + beta
         out = self.net(torch.cat([ts_mod, phys], dim=-1))
-        return out if self.uncertainty_enabled else out.squeeze(-1)
+        bep = self.bep(de_rxn_col)                               # [B, 1] direct BEP term
+        if self.uncertainty_enabled:
+            return torch.cat([out[..., :1] + bep, out[..., 1:]], dim=-1)
+        return (out + bep).squeeze(-1)
 
 
 class PSI(nn.Module):
@@ -2119,10 +2148,10 @@ class PSI(nn.Module):
     """
     def __init__(self, config, num_atom_types):
         super().__init__()
-        self.coord_noise = config.get("coord_noise", 0.005)
-        self.rc_bond_scale = config.get("fragment_bond_scale", 1.45)
-        self.mds_on_gpu = config.get("mds_on_gpu", False)
-        self.mds_dtype = torch.float32 if config.get("mds_dtype", "float64") == "float32" else torch.float64
+        self.coord_noise = config["coord_noise"]
+        self.rc_bond_scale = config["fragment_bond_scale"]
+        self.mds_on_gpu = config["mds_on_gpu"]
+        self.mds_dtype = torch.float32 if config["mds_dtype"] == "float32" else torch.float64
         d_model = config["gru_hidden"] * 2
         atom_dim = config["atom_embed_dim"]
         drop = config["dropout"]
@@ -2132,26 +2161,24 @@ class PSI(nn.Module):
         # EGNN coordinate refiner. Node features = chemical-property vector
         # (learned atom embedding + physical descriptors); coordinates come from
         # the MDS embedding of the geometry head's predicted TS distance matrix.
-        self.egnn_enabled = config.get("egnn_enabled", True)
-        if self.egnn_enabled:
-            node_in_dim = atom_dim + ATOM_PHYS_DIM
-            self.egnn = EGNN(
-                node_in_dim,
-                hidden=config["egnn_hidden"],
-                n_layers=config["egnn_layers"],
-                coord_clamp=config["egnn_coord_clamp"],
-                dropout=drop,
-            )
-            # Learned Ea head on the EGNN's refined per-atom features (h_ts)
-            # plus 28D energy descriptor (composition, bond-angle stats, RC angles).
-            self.ea_head = EaHead(
-                node_dim=config["egnn_hidden"],
-                hidden=config["egnn_hidden"],
-                energy_feat_dim=ENERGY_FEAT_DIM,
-                dropout=config.get("ea_head_dropout", drop),
-                uncertainty_enabled=config.get("ea_uncertainty_enabled", True),
-                log_var_init=config.get("ea_log_var_init", 0.0),
-            )
+        node_in_dim = atom_dim + ATOM_PHYS_DIM
+        self.egnn = EGNN(
+            node_in_dim,
+            hidden=config["egnn_hidden"],
+            n_layers=config["egnn_layers"],
+            coord_clamp=config["egnn_coord_clamp"],
+            dropout=drop,
+        )
+        # Learned Ea head on the EGNN's refined per-atom features (h_ts)
+        # plus 28D energy descriptor (composition, bond-angle stats, RC angles).
+        self.ea_head = EaHead(
+            node_dim=config["egnn_hidden"],
+            hidden=config["egnn_hidden"],
+            energy_feat_dim=ENERGY_FEAT_DIM,
+            dropout=config["ea_head_dropout"],
+            uncertainty_enabled=config["ea_uncertainty_enabled"],
+            log_var_init=config["ea_log_var_init"],
+        )
 
     @staticmethod
     def _coords_to_distance(x, mask):
@@ -2178,11 +2205,10 @@ class PSI(nn.Module):
             energy_feats: [B, 28] z-scored molecular descriptor vector
                     (composition, bond-angle stats) for the Ea head.
         Returns:
-            D_TS_pred:    [B, N, N] EGNN-refined TS distances (or coarse if EGNN off)
+            D_TS_pred:    [B, N, N] EGNN-refined TS distances
             D_TS_coarse:  [B, N, N] pre-EGNN coarse distances (for aux loss)
             ea_pred_norm: [B] normalized Ea or [B, 2] mean/log-variance from the
-                          EaHead, or None if the head is absent (EGNN off) or
-                          de_rxn was not supplied.
+                          EaHead, or None if de_rxn was not supplied.
             detach_ea_features: stop Ea gradients at h_ts while still training
                           the Ea head. Used during Ea warm-start.
         """
@@ -2191,39 +2217,36 @@ class PSI(nn.Module):
         # Coarse TS distance matrix from the geometry head.
         D_TS_coarse = self.geom_head(f, atom_emb, atom_phys, D_R, D_I, D_P, mask)
         ea_pred_norm = None
-        if self.egnn_enabled:
-            # Chemical properties in one vector; predicted TS coordinates in the
-            # other -- both fed to the EGNN. The MDS seed is detached so the
-            # geometry head is trained directly by the coarse-distance aux loss
-            # (keeping eigh's unstable backward out of the graph) while the EGNN
-            # learns the coordinate refinement under the main geometry loss.
-            node_feats = torch.cat([atom_emb, atom_phys], dim=-1)
-            # Coordinate-space MDS (eigh) seed for the EGNN. Device/precision are
-            # config-controlled (mds_on_gpu / mds_dtype): CPU-float64 by default,
-            # or on-GPU to remove the per-forward sync + host<->device transfers.
-            with torch.amp.autocast(device_type=D_R.device.type, enabled=False):
-                x_init = torch_mds_coords(
-                    D_TS_coarse.detach().float(), mask,
-                    on_gpu=self.mds_on_gpu, compute_dtype=self.mds_dtype,
-                )
-                
-            # --- Coordinate Noise Data Augmentation ---
-            # Prevents late-stage EGNN geometry memorization (train-val gap)
-            if self.training and self.coord_noise > 0.0:
-                noise = torch.randn_like(x_init) * self.coord_noise
-                x_init = x_init + (noise * mask.unsqueeze(-1))
-                
-            # h_ts is NOT detached: the Ea loss backpropagates through the
-            # EGNN, so message passing learns the structure->energy relation.
-            h_ts, x_ts = self.egnn(node_feats, x_init, mask)
-            D_TS_pred = self._coords_to_distance(x_ts, mask)
-            if de_rxn is not None:
-                h_ea = h_ts.detach() if detach_ea_features else h_ts
-                ef = energy_feats.float() if energy_feats is not None else None
-                rc_mask = self._reaction_center_mask(D_R, D_P, atom_ids, mask)
-                ea_pred_norm = self.ea_head(h_ea, mask, de_rxn.float(), ef, rc_mask)
-        else:
-            D_TS_pred = D_TS_coarse
+        # Chemical properties in one vector; predicted TS coordinates in the
+        # other -- both fed to the EGNN. The MDS seed is detached so the
+        # geometry head is trained directly by the coarse-distance aux loss
+        # (keeping eigh's unstable backward out of the graph) while the EGNN
+        # learns the coordinate refinement under the main geometry loss.
+        node_feats = torch.cat([atom_emb, atom_phys], dim=-1)
+        # Coordinate-space MDS (eigh) seed for the EGNN. Device/precision are
+        # config-controlled (mds_on_gpu / mds_dtype): CPU-float64 by default,
+        # or on-GPU to remove the per-forward sync + host<->device transfers.
+        with torch.amp.autocast(device_type=D_R.device.type, enabled=False):
+            x_init = torch_mds_coords(
+                D_TS_coarse.detach().float(), mask,
+                on_gpu=self.mds_on_gpu, compute_dtype=self.mds_dtype,
+            )
+
+        # --- Coordinate Noise Data Augmentation ---
+        # Prevents late-stage EGNN geometry memorization (train-val gap)
+        if self.training and self.coord_noise > 0.0:
+            noise = torch.randn_like(x_init) * self.coord_noise
+            x_init = x_init + (noise * mask.unsqueeze(-1))
+
+        # h_ts is NOT detached: the Ea loss backpropagates through the
+        # EGNN, so message passing learns the structure->energy relation.
+        h_ts, x_ts = self.egnn(node_feats, x_init, mask)
+        D_TS_pred = self._coords_to_distance(x_ts, mask)
+        if de_rxn is not None:
+            h_ea = h_ts.detach() if detach_ea_features else h_ts
+            ef = energy_feats.float() if energy_feats is not None else None
+            rc_mask = self._reaction_center_mask(D_R, D_P, atom_ids, mask)
+            ea_pred_norm = self.ea_head(h_ea, mask, de_rxn.float(), ef, rc_mask)
         return D_TS_pred, D_TS_coarse, ea_pred_norm
 
 class PlateauWarmupScheduler:
@@ -2264,7 +2287,7 @@ def freeze_backbone(model):
     Raises if the model has no Ea head / EGNN (Stage 2 is only meaningful then).
     """
     if not hasattr(model, "ea_head"):
-        raise AttributeError("freeze_backbone requires a model with an ea_head (egnn_enabled=True).")
+        raise AttributeError("freeze_backbone requires a model with an ea_head.")
     for module in (model.core, model.geom_head, model.egnn):
         for p in module.parameters():
             p.requires_grad_(False)
@@ -2278,7 +2301,7 @@ def build_ea_only_optimizer(model, config):
     fallback to training the whole model.
     """
     if not hasattr(model, "ea_head"):
-        raise AttributeError("ea_only stage requires a model with an ea_head (egnn_enabled=True).")
+        raise AttributeError("ea_only stage requires a model with an ea_head.")
     ea_params = [p for p in model.ea_head.parameters() if p.requires_grad]
     if not ea_params:
         raise ValueError("ea_only stage: ea_head has no trainable parameters to optimize.")
@@ -2292,7 +2315,7 @@ def build_optimizer(model, config):
     ea_params = list(model.ea_head.parameters()) if hasattr(model, "ea_head") else []
     if not ea_params:
         return torch.optim.AdamW(
-            model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
+            model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"], foreach=True
         )
 
     ea_param_ids = {id(p) for p in ea_params}
@@ -2308,35 +2331,8 @@ def build_optimizer(model, config):
                 "lr": config["ea_head_lr"],
                 "weight_decay": config["ea_head_weight_decay"],
             },
-        ]
+        ], foreach=True
     )
-
-
-def ea_tail_sample_weights(Ea, config):
-    """Piecewise sample weights for rare high-barrier Ea targets."""
-    weights = torch.ones_like(Ea, dtype=torch.float32)
-    if not config.get("ea_tail_weighting_enabled", False):
-        return weights
-
-    mode = config.get("ea_tail_weight_mode", "piecewise")
-    if mode != "piecewise":
-        raise ValueError(f"Unsupported ea_tail_weight_mode '{mode}'. Use 'piecewise'.")
-
-    bins = list(config.get("ea_tail_weight_bins", [80.0, 100.0, 120.0]))
-    values = list(config.get("ea_tail_weight_values", [1.0, 1.5, 2.0, 2.5]))
-    if len(values) != len(bins) + 1:
-        raise ValueError(
-            "ea_tail_weight_values must have exactly one more entry than "
-            "ea_tail_weight_bins."
-        )
-
-    for threshold, value in zip(bins, values[1:]):
-        weights = torch.where(Ea >= float(threshold), weights.new_tensor(float(value)), weights)
-    return weights.clamp(max=float(config.get("ea_tail_weight_max", max(values))))
-
-
-def weighted_mean(values, weights):
-    return (values * weights).sum() / weights.sum().clamp(min=1.0)
 
 
 def split_ea_prediction(ea_pred, config):
@@ -2349,8 +2345,8 @@ def split_ea_prediction(ea_pred, config):
         return ea_pred.squeeze(-1), None
     ea_mean_norm = ea_pred[..., 0]
     ea_log_var = ea_pred[..., 1].clamp(
-        min=float(config.get("ea_log_var_min", -5.0)),
-        max=float(config.get("ea_log_var_max", 4.0)),
+        min=float(config["ea_log_var_min"]),
+        max=float(config["ea_log_var_max"]),
     )
     return ea_mean_norm, ea_log_var
 
@@ -2387,7 +2383,7 @@ def adapt_ea_head_state_dict(state_dict, target_state, config):
         and old_w.shape[0] == 1
         and new_w.shape[0] == 2
         and old_w.shape[1] == new_w.shape[1]
-        and config.get("ea_uncertainty_enabled", True)
+        and config["ea_uncertainty_enabled"]
     )
     if not can_migrate_scalar_to_uncertainty:
         return adapted, migrated
@@ -2400,7 +2396,7 @@ def adapt_ea_head_state_dict(state_dict, target_state, config):
         if old_b.numel() == 1 and new_b.numel() == 2:
             merged_b = new_b.detach().clone()
             merged_b[0].copy_(old_b[0].to(device=merged_b.device, dtype=merged_b.dtype))
-            merged_b[1].fill_(float(config.get("ea_log_var_init", 0.0)))
+            merged_b[1].fill_(float(config["ea_log_var_init"]))
             adapted[b_key] = merged_b
     return adapted, True
 
@@ -2436,8 +2432,8 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     features so the starting Ea prediction improves without letting noisy early
     Ea gradients reshape the geometry backbone.
     """
-    geom_only = config.get("geom_only", False)
-    ea_only = config.get("ea_only", False)
+    geom_only = config["geom_only"]
+    ea_only = config["ea_only"]
     if ea_only:
         # Backbone stays frozen/deterministic; only the Ea head trains.
         model.eval()
@@ -2461,17 +2457,17 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         # Stage 1: geometry backbone only; the Ea head never runs (de_rxn=None).
         ea_started, ea_joint, detach_ea_features, ea_w = False, False, False, 0.0
     else:
-        ea_started = epoch >= config.get("ea_loss_start_epoch", config["ea_warmup_epochs"] + 1)
+        ea_started = epoch >= config["ea_loss_start_epoch"]
         ea_joint = epoch > config["ea_warmup_epochs"]
         detach_ea_features = (
-            config.get("ea_detach_during_warmup", True)
+            config["ea_detach_during_warmup"]
             and ea_started
             and not ea_joint
         )
         if ea_joint:
             ea_w = config["ea_loss_weight"]
         elif ea_started:
-            ea_w = config.get("ea_warmup_loss_weight", 1.0)
+            ea_w = config["ea_warmup_loss_weight"]
         else:
             ea_w = 0.0
     context = torch.enable_grad() if is_train else torch.no_grad()
@@ -2506,18 +2502,17 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # the long-range active<->spectator cross-distances that encode
                 # global fragment orientation. Boost those cross pairs and the
                 # reactive pairs, and damp the static spectator backbone.
-                if config.get("geom_active_masking_enabled", True):
-                    active = reaction_center_atom_mask(
-                        DR, DP, atom_ids, mask, config.get("fragment_bond_scale", 1.45)
-                    ).to(dist_weights.dtype)                     # [B, N]
-                    a_i = active.unsqueeze(2)                    # [B, N, 1]
-                    a_j = active.unsqueeze(1)                    # [B, 1, N]
-                    role_weight = (
-                        config.get("geom_hinge_cross_weight", 3.0) * (a_i + a_j - 2.0 * a_i * a_j)
-                        + config.get("geom_active_pair_weight", 2.0) * (a_i * a_j)
-                        + config.get("geom_spectator_spectator_weight", 0.25) * ((1.0 - a_i) * (1.0 - a_j))
-                    )
-                    dist_weights = dist_weights * role_weight
+                active = reaction_center_atom_mask(
+                    DR, DP, atom_ids, mask, config["fragment_bond_scale"]
+                ).to(dist_weights.dtype)                     # [B, N]
+                a_i = active.unsqueeze(2)                    # [B, N, 1]
+                a_j = active.unsqueeze(1)                    # [B, 1, N]
+                role_weight = (
+                    config["geom_hinge_cross_weight"] * (a_i + a_j - 2.0 * a_i * a_j)
+                    + config["geom_active_pair_weight"] * (a_i * a_j)
+                    + config["geom_spectator_spectator_weight"] * ((1.0 - a_i) * (1.0 - a_j))
+                )
+                dist_weights = dist_weights * role_weight
                 m2d_weighted = m2d * dist_weights
                 denom_weighted = m2d_weighted.sum().clamp(min=1)
                 
@@ -2551,7 +2546,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 steric_violation = F.relu(min_dist.to(p_DTS.dtype) - p_DTS) * m2d
                 l_pinn_steric = steric_violation.sum() / m2d.sum().clamp(min=1.0)
 
-                l_pinn = l_pinn_spectator + config.get("steric_loss_weight", 1.0) * l_pinn_steric
+                l_pinn = l_pinn_spectator + config["steric_loss_weight"] * l_pinn_steric
 
                 l_triangle_refined = triangle_inequality_loss(
                     p_DTS,
@@ -2609,19 +2604,21 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                         ea_objective = gaussian_ea_nll(ea_mean_norm, ea_log_var, ea_target_norm)
                     else:
                         ea_objective = ea_abs
-                    ea_tail_weight = ea_tail_sample_weights(Ea.float(), config)
                     l_ea = ea_abs.mean()
-                    l_ea_weighted = weighted_mean(ea_abs, ea_tail_weight)
                     l_ea_nll = ea_objective.mean()
-                    l_ea_weighted_nll = weighted_mean(ea_objective, ea_tail_weight)
+                    # High-Ea tail weighting was removed; the "weighted" metrics
+                    # are kept equal to the plain means only so training_history
+                    # JSON stays schema-compatible with older runs/readers.
+                    l_ea_weighted = l_ea
+                    l_ea_weighted_nll = l_ea_nll
                     if ea_w > 0.0:
-                        loss = loss + ea_w * l_ea_weighted_nll
+                        loss = loss + ea_w * l_ea_nll
                         if ea_joint and risk_sample.sum() > 0:
                             risk_weight = risk_scale * risk_sample
                             l_risk_ea = (ea_objective * risk_weight).sum() / risk_weight.sum().clamp(min=1.0)
                             loss = loss + config["risk_ea_loss_weight"] * l_risk_ea
                 else:
-                    l_ea = l_ea_weighted = l_ea_nll = l_ea_weighted_nll = ea_tail_weight = None
+                    l_ea = l_ea_weighted = l_ea_nll = l_ea_weighted_nll = None
                     ea_mean_norm = ea_log_var = ea_target_norm = None
             if is_train:
                 # Guard against a non-finite batch corrupting the weights: skip
@@ -2643,7 +2640,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 total_ea_weighted_norm += l_ea_weighted.item()
                 total_ea_nll += l_ea_nll.item()
                 total_ea_weighted_nll += l_ea_weighted_nll.item()
-                total_ea_tail_weight += ea_tail_weight.mean().item()
+                total_ea_tail_weight += 1.0
                 if ea_log_var is not None:
                     total_ea_log_var += ea_log_var.detach().mean().item()
                     total_ea_sigma_norm += torch.exp(0.5 * ea_log_var.detach()).mean().item()
@@ -2670,6 +2667,8 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
 def train_pipeline(config):
     device = resolve_device(config)
     configure_torch_runtime(device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     os.makedirs(config["save_dir"], exist_ok=True)
     print("="*70); print(" PSI FULL PIPELINE (v2) "); print("="*70)
     extract_raw_data(config)
@@ -2696,12 +2695,12 @@ def train_pipeline(config):
     eval_loader = DataLoader(Subset(eval_dataset, list(range(n_total))), shuffle=False, **loader_kwargs)
     num_atom_types = len(atom_vocab)
     model = PSI(config, num_atom_types).to(device)
-    geom_only = config.get("geom_only", False)
-    ea_only = config.get("ea_only", False)
+    geom_only = config["geom_only"]
+    ea_only = config["ea_only"]
     if geom_only and ea_only:
         raise ValueError("geom_only and ea_only are mutually exclusive training stages.")
     if ea_only:
-        backbone_ckpt = config.get("backbone_ckpt")
+        backbone_ckpt = config["backbone_ckpt"]
         if not backbone_ckpt or not os.path.exists(backbone_ckpt):
             raise FileNotFoundError(
                 f"ea_only stage requires an existing --backbone-ckpt; got {backbone_ckpt!r}"
@@ -2727,10 +2726,10 @@ def train_pipeline(config):
         "aphys_std": stats["aphys_std"].tolist(),
         "ea_mean": stats["ea_mean"],
         "ea_std": stats["ea_std"],
-        "ea_uncertainty_enabled": bool(config.get("ea_uncertainty_enabled", True)),
-        "ea_head_output_dim": 2 if config.get("ea_uncertainty_enabled", True) else 1,
-        "ea_log_var_min": float(config.get("ea_log_var_min", -5.0)),
-        "ea_log_var_max": float(config.get("ea_log_var_max", 4.0)),
+        "ea_uncertainty_enabled": bool(config["ea_uncertainty_enabled"]),
+        "ea_head_output_dim": 2 if config["ea_uncertainty_enabled"] else 1,
+        "ea_log_var_min": float(config["ea_log_var_min"]),
+        "ea_log_var_max": float(config["ea_log_var_max"]),
         "de_rxn_mean": stats["de_rxn_mean"],
         "de_rxn_std": stats["de_rxn_std"],
         "efeat_mean": stats["efeat_mean"].tolist(),
@@ -2746,16 +2745,10 @@ def train_pipeline(config):
         f"  Ea head starts at epoch {config['ea_loss_start_epoch']} on detached features; "
         f"full joint Ea starts after epoch {config['ea_warmup_epochs']}."
     )
-    if config.get("ea_uncertainty_enabled", True):
+    if config["ea_uncertainty_enabled"]:
         print(
             f"  Ea uncertainty: Gaussian NLL with log_var clamp "
             f"[{config['ea_log_var_min']}, {config['ea_log_var_max']}]."
-        )
-    if config.get("ea_tail_weighting_enabled", False):
-        print(
-            f"  Phase 2 high-Ea weighting: {config['ea_tail_weight_mode']} "
-            f"bins={config['ea_tail_weight_bins']} values={config['ea_tail_weight_values']} "
-            f"max={config['ea_tail_weight_max']}."
         )
     print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>11} | {'T.Geom':>8} | {'V.Geom':>8} | {'V.dMAE_A':>9} | {'T.EaMAE':>8} | {'V.EaMAE':>8} | {'LR':>10}")
     print("-" * 106)
@@ -2807,10 +2800,10 @@ def train_pipeline(config):
                 print(f"Checkpoint model loaded, but optimizer/scheduler state was reset: {exc}")
 
     from torch.optim.swa_utils import AveragedModel, SWALR
-    swa_enabled = config.get("swa_enabled", False)
-    swa_start = config.get("swa_start", config.get("epochs", 800))
+    swa_enabled = config["swa_enabled"]
+    swa_start = config["swa_start"]
     swa_model = AveragedModel(model) if swa_enabled else None
-    swa_scheduler = SWALR(optimizer, swa_lr=config.get("lr", 1.5e-4) * 0.5) if swa_enabled else None
+    swa_scheduler = SWALR(optimizer, swa_lr=config["lr"] * 0.5) if swa_enabled else None
     if swa_enabled and resumed_training_state:
         if "swa_model_state_dict" in ckpt:
             swa_model.load_state_dict(ckpt["swa_model_state_dict"])
@@ -4045,7 +4038,6 @@ if __name__ == "__main__":
     train_parser.add_argument("--no-ea-uncertainty", action="store_true", help="Use legacy scalar SmoothL1 Ea regression instead of Gaussian NLL uncertainty")
     train_parser.add_argument("--ea-log-var-min", type=float, default=CONFIG["ea_log_var_min"], help="Minimum clamped Ea log-variance for Gaussian NLL")
     train_parser.add_argument("--ea-log-var-max", type=float, default=CONFIG["ea_log_var_max"], help="Maximum clamped Ea log-variance for Gaussian NLL")
-    train_parser.add_argument("--ea-tail-weighting", action="store_true", help="Re-enable legacy high-Ea sample weighting on the Ea objective")
     train_parser.add_argument("--no-ea-detach-warmup", action="store_true", help="Allow Ea warmup gradients to reach EGNN/backbone")
     train_parser.add_argument("--swa-start", type=int, default=CONFIG["swa_start"], help="Epoch to start SWA")
     train_parser.add_argument("--no-swa", action="store_true", help="Disable SWA")
@@ -4116,8 +4108,6 @@ if __name__ == "__main__":
                 CONFIG["ea_uncertainty_enabled"] = False
             CONFIG["ea_log_var_min"] = args.ea_log_var_min
             CONFIG["ea_log_var_max"] = args.ea_log_var_max
-            if args.ea_tail_weighting:
-                CONFIG["ea_tail_weighting_enabled"] = True
             if args.no_ea_detach_warmup:
                 CONFIG["ea_detach_during_warmup"] = False
             CONFIG["swa_start"] = args.swa_start
