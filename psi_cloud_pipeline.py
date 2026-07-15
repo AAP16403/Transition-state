@@ -810,20 +810,20 @@ CONFIG = {
     "atom_embed_dim": 32,
     "gru_hidden": 128,
     "gru_layers": 2,
-    "gru_dropout": 0.3,
+    "gru_dropout": 0.1,
     "attn_heads": 8,
     "attn_layers": 3,
     "ff_dim": 512,
-    "dropout": 0.35,
+    "dropout": 0.1,
     "delta_clamp": 3.0,
     # --- EGNN coordinate refiner -----------------------------------------
     # After the geometry head predicts a TS distance matrix, we embed it to 3D
     # (differentiable MDS) and refine the coordinates with an E(n)-equivariant
     # GNN that consumes a per-atom chemical-property vector + the TS coords.
     "egnn_enabled": True,
-    "egnn_layers": 4,
-    "egnn_hidden": 128,
-    "egnn_coord_clamp": 2.0,  # max per-step coordinate displacement (Angstrom)
+    "egnn_layers": 8,
+    "egnn_hidden": 256,
+    "egnn_coord_clamp": 3.5,  # max per-step coordinate displacement (Angstrom)
     "geom_coarse_weight": 0.5,  # weight on the pre-EGNN (coarse) distance aux loss
     # --- MoE swarm (mixture-of-experts geometry/Ea refiners) -------------
     # When egnn_enabled, the refiner is a top-k routed swarm: `num_experts`
@@ -837,7 +837,7 @@ CONFIG = {
     # detached TS features, then after warmup its gradient can reshape the EGNN
     # once predicted TS geometries are good enough to learn from. PhysicsEa
     # (Marcus/Hammond/OLS) is kept as a side-by-side baseline.
-    "ea_loss_weight": 2.0,          # full joint Ea weight after warmup
+    "ea_loss_weight": 0.5,          # de-emphasized: Ea head already converged (~5 kcal); free gradient budget for TS geometry
     "ea_loss_start_epoch": 1,       # train Ea head from the first epoch
     "ea_warmup_loss_weight": 1.0,   # detached-feature Ea weight before joint mode
     "ea_warmup_epochs": 0,          # 0 = Ea head and TS geometry co-train jointly from epoch 1
@@ -863,7 +863,7 @@ CONFIG = {
     "ea_tail_weight_values": [1.0, 1.5, 2.0, 2.5],
     "ea_tail_weight_max": 2.5,
     "lr": 1.5e-4,
-    "weight_decay": 1e-2,
+    "weight_decay": 1e-3,
     "warmup_epochs": 40,
     "grad_clip": 1.0,
     "batch_size": 32,
