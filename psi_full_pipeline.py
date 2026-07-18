@@ -521,8 +521,13 @@ def reaction_center_atom_mask(D_R, D_P, atom_ids, mask, bond_scale=1.45):
         thr = bond_scale * (r.unsqueeze(2) + r.unsqueeze(1))     # [B, N, N]
         eye = torch.eye(N, device=mask.device).unsqueeze(0)
         pair_valid = (mask.unsqueeze(1) * mask.unsqueeze(2)) * (1.0 - eye) > 0
-        bond_R = (D_R < thr) & pair_valid
-        bond_P = (D_P < thr) & pair_valid
+        # Use <= to match bond_set_from_distance_matrix (the load-time reaction-
+        # center filter). If this used strict <, a forming/breaking bond sitting
+        # exactly at the covalent cutoff would count at load time (reaction kept)
+        # but not here, yielding an empty RC mask that trips the EaHead's hard
+        # raise the filter is meant to prevent.
+        bond_R = (D_R <= thr) & pair_valid
+        bond_P = (D_P <= thr) & pair_valid
         changed = bond_R ^ bond_P                                # formed or broken
         return changed.any(dim=2) & (mask > 0)                   # [B, N]
 
