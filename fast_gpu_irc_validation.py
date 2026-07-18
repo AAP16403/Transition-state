@@ -57,13 +57,13 @@ def compute_gpu_empirical_energy(coords, radii_tensor):
 def run_fast_gpu_irc(
     ckpt_path=r"d:\Transition state\Archives_Master\archive_run_20260715\psi_best.pt",
     base_out_dir=r"d:\Transition state\fast_gpu_irc_results",
-    num_samples=20,
+    num_samples=100,
     irc_steps=20,
     step_size=0.05,
     lr=0.02
 ):
     print("=" * 70)
-    print(" FAST CUDA GPU-ACCELERATED IRC VALIDATION ")
+    print(" FAST CUDA GPU-ACCELERATED IRC VALIDATION (LARGE BATCH) ")
     print(f" Checkpoint: {ckpt_path}")
     print(f" Reactions to evaluate: {num_samples}")
     print("=" * 70)
@@ -103,7 +103,7 @@ def run_fast_gpu_irc(
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
 
     # --- Fast Scanning Pass: Compute Ea Errors for Validation Set ---
-    scan_limit = min(500, len(val_indices))
+    scan_limit = min(1000, len(val_indices))
     print(f"\n[SCAN] Scanning {scan_limit} validation reactions to identify highest Ea prediction errors...")
     scan_loader = DataLoader(Subset(eval_dataset, val_indices[:scan_limit]), batch_size=1, shuffle=False)
 
@@ -129,9 +129,7 @@ def run_fast_gpu_irc(
     scored_samples.sort(key=lambda x: x[0], reverse=True)
     top_worst = scored_samples[:num_samples]
 
-    print(f"[SCAN] Top {num_samples} Highest Ea Error Reactions Selected:")
-    for rank, (err, val_idx, b) in enumerate(top_worst):
-        print(f"  Rank {rank+1:2d}: Rxn {b['rxn_id'][0]} | Ea Error = {err:.2f} kcal/mol")
+    print(f"[SCAN] Top {len(top_worst)} Highest Ea Error Reactions Selected.")
 
     sample_reports = []
 
