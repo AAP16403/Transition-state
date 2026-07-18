@@ -851,12 +851,17 @@ CONFIG = {
     "weight_decay": 1e-3,
     "warmup_epochs": 40,
     "grad_clip": 1.0,
-    "batch_size": 32,
-    "num_workers": 2,
+    "batch_size": 48,
+    "num_workers": 4,
+    # Each worker prepares this many batches ahead. With cached samples this
+    # keeps the pinned-memory queue ready while the GPU is training.
+    "prefetch_factor": 4,
     "pin_memory": True,
     "device": "cuda",
-    "require_cuda": True,
     "amp": True,
+    # Inductor compilation is required for the optimized training path. The
+    # environment must provide a compatible CUDA Triton installation.
+    "compile": True,
     "epochs": 800,
     # --- Two-stage decoupled training -----------------------------------
     # Stage 1: train the geometry backbone alone (--geom-only). Stage 2: load
@@ -1905,6 +1910,26 @@ def torch_mds_coords(D, mask, dim=3, on_gpu=False, compute_dtype=torch.float64):
     return coords.to(dtype=out_dtype, device=out_device)
 
 
+_TRIPLET_POOL_CACHE = {}
+
+
+def _distinct_triplet_pool(n_atoms, device):
+    """Return cached ordered, distinct atom triplets for a shape/device pair."""
+    key = (n_atoms, device.type, device.index)
+    triplets = _TRIPLET_POOL_CACHE.get(key)
+    if triplets is None:
+        indices = torch.arange(n_atoms, device=device)
+        triplets = torch.cartesian_prod(indices, indices, indices)
+        distinct = (
+            (triplets[:, 0] != triplets[:, 1])
+            & (triplets[:, 0] != triplets[:, 2])
+            & (triplets[:, 1] != triplets[:, 2])
+        )
+        triplets = triplets[distinct]
+        _TRIPLET_POOL_CACHE[key] = triplets
+    return triplets
+
+
 def triangle_inequality_loss(
     D, mask, geom_mask=None, tol=0.02, triplet_samples=1024, stochastic=True
 ):
@@ -1914,17 +1939,7 @@ def triangle_inequality_loss(
         return D.new_tensor(0.0)
 
     device = D.device
-    triplets = torch.cartesian_prod(
-        torch.arange(N, device=device),
-        torch.arange(N, device=device),
-        torch.arange(N, device=device),
-    )
-    distinct = (
-        (triplets[:, 0] != triplets[:, 1])
-        & (triplets[:, 0] != triplets[:, 2])
-        & (triplets[:, 1] != triplets[:, 2])
-    )
-    triplets = triplets[distinct]
+    triplets = _distinct_triplet_pool(N, device)
     if triplet_samples and 0 < triplet_samples < triplets.shape[0]:
         n_pick = int(triplet_samples)
         if stochastic:
@@ -2398,21 +2413,41 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     else:
         ea_started = epoch >= config["ea_loss_start_epoch"]
         ea_w = config["ea_loss_weight"] if ea_started else 0.0
+    t_data, t_forward, t_loss, t_backward, t_opt = 0.0, 0.0, 0.0, 0.0, 0.0
+    def _sync():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
+        t_batch_start = time.perf_counter()
         for batch in loader:
+            _sync()
+            t_data += time.perf_counter() - t_batch_start
+
+            t0 = time.perf_counter()
             (
                 DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, Ea,
                 de_rxn, energy_feats, risk_pair_mask,
                 risk_score, risk_penalty, complexity_flag, risky_chem_flag,
             ) = move_batch_to_device(batch, device)
+            _sync()
+            t_data += time.perf_counter() - t0
+
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
+            
+            t0 = time.perf_counter()
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 p_DTS, p_DTS_coarse, ea_pred_norm = model(
                     DR, DI, DP, mask, atom_ids, atom_phys,
                     None if geom_only else de_rxn, energy_feats,
                 )
+            _sync()
+            t_forward += time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 if ea_only and ea_pred_norm is None:
                     raise RuntimeError("ea_only stage produced no Ea prediction (de_rxn missing).")
                 N = DR.shape[1]
@@ -2443,11 +2478,19 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 m2d_weighted = m2d * dist_weights
                 denom_weighted = m2d_weighted.sum().clamp(min=1)
                 
-                # Main geometry loss on the EGNN-refined distances.
-                l_geom = F.huber_loss(p_DTS * m2d_weighted, DTS * m2d_weighted, reduction='sum', delta=0.5) / denom_weighted
+                # Weight the per-pair Huber loss, rather than scaling its
+                # inputs. Scaling inputs would make Huber's transition delta
+                # vary with the pair weight and distort the robust objective.
+                l_geom = (
+                    F.huber_loss(p_DTS, DTS, reduction='none', delta=0.5)
+                    * m2d_weighted
+                ).sum() / denom_weighted
                 # Auxiliary loss on the coarse (pre-EGNN) distances trains the
                 # geometry head directly, giving the EGNN a stable MDS seed.
-                l_geom_coarse = F.huber_loss(p_DTS_coarse * m2d_weighted, DTS * m2d_weighted, reduction='sum', delta=0.5) / denom_weighted
+                l_geom_coarse = (
+                    F.huber_loss(p_DTS_coarse, DTS, reduction='none', delta=0.5)
+                    * m2d_weighted
+                ).sum() / denom_weighted
                 # Physical, unweighted interatomic-distance MAE (Angstrom): an
                 # interpretable readout of geometry quality, independent of the
                 # role/inverse-distance weighting used for the gradient.
@@ -2537,17 +2580,29 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 else:
                     l_ea = None
                     ea_mean_norm = ea_target_norm = None
+            _sync()
+            t_loss += time.perf_counter() - t0
+
             if is_train:
                 # Guard against a non-finite batch corrupting the weights: skip
                 # the step entirely rather than relying solely on GradScaler.
                 if not torch.isfinite(loss):
                     optimizer.zero_grad(set_to_none=True)
+                    t_batch_start = time.perf_counter()
                     continue
+                t0 = time.perf_counter()
                 scaler.scale(loss).backward()
+                _sync()
+                t_backward += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
                 scaler.step(optimizer)
                 scaler.update()
+                _sync()
+                t_opt += time.perf_counter() - t0
+
             total_loss += loss.item()
             total_geom += l_geom.item()
             total_geom_mae_A += geom_mae_A.item()
@@ -2557,6 +2612,8 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # Denormalized Ea MAE (kcal/mol) for human-readable tracking.
                 total_ea_mae += (ea_mean_norm.detach() - ea_target_norm).abs().mean().item() * ea_std
             n_batches += 1
+            t_batch_start = time.perf_counter()
+
     nb = max(n_batches, 1)
     return {
         "loss": total_loss / nb,
@@ -2565,6 +2622,13 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         "triangle": total_triangle / nb,
         "ea_mae": total_ea_mae / nb,
         "ea_norm": total_ea_norm / nb,
+        "timing": {
+            "data": t_data,
+            "forward": t_forward,
+            "loss": t_loss,
+            "backward": t_backward,
+            "opt": t_opt,
+        } if is_train else None
     }
 
 class _TeeLogger:
@@ -2724,6 +2788,7 @@ def _train_run(config, run_ctx):
     }
     if config["num_workers"] > 0:
         loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = config["prefetch_factor"]
     train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_subset, shuffle=False, **loader_kwargs)
     eval_loader = DataLoader(Subset(eval_dataset, list(range(n_total))), shuffle=False, **loader_kwargs)
@@ -2795,6 +2860,19 @@ def _train_run(config, run_ctx):
     swa_model = AveragedModel(model) if swa_enabled else None
     swa_scheduler = SWALR(optimizer, swa_lr=config["lr"] * 0.5) if swa_enabled else None
 
+    # torch.compile fuses the EGNN / pairwise-geometry-head kernels for a faster
+    # forward+backward. It shares parameters with `model`, so gradients still land
+    # on the original weights and the optimizer/SWA/checkpoint paths are unchanged.
+    # We ONLY ever call state_dict()/save/load on `model`, never on the compiled
+    # handle, so checkpoints keep their plain (unprefixed) keys and stay loadable
+    # by the un-compiled predict path. Validation and early-stopping are untouched.
+    train_model = model
+    if config.get("compile", False) and device.type == "cuda":
+        train_model = torch.compile(model)
+        print("torch.compile enabled (inductor); the first epoch includes a "
+              "one-time compilation cost. Disable with --no-compile if your "
+              "PyTorch/CUDA stack cannot compile this model.")
+
     # The epoch loop is interrupt-safe: a Ctrl-C lands in the except below and
     # falls through to the evaluation/dashboard section, which loads the best
     # checkpoint saved so far. Completed, early-stopped, and interrupted runs
@@ -2802,12 +2880,30 @@ def _train_run(config, run_ctx):
     try:
         for epoch in range(start_epoch, config["epochs"] + 1):
             epoch_t0 = time.time()
-            train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
+            train_metrics = run_epoch(train_model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
+            val_t0 = time.time()
             if swa_enabled and epoch >= swa_start:
                 swa_model.update_parameters(model)
                 val_metrics = run_epoch(swa_model.module, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
             else:
-                val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
+                val_metrics = run_epoch(train_model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
+            val_time = time.time() - val_t0
+
+            if epoch == start_epoch and train_metrics.get("timing"):
+                tm = train_metrics["timing"]
+                tot_ep = time.time() - epoch_t0
+                tot_calc = tm["data"] + tm["forward"] + tm["loss"] + tm["backward"] + tm["opt"] + val_time
+                tot = max(tot_ep, tot_calc)
+                print(f"\n{'-'*70}")
+                print(f" [EPOCH {epoch} PROFILING BREAKDOWN]")
+                print(f" Data Transfer (CPU->GPU):  {tm['data']:7.3f}s ({tm['data']/tot*100:5.1f}%)")
+                print(f" Forward Pass (Model):      {tm['forward']:7.3f}s ({tm['forward']/tot*100:5.1f}%)")
+                print(f" Loss Computation:          {tm['loss']:7.3f}s ({tm['loss']/tot*100:5.1f}%)")
+                print(f" Backward Pass (Autograd):  {tm['backward']:7.3f}s ({tm['backward']/tot*100:5.1f}%)")
+                print(f" Optimizer Update:          {tm['opt']:7.3f}s ({tm['opt']/tot*100:5.1f}%)")
+                print(f" Validation Evaluation:     {val_time:7.3f}s ({val_time/tot*100:5.1f}%)")
+                print(f" Total Epoch Time:          {tot_ep:7.3f}s (100.0%)")
+                print(f"{'-'*70}\n")
 
             if ea_only:
                 # Stage 2: select and early-stop purely on validation Ea MAE (kcal/mol).
@@ -4010,6 +4106,7 @@ if __name__ == "__main__":
     train_parser.add_argument("--epochs", type=int, default=CONFIG["epochs"], help="Training epochs")
     train_parser.add_argument("--batch-size", type=int, default=CONFIG["batch_size"], help="Training batch size")
     train_parser.add_argument("--num-workers", type=int, default=CONFIG["num_workers"], help="DataLoader worker processes")
+    train_parser.add_argument("--prefetch-factor", type=int, default=CONFIG["prefetch_factor"], help="Batches queued ahead per DataLoader worker")
     train_parser.add_argument("--val-split", type=float, default=CONFIG["val_split"], help="Validation fraction; 0.1 keeps 90%% of data for training")
     train_parser.add_argument("--split-seed", type=int, default=CONFIG["split_seed"], help="Random seed for train/validation splitting")
     train_parser.add_argument("--split-strategy", choices=["random", "stratified"], default=CONFIG["split_strategy"], help="Train/validation split strategy")
@@ -4020,8 +4117,10 @@ if __name__ == "__main__":
     train_parser.add_argument("--triangle-loss-weight", type=float, default=CONFIG["triangle_loss_weight"], help="Weight for triangle-inequality PINN loss")
     train_parser.add_argument("--triangle-triplet-samples", type=int, default=CONFIG["triangle_triplet_samples"], help="Triplets sampled per batch for triangle loss; 0 uses all")
     train_parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default=CONFIG["device"], help="Training device")
-    train_parser.add_argument("--require-cuda", action="store_true", help="Fail instead of falling back to CPU")
     train_parser.add_argument("--no-amp", action="store_true", help="Disable CUDA mixed precision")
+    compile_group = train_parser.add_mutually_exclusive_group()
+    compile_group.add_argument("--compile", action="store_true", help="Enable torch.compile when the CUDA/Triton runtime supports Inductor")
+    compile_group.add_argument("--no-compile", action="store_true", help="Explicitly use eager execution (default)")
     train_parser.add_argument("--patience", type=int, default=CONFIG["patience"], help="Early stopping patience")
     train_parser.add_argument("--lr", type=float, default=CONFIG["lr"], help="Learning rate")
     train_parser.add_argument("--ea-head-lr", type=float, default=CONFIG["ea_head_lr"], help="Learning rate for the Ea head")
@@ -4043,7 +4142,6 @@ if __name__ == "__main__":
     predict_parser.add_argument("--output", "-o", default=os.path.join(CONFIG["save_dir"], "psi_prediction.json"), help="Output JSON path")
     predict_parser.add_argument("--xyz", default=os.path.join(CONFIG["save_dir"], "psi_predicted_ts.xyz"), help="Output XYZ path")
     predict_parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default=CONFIG["device"], help="Prediction device")
-    predict_parser.add_argument("--require-cuda", action="store_true", help="Fail instead of falling back to CPU")
     dash_parser = subparsers.add_parser("dashboard", help="Generate the results dashboard from a detailed_analysis.json")
     dash_parser.add_argument("--data", default="detailed_analysis.json", help="Path to detailed_analysis.json")
     dash_parser.add_argument("--save-dir", default=".", help="Directory to save the HTML dashboard")
@@ -4053,8 +4151,6 @@ if __name__ == "__main__":
         args = parser.parse_args()
     if args.command == "predict":
         CONFIG["device"] = args.device
-        if args.require_cuda:
-            CONFIG["require_cuda"] = True
         predict_transition_state(CONFIG, args.reactant, args.product, args.model, args.output, args.xyz)
     elif args.command == "dashboard":
         create_dashboard(args.data, args.save_dir)
@@ -4070,6 +4166,7 @@ if __name__ == "__main__":
             CONFIG["epochs"] = args.epochs
             CONFIG["batch_size"] = args.batch_size
             CONFIG["num_workers"] = args.num_workers
+            CONFIG["prefetch_factor"] = args.prefetch_factor
             CONFIG["val_split"] = args.val_split
             CONFIG["split_seed"] = args.split_seed
             CONFIG["split_strategy"] = args.split_strategy
@@ -4080,10 +4177,12 @@ if __name__ == "__main__":
             CONFIG["triangle_loss_weight"] = args.triangle_loss_weight
             CONFIG["triangle_triplet_samples"] = args.triangle_triplet_samples
             CONFIG["device"] = args.device
-            if args.require_cuda:
-                CONFIG["require_cuda"] = True
             if args.no_amp:
                 CONFIG["amp"] = False
+            if args.compile:
+                CONFIG["compile"] = True
+            if args.no_compile:
+                CONFIG["compile"] = False
             CONFIG["patience"] = args.patience
             CONFIG["lr"] = args.lr
             CONFIG["ea_head_lr"] = args.ea_head_lr

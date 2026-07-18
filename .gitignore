@@ -1,43 +1,44 @@
-# Large dataset archives
-*.tar.gz
-
-# Model checkpoints
-*.pt
-
-# Temp extraction folders
-temp_extract/
-
-# Full predictions (large distance matrices)
-predictions_basic-1_full.json
-
-# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.so
 
-# IDE
-.vscode/
+# Environments
+venv/
+venv_cuda/
+venv_cuda_compile/
+env/
+.env
+.venv
+
+# IDE & OS
 .idea/
-
-# OS
-Thumbs.db
+.vscode/
 .DS_Store
+Thumbs.db
 
-# Virtual Environment
-.venv/
-
-# Large dataset and result files
-*.json
-*.xyz
-
-# Built-sample cache (rebuildable from RGD1 HDF5)
-*.pkl
-
-# Large datasets (RGD1 HDF5 + CSVs, wb97xd3) — fetched online, never committed
+# Datasets & Large Archives
 *.h5
-*.csv
+*.tar.gz
 RGD1_Dataset/
-
-# Training run logs and archived runs
-*.log
 Archives_Master/
+
+# Caches & Heavy Generated Assets
+*.log
+*.json
+*.pkl
+*.pt
+*.xyz
+*.html
+
+# Output Folders
+runs/
+predicted_ts_samples/
+irc_validation/
+validation_run_*/
+fast_gpu_irc_results/
+
+# Keep specific tracked files if needed
+!/extracted_b97d3.json
