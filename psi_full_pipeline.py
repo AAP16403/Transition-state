@@ -2795,104 +2795,126 @@ def _train_run(config, run_ctx):
     swa_model = AveragedModel(model) if swa_enabled else None
     swa_scheduler = SWALR(optimizer, swa_lr=config["lr"] * 0.5) if swa_enabled else None
 
-    for epoch in range(start_epoch, config["epochs"] + 1):
-        epoch_t0 = time.time()
-        train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
-        if swa_enabled and epoch >= swa_start:
-            swa_model.update_parameters(model)
-            val_metrics = run_epoch(swa_model.module, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
+    # The epoch loop is interrupt-safe: a Ctrl-C lands in the except below and
+    # falls through to the evaluation/dashboard section, which loads the best
+    # checkpoint saved so far. Completed, early-stopped, and interrupted runs
+    # all produce detailed_analysis.json + the HTML dashboard for their period.
+    try:
+        for epoch in range(start_epoch, config["epochs"] + 1):
+            epoch_t0 = time.time()
+            train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
+            if swa_enabled and epoch >= swa_start:
+                swa_model.update_parameters(model)
+                val_metrics = run_epoch(swa_model.module, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
+            else:
+                val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
+
+            if ea_only:
+                # Stage 2: select and early-stop purely on validation Ea MAE (kcal/mol).
+                val_select = val_metrics["ea_mae"]
+            elif geom_only:
+                # Stage 1: geometry only.
+                val_select = val_metrics["geom"]
+            else:
+                val_select = val_metrics["geom"] + config["ea_select_weight"] * val_metrics["ea_norm"]
+
+            if swa_enabled and epoch >= swa_start:
+                swa_scheduler.step()
+            else:
+                scheduler.step(val_select)
+            current_lr = optimizer.param_groups[0]['lr']
+            current_ea_lr = optimizer.param_groups[-1]['lr']
+
+            history.append({
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "val_loss": val_metrics["loss"],
+                "val_select": val_select,
+                "train_geom": train_metrics["geom"],
+                "val_geom": val_metrics["geom"],
+                "train_geom_mae_A": train_metrics["geom_mae_A"],
+                "val_geom_mae_A": val_metrics["geom_mae_A"],
+                "train_triangle": train_metrics["triangle"],
+                "val_triangle": val_metrics["triangle"],
+                "train_ea_mae": train_metrics["ea_mae"],
+                "train_ea_norm": train_metrics["ea_norm"],
+                "val_ea_mae": val_metrics["ea_mae"],
+                "val_ea_norm": val_metrics["ea_norm"],
+                "lr": current_lr,
+                "ea_lr": current_ea_lr,
+            })
+            improved = val_select < best_val_loss
+            if improved:
+                best_val_loss = val_select
+                best_state_dict = swa_model.module.state_dict() if (swa_enabled and epoch >= swa_start) else model.state_dict()
+                torch.save({"model_state_dict": best_state_dict, "metadata": metadata}, best_model_path)
+            patience_counter = 0 if improved else patience_counter + 1
+
+            save_dict = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "epoch": epoch,
+                "best_val_loss": best_val_loss,
+                "patience_counter": patience_counter,
+                "metadata": metadata,
+                "history": history
+            }
+            if swa_enabled and swa_model is not None:
+                save_dict["swa_model_state_dict"] = swa_model.state_dict()
+                if swa_scheduler is not None:
+                    save_dict["swa_scheduler_state_dict"] = swa_scheduler.state_dict()
+            torch.save(save_dict, latest_model_path)
+
+            # Verbose per-epoch line (every epoch) with wall-time and ETA, plus
+            # incremental persistence so an interrupted run is still fully analysable.
+            epoch_time = time.time() - epoch_t0
+            eta_min = (config["epochs"] - epoch) * epoch_time / 60.0
+            marker = " *" if improved else ""
+            print(f"{epoch:6d} | {train_metrics['loss']:11.4f} | {val_metrics['loss']:11.4f} | "
+                  f"{train_metrics['geom']:8.5f} | {val_metrics['geom']:8.5f} | "
+                  f"{val_metrics['geom_mae_A']:9.4f} | "
+                  f"{train_metrics['ea_mae']:8.3f} | {val_metrics['ea_mae']:8.3f} | "
+                  f"{current_lr:10.2e} | {epoch_time:6.1f}s | ETA {eta_min:6.1f}m{marker}")
+            with open(run_ctx["history_path"], "w") as f:
+                json.dump(history, f, indent=2)
+            if improved:
+                run_ctx["best_epoch"] = epoch
+            run_ctx["epochs_completed"] = epoch
+            run_ctx["best_val_select"] = best_val_loss
+            run_ctx["patience_counter"] = patience_counter
+            run_ctx["last_metrics"] = history[-1]
+            _write_run_report(run_ctx)
+            if patience_counter >= config["patience"]:
+                print(f"\nEarly stopping at epoch {epoch} (no improvement for {config['patience']} epochs)")
+                run_ctx["stop_reason"] = "early_stopping_patience"
+                break
         else:
-            val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
-        
-        if ea_only:
-            # Stage 2: select and early-stop purely on validation Ea MAE (kcal/mol).
-            val_select = val_metrics["ea_mae"]
-        elif geom_only:
-            # Stage 1: geometry only.
-            val_select = val_metrics["geom"]
-        else:
-            val_select = val_metrics["geom"] + config["ea_select_weight"] * val_metrics["ea_norm"]
-
-        if swa_enabled and epoch >= swa_start:
-            swa_scheduler.step()
-        else:
-            scheduler.step(val_select)
-        current_lr = optimizer.param_groups[0]['lr']
-        current_ea_lr = optimizer.param_groups[-1]['lr']
-
-        history.append({
-            "epoch": epoch,
-            "train_loss": train_metrics["loss"],
-            "val_loss": val_metrics["loss"],
-            "val_select": val_select,
-            "train_geom": train_metrics["geom"],
-            "val_geom": val_metrics["geom"],
-            "train_geom_mae_A": train_metrics["geom_mae_A"],
-            "val_geom_mae_A": val_metrics["geom_mae_A"],
-            "train_triangle": train_metrics["triangle"],
-            "val_triangle": val_metrics["triangle"],
-            "train_ea_mae": train_metrics["ea_mae"],
-            "train_ea_norm": train_metrics["ea_norm"],
-            "val_ea_mae": val_metrics["ea_mae"],
-            "val_ea_norm": val_metrics["ea_norm"],
-            "lr": current_lr,
-            "ea_lr": current_ea_lr,
-        })
-        improved = val_select < best_val_loss
-        if improved:
-            best_val_loss = val_select
-            best_state_dict = swa_model.module.state_dict() if (swa_enabled and epoch >= swa_start) else model.state_dict()
-            torch.save({"model_state_dict": best_state_dict, "metadata": metadata}, best_model_path)
-        patience_counter = 0 if improved else patience_counter + 1
-
-        save_dict = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "epoch": epoch,
-            "best_val_loss": best_val_loss,
-            "patience_counter": patience_counter,
-            "metadata": metadata,
-            "history": history
-        }
-        if swa_enabled and swa_model is not None:
-            save_dict["swa_model_state_dict"] = swa_model.state_dict()
-            if swa_scheduler is not None:
-                save_dict["swa_scheduler_state_dict"] = swa_scheduler.state_dict()
-        torch.save(save_dict, latest_model_path)
-
-        # Verbose per-epoch line (every epoch) with wall-time and ETA, plus
-        # incremental persistence so an interrupted run is still fully analysable.
-        epoch_time = time.time() - epoch_t0
-        eta_min = (config["epochs"] - epoch) * epoch_time / 60.0
-        marker = " *" if improved else ""
-        print(f"{epoch:6d} | {train_metrics['loss']:11.4f} | {val_metrics['loss']:11.4f} | "
-              f"{train_metrics['geom']:8.5f} | {val_metrics['geom']:8.5f} | "
-              f"{val_metrics['geom_mae_A']:9.4f} | "
-              f"{train_metrics['ea_mae']:8.3f} | {val_metrics['ea_mae']:8.3f} | "
-              f"{current_lr:10.2e} | {epoch_time:6.1f}s | ETA {eta_min:6.1f}m{marker}")
-        with open(run_ctx["history_path"], "w") as f:
-            json.dump(history, f, indent=2)
-        if improved:
-            run_ctx["best_epoch"] = epoch
-        run_ctx["epochs_completed"] = epoch
-        run_ctx["best_val_select"] = best_val_loss
-        run_ctx["patience_counter"] = patience_counter
-        run_ctx["last_metrics"] = history[-1]
+            run_ctx["stop_reason"] = "max_epochs_reached"
+    except KeyboardInterrupt:
+        run_ctx["status"] = "interrupted"
+        run_ctx["stop_reason"] = "keyboard_interrupt"
         _write_run_report(run_ctx)
-        if patience_counter >= config["patience"]:
-            print(f"\nEarly stopping at epoch {epoch} (no improvement for {config['patience']} epochs)")
-            run_ctx["stop_reason"] = "early_stopping_patience"
-            break
-    else:
-        run_ctx["stop_reason"] = "max_epochs_reached"
+        print(
+            f"\n[interrupted] Ctrl-C after {run_ctx['epochs_completed']} completed "
+            f"epoch(s) (best epoch: {run_ctx['best_epoch']}). Proceeding to "
+            "evaluation + dashboard with the best checkpoint saved so far; "
+            "press Ctrl-C again to abort."
+        )
     history_path = run_ctx["history_path"]
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"\nTraining history saved to {history_path}")
-    print(f"\nLoading best model (best val_select={best_val_loss:.4f})...")
-    checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # Load the best checkpoint saved so far. If the run stopped before the first
+    # epoch finished (no best checkpoint on disk yet), evaluate the current
+    # in-memory weights instead so a dashboard is still produced for this period.
+    if os.path.exists(best_model_path):
+        print(f"\nLoading best model (best val_select={best_val_loss:.4f})...")
+        checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        print("\nNo best checkpoint saved yet (stopped before the first epoch "
+              "completed); evaluating the current in-memory weights instead.")
     # =========================================================================
     # Post-training: predict TS geometries, then compute Ea via physics
     # =========================================================================
