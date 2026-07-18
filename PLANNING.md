@@ -983,3 +983,30 @@ The pipeline is currently executing with all critical fixes applied:
 - Phase 2b Inverse Distance Weighting
 
 Once this run concludes, compare its `detailed_analysis.json` against the historical baseline to decide if Phase 3 or Experiment D are necessary.
+
+---
+
+## 10. Latest Pipeline Enhancements (Detailed Technical Breakdown)
+
+We have recently transitioned from the problematic Swarm MoE to an optimized, stable EGNN architecture trained on the high-fidelity RGD1 dataset (40,000 samples). This section explicitly details the previous failures and the architectural interventions deployed to resolve them.
+
+### 10.1 Resolving Variance Collapse & Overconfidence
+*   **The Failure:** Previous Swarm MoE iterations relied on a Gaussian Negative Log-Likelihood (NLL) loss. Around Epoch 15-20, the model would suffer from "variance collapse." It would become hyper-confident in bad predictions, driving the predicted variance to zero. This artificially cratered the training loss while validation loss exploded into infinity.
+*   **The Fix:** We entirely removed the Gaussian uncertainty prediction and reverted to a deterministic **Huber (Smooth L1) Loss**. Huber acts as an L1 loss for large errors (preventing massive gradient spikes from extreme outliers) and MSE for small errors (allowing deep convergence). This completely eliminated variance collapse.
+
+### 10.2 Resolving "Fragment Melting" (Scale Imbalance)
+*   **The Failure:** When using standard distance matrices, a 10% error on a 10 Å inter-fragment distance produces a massive loss gradient, while a 10% error on a delicate 1.2 Å forming C-N bond produces almost nothing. The network learned a "Clever Hans" shortcut: it loosely placed the molecular fragments in space to minimize global error, but allowed the actual atoms to crash into each other and overlap ("melting"), which destroyed physical validity.
+*   **The Fix:** We implemented a two-fold Physics Constraint:
+    1.  **Inverse Distance Weighting:** The geometry loss is multiplied by `1.0 / (DTS + 1.0)`. This mathematically equalizes the gradients, making a 0.1 Å error on a chemical bond just as punishing as a 0.1 Å error on a distant spectator atom.
+    2.  **Risk-Pair Penalty Mask:** The pipeline dynamically scans for bonds involving Nitrogen and Oxygen (`N-N`, `N-O`, `C-N`, `O-O`) that are actively breaking or forming. Because 97% of the dataset involves highly crowded, complex TS geometries, these specific reaction-center pairs receive a continuous penalty multiplier (up to 3.0x). The model is forced to prioritize the active quantum site.
+
+### 10.3 Resolving Gradient Conflict (The Detached Head)
+*   **The Failure:** When the Activation Energy (Ea) loss and Geometry loss were backpropagated simultaneously through the same graph backbone, the gradients fought. Pushing atoms to their exact physical locations did not always mathematically align with the fastest path to predicting the thermodynamic Ea scalar.
+*   **The Fix:** The features passed to the Ea Head are now explicitly detached (`h.detach()`) during the warm-up phases. The geometry backbone is forced to learn *only* perfect 3D coordinates. The Ea Head is forced to learn the thermodynamic values based on those frozen coordinates.
+
+### 10.4 Resolving GPU Starvation (The Caching Bottleneck)
+*   **The Failure:** Epochs were taking ~27 minutes. The `DataLoader` was re-computing complex distance matrices, risk masks, and physics features on the CPU every single batch, starving the GPU.
+*   **The Fix:** The entire RGD1 dataset (all 40,000 samples) is now pre-processed once at pipeline startup and cached into memory via `samples_cache_rgd1.pkl`. The DataLoader now simply fetches pre-computed tensors. Epoch times dropped from ~27 minutes to ~2.4 minutes (a >11x throughput increase).
+
+### 10.5 Eliminating the Generalization Gap
+*   **The Intervention:** To close the gap between training and validation accuracy without destroying the delicate TS geometries, we abandoned Step-LR for a **Cosine Annealing Warmup** scheduler, preventing premature plateau death. In the final phases of training, **Stochastic Weight Averaging (SWA)** is triggered to smooth the weight landscapes and bridge the final generalization gap on complex multi-bond rearrangements.

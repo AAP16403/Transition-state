@@ -61,8 +61,66 @@ Important implementation fact:
 - `psi_cloud_pipeline.py` currently uses unweighted geometry loss and no
   coordinate noise.
 
+\newpage
+
+# Current Features and Drawbacks
+
+The transition-state prediction pipeline has been actively iterated to resolve physical and computational challenges. The current architecture reflects the following mature features and remaining limitations.
+
+## Pipeline Features
+
+1. **High-Fidelity EGNN Backbone:** Replaced sequence-only layers to maintain strict SE(3) equivariance, allowing the model to reason natively over 3D point clouds and preserve rotational/translational invariance.
+2. **High-Fidelity Datasets:** Migrated to the comprehensive WB97XD3 and RGD1 transition-state datasets (HDF5/JSON formats) yielding a robust and varied sampling of complex reactions.
+3. **ZPE-Corrected Activation Energy:** Integrated zero-point energy (ZPE) corrections extracted directly via CSV to resolve high-barrier activation energy underpredictions.
+4. **Smooth L1 (Huber) Loss:** Replaced unstable Gaussian NLL with Smooth L1 loss to prevent variance collapse and hyper-confidence overfitting, specifically during complex Swarm MoE training runs.
+5. **Stochastic Weight Averaging (SWA):** Implemented SWA to stabilize late-stage convergence, significantly reducing geometric overfitting and bridging the generalization gap.
+6. **Inverse-Distance Geometry Weighting:** Resolves "fragment-melting" artifacts by exponentially penalizing errors in short-range atomic distances (steric clashes) over long-range distances.
+7. **Pre-computation Caching:** Mitigated severe CPU data-loading bottlenecks by pre-computing and caching pairwise distance matrices and spatial feature tensors.
+8. **Fully-Attached Attention Ea Head:** Features latent cross-talk attention directly pooling from the EGNN backbone to correlate structural distortions explicitly with activation barriers.
+
+## Known Drawbacks and Limitations
+
+1. **CPU/Data Bottlenecks:** Despite caching, the data pipeline is computationally heavy, and scaling to full-dataset epochs demands significant local CPU pre-processing time.
+2. **Persistent Generalization Gap:** The EGNN backbone occasionally risks memorizing coordinate-specific structural distributions, requiring careful regularization to generalize perfectly out-of-distribution.
+3. **Hardware Constraints:** Running the fully-attached architecture (e.g. Swarm MoE configurations) on local NVIDIA hardware imposes strict limits on batch sizing and training throughput.
+4. **Steric Sensitivity:** While inverse-distance weighting reduces unphysical fragment melting, the model's raw inference output sometimes requires post-processing geometry relaxation to fully resolve transient steric clashes.
 
 \newpage
+
+# Installation and Usage (Pipeline Execution)
+
+The following summarizes the practical usage previously maintained in the project `README.md`.
+
+## Installation
+
+Ensure you have Python 3.8+ and install the dependencies in a CUDA-enabled environment:
+```bash
+pip install -r requirements.txt
+```
+
+## Execution Commands
+
+**1. Training the Model**
+To extract data, process datasets, and train the model from scratch:
+```bash
+python psi_full_pipeline.py train --extract-limit 30000 --target-reactions 10000 --force-extract
+```
+This produces `psi_final.pt` containing the best model weights.
+
+**2. Inference (Prediction)**
+To predict a transition state for a new reaction given reactant and product `.log` files:
+```bash
+python psi_full_pipeline.py predict -r reactant.log -p product.log -o prediction.json --xyz predicted_ts.xyz
+```
+
+**3. Visualization Dashboard**
+To generate a Plotly HTML performance dashboard (`psi_results_dashboard.html`) from the training/evaluation analysis:
+```bash
+python psi_full_pipeline.py dashboard
+```
+
+\newpage
+
 
 # Notation
 

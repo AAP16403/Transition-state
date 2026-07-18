@@ -961,7 +961,7 @@ def build_atom_vocab():
 def _sample_cache_meta(config):
     """Feature-affecting params. A change to any of these invalidates the cache."""
     return {
-        "cache_version": 1,
+        "cache_version": 2,  # v2: drop reactions with empty reaction center (no changed bonds)
         "dataset": "rgd1",
         "max_atoms": config["max_atoms"],
         "fragment_bond_scale": config["fragment_bond_scale"],
@@ -1159,6 +1159,7 @@ def _build_reaction_samples_from_h5(config):
     
     samples = []
     atom_types_map = {}
+    skipped_no_rc = 0
     target_reactions = config.get("target_reactions", 30000)
     
     print(f"Opening HDF5 dataset at {h5_path} to extract {target_reactions} samples...")
@@ -1224,6 +1225,13 @@ def _build_reaction_samples_from_h5(config):
                 D_R_raw, D_P_raw, atom_types, n, config["max_atoms"],
                 config["fragment_bond_scale"], config["spectator_threshold"],
             )
+            # Reaction-center pooling requires at least one forming/breaking bond.
+            # A reaction whose covalent bond sets are identical in R and P yields an
+            # empty RC mask, which the Ea head refuses to pool over (it raises). Drop
+            # these at load time rather than degrade the pooling downstream.
+            if risk["changed_bonds"] == 0:
+                skipped_no_rc += 1
+                continue
             ts_fragments = find_fragments_from_coords(
                 c_TS, atom_types, n, config["fragment_bond_scale"]
             )
@@ -1258,6 +1266,8 @@ def _build_reaction_samples_from_h5(config):
             if len(samples) % 1000 == 0:
                 print(f"  Processed {len(samples)}/{target_reactions} reactions...", flush=True)
 
+    if skipped_no_rc:
+        print(f"Skipped {skipped_no_rc} reactions with no forming/breaking bonds (empty reaction center).", flush=True)
     print(f"Loaded {len(samples)} complete reaction triplets.", flush=True)
     return samples, atom_vocab, atom_types_map
 
