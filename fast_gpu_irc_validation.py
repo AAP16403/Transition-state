@@ -158,7 +158,7 @@ def run_fast_gpu_irc(
         pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
         np.fill_diagonal(pred_dist, 0.0)
 
-        sample_dict = samples[val_indices[i]]
+        sample_dict = samples[val_idx]
         atom_types = sample_dict["atom_types"]
         c_R = np.asarray(sample_dict["c_R"][:n], dtype=np.float64)
         c_P = np.asarray(sample_dict["c_P"][:n], dtype=np.float64)
