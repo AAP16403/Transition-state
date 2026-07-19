@@ -46,22 +46,16 @@ def stats_from_checkpoint_or_samples(metadata, samples, train_indices):
     return p.compute_normalization(samples, train_indices)
 
 def configure_atom_angle_features_from_checkpoint(config, metadata):
-    """Match model/input feature width to the checkpoint being evaluated."""
-    if metadata and "atom_phys_dim" in metadata:
-        atom_phys_dim = int(metadata["atom_phys_dim"])
-    elif metadata and "aphys_mean" in metadata:
-        atom_phys_dim = len(metadata["aphys_mean"])
-    else:
-        atom_phys_dim = p.get_atom_phys_dim(config)
+    """Return the atom descriptor width for the current pipeline.
 
-    if atom_phys_dim == p.ATOM_BASE_PHYS_DIM:
-        config["atom_angle_features_enabled"] = False
-    elif atom_phys_dim == p.ATOM_PHYS_DIM:
-        config["atom_angle_features_enabled"] = True
-    else:
+    The current psi_full_pipeline uses a fixed ATOM_PHYS_DIM (no atom-angle
+    toggle), so the checkpoint width must match it.
+    """
+    atom_phys_dim = p.ATOM_PHYS_DIM
+    if metadata and "aphys_mean" in metadata and len(metadata["aphys_mean"]) != atom_phys_dim:
         raise ValueError(
-            f"Unsupported checkpoint atom descriptor width {atom_phys_dim}. "
-            f"Expected {p.ATOM_BASE_PHYS_DIM} or {p.ATOM_PHYS_DIM}."
+            f"Checkpoint atom descriptor width {len(metadata['aphys_mean'])} "
+            f"!= pipeline ATOM_PHYS_DIM {atom_phys_dim}."
         )
     return atom_phys_dim
 
@@ -99,9 +93,6 @@ def run_resumed_evaluation(args):
 
     config = dict(p.CONFIG)
     config.update(metadata.get("config_snapshot", {}))
-    checkpoint_ea_dim = p.infer_ea_head_output_dim(checkpoint_cpu["model_state_dict"])
-    if checkpoint_ea_dim is not None:
-        config["ea_uncertainty_enabled"] = checkpoint_ea_dim == 2
     atom_phys_dim = configure_atom_angle_features_from_checkpoint(config, metadata)
     config["force_extract"] = False
     if args.dataset_json is not None:
@@ -203,10 +194,8 @@ def run_resumed_evaluation(args):
             ea_pred_kcal = None
             ea_sigma_kcal = None
             if ea_pred_norm is not None:
-                ea_mean_norm, ea_log_var = p.split_ea_prediction(ea_pred_norm, config)
-                ea_pred_kcal = ea_mean_norm.float().cpu().numpy() * ea_std + ea_mean
-                if ea_log_var is not None:
-                    ea_sigma_kcal = torch.exp(0.5 * ea_log_var.float()).cpu().numpy() * ea_std
+                # Current pipeline's Ea head emits a single scalar (no uncertainty).
+                ea_pred_kcal = ea_pred_norm.float().cpu().numpy() * ea_std + ea_mean
             for i in range(len(batch["rxn_id"])):
                 rxn_id = batch["rxn_id"][i]
                 n = int(mask[i].sum().item())
@@ -341,7 +330,13 @@ def parse_args():
     parser.add_argument("--final-model", default=None)
     parser.add_argument("--target-reactions", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader workers. Default 0: avoids forked workers each holding a "
+        "~5GB copy of the in-memory dataset, which OOMs low-RAM machines during eval.",
+    )
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default=p.CONFIG["device"])
     parser.add_argument("--require-cuda", action="store_true")
     parser.add_argument("--no-amp", action="store_true")

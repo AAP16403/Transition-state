@@ -32,6 +32,10 @@ Archives_Master/
 *.pt
 *.xyz
 *.html
+*.out
+*.err
+run_log.txt
+run_report.json
 
 # Output Folders
 runs/
