@@ -207,6 +207,123 @@ relative to the structural ceiling.
 
 ---
 
+## Fixes applied (2026-07-20)
+
+Implemented in `psi_full_pipeline.py`, verified by static compile + a synthetic forward/backward unit
+test. **Not yet trained** (training runs elsewhere) — a short smoke run is recommended before a full run.
+Not mirrored to `psi_cloud`/`psi_swarm` (older divergent loss: they scale Huber inputs and lack the
+role-weighting; they also still carry the old `PlateauWarmupScheduler` and padded `torch_mds_coords`).
+
+This section merges the earlier standalone `failure.md`, which added two further root causes on top of the
+under-shoot diagnosis below: (1) **LR-schedule under-utilization** — the plateau scheduler warmed up for 40
+epochs then sat at peak LR for 100+ epochs before its first decay, wasting compute and overshooting minima
+(→ cosine schedule); and (2) **geometry-MAE saturation** — validation geometry MAE floored (~0.16 Å) while
+train error kept dropping, because the MDS `eigh` gradient was severed by padding, starving the GeometryHead
+of 3D-refinement feedback (→ per-molecule unpadded differentiable MDS). Both are in the table below.
+
+**A diagnostic that reframed the fix.** Before changing anything, a check measured `|D_pred − midpoint|` vs
+`|D_true − midpoint|`: the model **systematically under-shoots** — `pred_dev = 0.86 × true_dev`, under-shoot
+in 85–94% of reactions across *all* quartiles, and on the hardest cases (true maxdev > 3.0 Å) it reaches
+only **66% of the needed displacement**. Critically it under-shoots *even inside* the ±3.0 clamp, so the
+clamp is not the main cause — the **loss rewards hedging toward the midpoint**. That moved the fix from
+"architecture" to "loss + uncertainty".
+
+| Change | Mechanism | Config | Status |
+|---|---|---|---|
+| Soft δ-clamp | `delta = dc·tanh(delta/dc)`, raised 3.0→5.0; hard clamp zeroed the gradient past the bound | `delta_clamp` | ✅ verified |
+| Movement-aware weighting | Lift each pair's loss weight toward the active weight ∝ its R→P movement `|D_R−D_P|`, so moving "spectator" pairs (unimolecular rearrangements) are no longer damped to 0.25× | `geom_move_weight`=2.0 | ✅ verified |
+| Huber δ 0.5→1.0 | Keeps large reactive-bond misses in the quadratic regime so they get real gradient instead of the flat/hedged linear region | `geom_huber_delta`=1.0 | ✅ verified |
+| Uncertainty head + Kendall-Gal attenuation | Per-atom log-variance from EGNN features; `exp(−s)·huber + 0.5·s` lets the model express uncertainty instead of hedging every pair, and revives the dead UQ | `geom_uncertainty`=True | ✅ verified |
+| Cosine LR schedule | Replace `PlateauWarmupScheduler` (40-epoch warmup, then sat at peak LR 100+ epochs before its first plateau decay) with a 5-epoch linear warmup + cosine anneal to `1e-6` over the epochs until `swa_start`. Continuous decay lets the model settle into sharper minima instead of overshooting. | `warmup_epochs`=5 | ✅ verified |
+| Per-molecule unpadded differentiable MDS | Restore end-to-end gradient through the 3D reconstruction — see resolution below | `mds_differentiable`=True | ✅ verified |
+
+**Resolved (formerly a "proven dead end"):** `mds_differentiable` — letting the geometry head learn
+*through* the 3D reconstruction by backpropagating through the MDS `eigh`. The **original padded** path was a
+**silent no-op**: the dummy-shift that separates padded atoms creates degenerate eigenvalues, `eigh`'s
+backward goes non-finite, and the sanitizer zeroes it — so with any padded molecule (i.e. always, 9–30 atoms
+in a 30-slot tensor) the geometry head received **zero** gradient. **Fix:** `torch_mds_coords(differentiable=True)`
+now slices each molecule to its real `[n, n]` block and runs `eigh` **unpadded**, so there is no
+padding-induced degeneracy and the backward is stable — gradient flows geom-loss → EGNN → MDS → GeometryHead.
+Two correctness details were required to make it real rather than another silent no-op: (1) the seed passed to
+MDS must **not** be detached when the flag is on (it now isn't); (2) `sqrt(λ)` on a clamped eigenvalue has an
+**infinite backward gradient at 0**, and early in training the dim-th eigenvalue sits at/near zero, so a bare
+`.sqrt()` re-emits `inf`/`NaN` grads that the forward `nan_to_num` cannot catch — a `+1e-8` floor before the
+`sqrt` keeps the backward finite. **Now default on.**
+
+**Caveats on the MDS fix.** (a) *Throughput* — the per-molecule loop replaces one batched `eigh` with a
+Python loop of `.item()` syncs + tiny per-molecule `eigh` calls; benchmark before a long run. (b) *Residual
+degeneracy* — the `+eps`/sqrt fix removes the `sqrt(0)` NaN, but `eigh`'s backward still contains
+`1/(λ_i − λ_j)` terms; when the dim-th eigenvalue collides with the near-zero cluster (predicted distances
+not yet a valid 3-D Euclidean matrix) the backward can still spike. A loud non-finite-grad guard
+(detect → skip step → log) is preferable to silently zeroing. (c) *Redundancy* — the coordinate-native
+rewrite in the Appendix deletes MDS entirely and makes this bridge obsolete; if that migration is committed,
+this fix is temporary.
+
+**Success metric after retrain:** `pred_dev / true_dev` slope should move from **0.81 → ~1.0**; unimolecular
+(1-fragment) median `dist_MAE` should drop from 0.117 toward the multi-fragment 0.05–0.08 range.
+
+---
+
+## Appendix — Scope: coordinate-native geometry (the real MDS-bottleneck kill)
+
+The loss/uncertainty fixes attack the *symptoms* of the under-shoot. The **root** is the geometry
+*algorithm*: `distance interpolation → detached MDS (eigh) → incremental EGNN`. Each stage is a
+deterministic, midpoint-anchored, lossy transform, and the MDS detachment cannot be removed in the
+padded-batch design (proven above). The SOTA line (React-OT 0.053 Å, OA-ReactDiff, LEFTNet on Transition1x)
+skips all of it: an **equivariant network predicts TS coordinates directly from R+P coordinates**,
+end-to-end, no eigh. Scoping that migration here.
+
+### Goal
+Replace the distance→MDS→EGNN chain with a coordinate-native, end-to-end-differentiable geometry head that
+predicts TS coordinates from reactant/product coordinates, and supervise it directly against the DFT TS
+geometry `c_TS`.
+
+### What changes
+
+**1. Data layer (`ReactionDataset`, `move_batch_to_device`).** Currently the model sees only distance
+matrices (`D_R/D_I/D_P`). Add the raw coordinates `c_R`, `c_P` (already in every `sample` dict, and already
+used by the coord-noise branch and by `xtb_qm_validation`) to the batch. Define a **common reference frame**:
+Kabsch-align the product onto the reactant, giving `c_P_aligned`; the physical midpoint
+`c_I = (c_R + c_P_aligned)/2` is the same construction inference already uses as the MDS reference — reuse it
+as the coordinate seed. Handle multi-fragment cases with the existing `kabsch_align_reactant_fragments`.
+
+**2. Geometry head.** Drop `GeometryHead` (distance interpolation) and `torch_mds_coords` (eigh MDS). Seed
+the existing E(n)-equivariant `EGNN` with the real `c_I` midpoint coordinates (not the MDS of a predicted
+distance matrix) and let it predict the displacement to the TS. Node features still come from `PSICore`.
+This removes both the interpolation prior *and* the eigh bottleneck; gradient flows end-to-end through
+coordinates. (The EGNN is already E(n)-equivariant, so no new equivariant machinery is needed — it just
+operates on a real seed instead of an eigen-embedded one.)
+
+**3. Equivariance / frame.** The distance-matrix design bought SE(3)-invariance for free; coordinate-native
+must be explicit. Two safe options: (a) predict in the reactant frame and train with a **Kabsch-aligned**
+coordinate loss to `c_TS` (frame-invariant target); or (b) keep the equivariant EGNN and let equivariance
+handle it, with the alignment only defining the seed. Distance-matrix auxiliaries (triangle, steric) still
+apply — compute them from the predicted coordinates. **Bonus:** coordinates recover chirality/handedness,
+which distance matrices throw away.
+
+**4. Loss.** Primary: Kabsch-RMSD (or aligned-coordinate Huber) of predicted coords vs `c_TS`. Keep the
+movement-aware weighting, triangle, steric, and spectator terms (recomputed from coords). The uncertainty
+head carries over unchanged (per-atom coordinate variance).
+
+**5. Ea head: unchanged.** It reads the EGNN's node features `h_ts` (detached) — that interface is preserved,
+so the energy path and the two-stage training are untouched.
+
+### Risks & mitigations
+- **Reference-frame / alignment stability** — Kabsch is standard and stable; align once per sample, cache.
+- **Equivariance bugs** — unit-test that a random rotation of R+P rotates the predicted TS identically.
+- **Training instability from a bigger change** — gate behind `geom_mode: "coord" | "distance"` so the old
+  path stays runnable; retrain from scratch (weights are architecture-specific).
+- **Multi-fragment framing** — reuse `kabsch_align_reactant_fragments`; the fragment logic already exists.
+
+### Effort & payoff
+Medium–high: touches the data layer, the geometry head, and the geometry loss, but **keeps the PSICore
+backbone, the EGNN module, and the entire Ea head.** Expected payoff: removes the under-shoot at its root
+(no midpoint interpolation prior, no lossy MDS), recovers chirality, and adopts the exact inductive bias of
+the current SOTA geometry models — the single change most likely to close the gap to React-OT-class
+`dist_MAE`.
+
+---
+
 ## Caveats
 
 - `D_midpoint` uses `D_I = (D_R_aligned + D_P)/2`; the interpolation head mixes `D_R`/`D_P` with a learned

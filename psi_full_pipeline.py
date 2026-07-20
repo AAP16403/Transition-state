@@ -825,7 +825,9 @@ CONFIG = {
     "attn_layers": 3,
     "ff_dim": 512,
     "dropout": 0.1,
-    "delta_clamp": 3.0,
+    "delta_clamp": 5.0,  # soft (tanh) bound on the interpolation residual; raised from
+                         # 3.0 so the ~4% of TSs needing a large non-interpolative move
+                         # aren't capped (mode-A under-shoot fix). See GeometryHead.
     # --- EGNN coordinate refiner -----------------------------------------
     # After the geometry head predicts a TS distance matrix, we embed it to 3D
     # (differentiable MDS) and refine the coordinates with an E(n)-equivariant
@@ -849,7 +851,7 @@ CONFIG = {
     "ea_head_weight_decay": 1e-3,
     "lr": 1.5e-4,
     "weight_decay": 1e-3,
-    "warmup_epochs": 40,
+    "warmup_epochs": 5,
     "grad_clip": 1.0,
     "batch_size": 48,
     "num_workers": 4,
@@ -902,6 +904,28 @@ CONFIG = {
     # consumer cards have ~1/64 FP64 throughput (float64 GPU eigh would be slow).
     "mds_on_gpu": True,
     "mds_dtype": "float32",
+    # --- Kill the geometry bottleneck (FAILURE_ANALYSIS mode A) ---------------
+    # (B) mds_differentiable: flow gradient through the MDS embedding so the
+    #     geometry head learns THROUGH the 3D reconstruction. The old padded-eigh
+    #     path WAS a no-op: the dummy-shift that separates padded atoms produced
+    #     degenerate eigenvalues, eigh's backward went non-finite on them, and the
+    #     sanitizer zeroed the result -- so the geometry head got ZERO gradient.
+    #     FIXED here: torch_mds_coords(differentiable=True) slices each molecule to
+    #     its real [n, n] block and runs eigh unpadded, so no padding-induced
+    #     degeneracy and the backward is stable. Gradient now flows geom-loss ->
+    #     EGNN -> MDS -> GeometryHead. Enabled by default.
+    # (A) geom_uncertainty: heteroscedastic per-atom geometry log-variance head +
+    #     Kendall-Gal loss attenuation. Lets the model express uncertainty instead
+    #     of hedging every prediction toward the R/P midpoint (under-shoot fix),
+    #     and revives the (currently unpopulated) uncertainty estimate. VERIFIED
+    #     working (finite, nonzero gradient to the head).
+    "mds_differentiable": True,
+    "geom_uncertainty": True,
+    # Auto-write the ultra-detailed per-sector geometry failure atlas at the end of
+    # every training run (geom_diagnostics/). Runs AFTER all primary outputs are
+    # saved, so it can never cost a completed run; a diagnostic error only prints.
+    "run_geom_diagnostics": True,
+    "geom_diagnostics_limit": -1,   # reactions to diagnose (-1 = all val; lower to speed up)
     "swa_enabled": True,
     "swa_start": 450,
     "print_every": 25,
@@ -1150,6 +1174,11 @@ def _build_reaction_samples_from_h5(config):
             samples.append({
                 "rxn_id": rxn_id, "n_atoms": n,
                 "c_R": c_R, "c_P": c_P,
+                # True DFT TS coordinates: needed for the chirality/enantiomer
+                # diagnostic (distance matrices are chirality-blind) and for the
+                # coordinate-native geometry rewrite. Additive; older caches
+                # lacking it fall back to distance-space only.
+                "c_TS": c_TS,
                 "atom_types": atom_types,
                 "atom_ids": torch.from_numpy(atom_ids),
                 "mask": torch.from_numpy(mask),
@@ -1643,7 +1672,11 @@ class GeometryHead(nn.Module):
         pair = torch.cat([fi, fj, ai, aj, pair_dist], dim=-1)
         out = self.net(pair)
         alpha = torch.sigmoid(out[..., 0])
-        delta = torch.clamp(out[..., 1], min=-self.delta_clamp, max=self.delta_clamp)
+        # Soft bound on the interpolation residual: a hard clamp zeroes the
+        # gradient past +/-delta_clamp, so large non-interpolative moves get no
+        # learning signal and the model hedges toward the R/P midpoint. tanh keeps
+        # the same +/-delta_clamp range but leaves gradient flowing everywhere.
+        delta = self.delta_clamp * torch.tanh(out[..., 1] / self.delta_clamp)
         D_base = alpha * D_R + (1.0 - alpha) * D_P
         D_TS_pred = torch.clamp(D_base + delta, min=0.0)
         D_TS_pred = (D_TS_pred + D_TS_pred.transpose(1, 2)) / 2.0
@@ -1866,16 +1899,14 @@ class PhysicsEaCalculator:
         return float(feats @ self.coeffs)
 
 
-def torch_mds_coords(D, mask, dim=3, on_gpu=False, compute_dtype=torch.float64):
-    """Differentiable-friendly classical MDS: distance matrix -> 3D coordinates.
+def torch_mds_coords(D, mask, dim=3, on_gpu=False, compute_dtype=torch.float64,
+                     differentiable=False):
+    """Classical MDS: distance matrix -> 3D coordinates.
 
-    Embeds each molecule's predicted TS distance matrix into Cartesian space so
-    an EGNN can refine the geometry. Double-centering is masked so padded atoms
-    never contaminate the per-molecule centroid. The eigendecomposition is run
-    in float64 for numerical stability; callers should pass a *detached* D (the
-    geometry head is supervised directly on the coarse distances, while the EGNN
-    learns the coordinate refinement on top), which keeps the unstable backward
-    pass of eigh out of the graph.
+    When differentiable=True, processes each molecule at its real atom count
+    (no padding in eigh) so the backward pass is numerically stable. This
+    enables end-to-end gradient flow from the geometry loss through the EGNN
+    back to the GeometryHead.
 
     Args:
         D:    [B, N, N] pairwise distances (padded entries should be ~0).
@@ -1885,44 +1916,80 @@ def torch_mds_coords(D, mask, dim=3, on_gpu=False, compute_dtype=torch.float64):
     """
     B, N, _ = D.shape
     out_device, out_dtype = D.device, D.dtype
-    # eigh location/precision is a throughput knob. Default (on_gpu=False,
-    # float64) reproduces the original CPU-LAPACK path exactly. on_gpu=True keeps
-    # the whole embedding on the GPU, which removes the per-forward device sync
-    # and the two host<->device transfers -- the actual bottleneck in an async
-    # CUDA pipeline -- at the cost of a (tiny-matrix) GPU eigh. This path is
-    # detached, so lower precision only affects a seed the EGNN then refines.
     work_device = D.device if on_gpu else torch.device("cpu")
-    Dw = D.detach().to(device=work_device, dtype=compute_dtype)
-    m = mask.detach().to(device=work_device, dtype=compute_dtype)  # [B, N]
-    pair = m.unsqueeze(-1) * m.unsqueeze(-2)         # [B, N, N] valid atom pairs
-    cnt = m.sum(dim=1).clamp(min=1.0)                # [B] atoms per molecule
-    S = (Dw ** 2) * pair                                 # squared, masked
-    # Masked double centering: subtract row/col/grand means over valid atoms.
-    row_mean = S.sum(dim=2) / cnt.unsqueeze(-1)                      # [B, N]
-    grand = S.sum(dim=(1, 2)) / (cnt ** 2)                          # [B]
-    Bmat = -0.5 * (S - row_mean.unsqueeze(-1) - row_mean.unsqueeze(-2)
-                   + grand.view(B, 1, 1))
-    Bmat = Bmat * pair                               # keep padded rows/cols at 0
-    # Symmetrize defensively before eigh.
-    Bmat = 0.5 * (Bmat + Bmat.transpose(1, 2))
-    # Keep padded atoms out of the top eigenspace. A global positive jitter makes
-    # padded dummy modes tie with true zero modes from planar fragments; shifting
-    # only dummy diagonals negative prevents that mixing while preserving the
-    # valid-block jitter.
-    eyeN = torch.eye(N, dtype=Bmat.dtype, device=Bmat.device).unsqueeze(0)
-    dummy_shift = (1.0 - m).unsqueeze(-1) * eyeN
-    Bmat = Bmat - dummy_shift + 1e-6 * eyeN
-    evals, evecs = torch.linalg.eigh(Bmat)       # ascending eigenvalues
-    top_vals = evals[:, -dim:].flip(-1).clamp(min=0.0)              # [B, dim]
-    top_vecs = evecs[:, :, -dim:].flip(-1)                          # [B, N, dim]
-    coords = top_vecs * top_vals.clamp(min=0.0).sqrt().unsqueeze(1)
-    coords = coords * m.unsqueeze(-1)                # zero padded atoms
-    # eigh can silently return NaN eigenvectors on a degenerate Bmat (no
-    # LinAlgError raised), which would poison the EGNN every forward pass. This
-    # seed is detached, so replacing a bad embedding with zeros is harmless.
-    coords = torch.nan_to_num(coords, nan=0.0, posinf=0.0, neginf=0.0)
-    # Return on the original device/dtype for the EGNN (a no-op when on_gpu).
-    return coords.to(dtype=out_dtype, device=out_device)
+
+    if differentiable:
+        # --- Per-molecule unpadded eigh for clean gradients ---
+        # Each molecule is sliced to its real atom count before eigh, avoiding
+        # the degenerate eigenvalues that padding creates. The backward pass
+        # of eigh is stable on non-degenerate spectra, so gradients flow from
+        # the geometry loss through MDS back to the GeometryHead.
+        Dw = D.to(device=work_device, dtype=compute_dtype)
+        m = mask.to(device=work_device, dtype=compute_dtype)
+        counts = mask.sum(dim=1).long()  # [B] real atom counts
+        coords_list = []
+        for b in range(B):
+            n = counts[b].item()
+            if n < 2:
+                coords_list.append(torch.zeros(N, dim, dtype=compute_dtype, device=work_device))
+                continue
+            # Slice the real [n, n] submatrix — no padding
+            Db = Dw[b, :n, :n]   # [n, n], in the autograd graph
+            S = Db ** 2
+            row_mean = S.mean(dim=1)             # [n]
+            grand = S.mean()                     # scalar
+            Bmat = -0.5 * (S - row_mean.unsqueeze(1) - row_mean.unsqueeze(0) + grand)
+            # Symmetrize defensively
+            Bmat = 0.5 * (Bmat + Bmat.transpose(0, 1))
+            # Small jitter for numerical stability (no dummy-shift needed)
+            Bmat = Bmat + 1e-6 * torch.eye(n, dtype=Bmat.dtype, device=Bmat.device)
+            evals, evecs = torch.linalg.eigh(Bmat)       # ascending
+            top_vals = evals[-dim:].flip(0).clamp(min=0.0)   # [dim]
+            top_vecs = evecs[:, -dim:].flip(1)               # [n, dim]
+            # sqrt(0) has an infinite backward gradient, and early in training the
+            # predicted distances are not a valid 3D Euclidean matrix so the dim-th
+            # eigenvalue sits at/near zero. A bare .sqrt() would emit inf/NaN grads
+            # that the forward nan_to_num cannot catch, re-severing the very
+            # gradient path this branch exists to restore. The +eps floor keeps the
+            # sqrt backward finite while shifting the (masked-small) zero modes by
+            # ~1e-4, which is negligible.
+            top_vals = top_vals + 1e-8
+            coords_b = top_vecs * top_vals.sqrt().unsqueeze(0)  # [n, dim]
+            # Pad back to [N, dim]
+            padded = torch.zeros(N, dim, dtype=compute_dtype, device=work_device)
+            padded[:n] = coords_b
+            coords_list.append(padded)
+        coords = torch.stack(coords_list, dim=0)  # [B, N, dim]
+        coords = coords * m.unsqueeze(-1)
+        # NOTE: deliberately NOT sanitized with nan_to_num here. This path is in
+        # the autograd graph; masking a forward NaN would hide an unstable eigh
+        # while its NaN gradient still poisons the GeometryHead. Any non-finite
+        # value is left to propagate so the loud non-finite loss/grad guard in
+        # run_epoch detects it, logs it, and skips the step visibly.
+        return coords.to(dtype=out_dtype, device=out_device)
+    else:
+        # --- Original batched padded path (detached, no grad needed) ---
+        Dw = D.detach().to(device=work_device, dtype=compute_dtype)
+        m = mask.detach().to(device=work_device, dtype=compute_dtype)
+        pair = m.unsqueeze(-1) * m.unsqueeze(-2)
+        cnt = m.sum(dim=1).clamp(min=1.0)
+        S = (Dw ** 2) * pair
+        row_mean = S.sum(dim=2) / cnt.unsqueeze(-1)
+        grand = S.sum(dim=(1, 2)) / (cnt ** 2)
+        Bmat = -0.5 * (S - row_mean.unsqueeze(-1) - row_mean.unsqueeze(-2)
+                       + grand.view(B, 1, 1))
+        Bmat = Bmat * pair
+        Bmat = 0.5 * (Bmat + Bmat.transpose(1, 2))
+        eyeN = torch.eye(N, dtype=Bmat.dtype, device=Bmat.device).unsqueeze(0)
+        dummy_shift = (1.0 - m).unsqueeze(-1) * eyeN
+        Bmat = Bmat - dummy_shift + 1e-6 * eyeN
+        evals, evecs = torch.linalg.eigh(Bmat)
+        top_vals = evals[:, -dim:].flip(-1).clamp(min=0.0)
+        top_vecs = evecs[:, :, -dim:].flip(-1)
+        coords = top_vecs * top_vals.clamp(min=0.0).sqrt().unsqueeze(1)
+        coords = coords * m.unsqueeze(-1)
+        coords = torch.nan_to_num(coords, nan=0.0, posinf=0.0, neginf=0.0)
+        return coords.to(dtype=out_dtype, device=out_device)
 
 
 _TRIPLET_POOL_CACHE = {}
@@ -2212,6 +2279,8 @@ class PSI(nn.Module):
         self.rc_bond_scale = config["fragment_bond_scale"]
         self.mds_on_gpu = config["mds_on_gpu"]
         self.mds_dtype = torch.float32 if config["mds_dtype"] == "float32" else torch.float64
+        self.mds_differentiable = config.get("mds_differentiable", False)
+        self.geom_uncertainty = config.get("geom_uncertainty", False)
         d_model = config["gru_hidden"] * 2
         atom_dim = config["atom_embed_dim"]
         drop = config["dropout"]
@@ -2237,6 +2306,20 @@ class PSI(nn.Module):
             energy_feat_dim=ENERGY_FEAT_DIM,
             dropout=config["ea_head_dropout"],
         )
+        # Heteroscedastic geometry-uncertainty head: predicts a per-atom log
+        # variance from the EGNN's refined features. Used for Kendall-Gal loss
+        # attenuation (lets the model express uncertainty instead of hedging
+        # toward the midpoint) and as a usable confidence estimate. Zero-init the
+        # last layer so log-var starts at 0 (variance 1) -> neutral attenuation.
+        if self.geom_uncertainty:
+            hid = config["egnn_hidden"]
+            self.geom_logvar_head = nn.Sequential(
+                nn.Linear(hid, hid // 2),
+                nn.GELU(),
+                nn.Linear(hid // 2, 1),
+            )
+            nn.init.zeros_(self.geom_logvar_head[-1].weight)
+            nn.init.zeros_(self.geom_logvar_head[-1].bias)
 
     @staticmethod
     def _coords_to_distance(x, mask):
@@ -2253,7 +2336,7 @@ class PSI(nn.Module):
 
     def forward(
         self, D_R, D_I, D_P, mask, atom_ids, atom_phys,
-        de_rxn=None, energy_feats=None,
+        de_rxn=None, energy_feats=None, return_uncertainty=False, return_debug=False,
     ):
         """Predict TS distance matrix and (optionally) the learned Ea.
 
@@ -2283,9 +2366,14 @@ class PSI(nn.Module):
         # config-controlled (mds_on_gpu / mds_dtype): CPU-float64 by default,
         # or on-GPU to remove the per-forward sync + host<->device transfers.
         with torch.amp.autocast(device_type=D_R.device.type, enabled=False):
+            # Differentiable seed lets the geometry head learn through the 3D
+            # reconstruction; the detached path keeps eigh's backward out of the
+            # graph (original behavior). Controlled by config mds_differentiable.
+            seed_in = D_TS_coarse.float() if self.mds_differentiable else D_TS_coarse.detach().float()
             x_init = torch_mds_coords(
-                D_TS_coarse.detach().float(), mask,
+                seed_in, mask,
                 on_gpu=self.mds_on_gpu, compute_dtype=self.mds_dtype,
+                differentiable=self.mds_differentiable,
             )
 
         # --- Coordinate Noise Data Augmentation ---
@@ -2296,6 +2384,15 @@ class PSI(nn.Module):
 
         h_ts, x_ts = self.egnn(node_feats, x_init, mask)
         D_TS_pred = self._coords_to_distance(x_ts, mask)
+        geom_logvar = None
+        if (return_uncertainty or return_debug) and self.geom_uncertainty:
+            # Per-atom geometry log-variance from the refined features (attached:
+            # this is part of the geometry objective, unlike the Ea head).
+            geom_logvar = self.geom_logvar_head(h_ts).squeeze(-1)   # [B, N]
+            # Clamp before it reaches exp(-logvar) in the loss: unbounded negative
+            # log-var would overflow fp16 under AMP (exp(7) ~ 1096 is safe, exp(20)
+            # is not). Keeps the Kendall-Gal attenuation numerically stable.
+            geom_logvar = geom_logvar.clamp(-7.0, 7.0).masked_fill(mask <= 0, 0.0)
         if de_rxn is not None:
             # h_ts is ALWAYS detached before the Ea head: the Ea gradient never
             # reaches the EGNN, so geometry is shaped purely by the geometry loss
@@ -2309,35 +2406,63 @@ class PSI(nn.Module):
             ea_pred_norm = self.ea_head(
                 h_ts.detach(), mask, de_rxn.float(), energy_feats.float(), rc_mask
             )
+        if return_debug:
+            # Per-sector intermediates for the geometry failure atlas
+            # (geom_diagnostics.py). All tensors are detached & on-device; this
+            # path is off in training so it adds zero hot-loop overhead.
+            debug = {
+                "D_coarse": D_TS_coarse.detach(),   # geometry-head (interpolation) output
+                "x_init": x_init.detach(),          # MDS seed coordinates
+                "x_ts": x_ts.detach(),              # EGNN-refined coordinates
+                "h_ts": h_ts.detach(),              # EGNN node features
+                "D_pred": D_TS_pred.detach(),       # final predicted distances
+                "geom_logvar": None if geom_logvar is None else geom_logvar.detach(),
+            }
+            return D_TS_pred, D_TS_coarse, ea_pred_norm, geom_logvar, debug
+        if return_uncertainty:
+            return D_TS_pred, D_TS_coarse, ea_pred_norm, geom_logvar
         return D_TS_pred, D_TS_coarse, ea_pred_norm
 
-class PlateauWarmupScheduler:
-    def __init__(self, optimizer, warmup_epochs, factor=0.5, patience=20, min_lr=1e-6):
+class CosineWarmupScheduler:
+    """Short linear warmup followed by cosine annealing to min_lr.
+
+    The cosine phase spans from warmup_epochs to total_epochs, smoothly
+    decaying each param group's LR from its base value to min_lr.  This
+    replaces ReduceLROnPlateau which sat at max LR for 100+ epochs in
+    previous runs before triggering its first decay.
+    """
+    def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6):
         self.optimizer = optimizer
         self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
         self.min_lr = min_lr
         self.base_lrs = [group['lr'] for group in optimizer.param_groups]
         self.last_epoch = 0
-        self.plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=factor, patience=patience, min_lr=min_lr
-        )
-        
-    def step(self, metric):
+
+    def step(self, metric=None):
+        """metric is accepted for API compatibility but ignored."""
         self.last_epoch += 1
         if self.last_epoch <= self.warmup_epochs:
+            # Linear warmup: 0 -> 1 over warmup_epochs
             scale = self.last_epoch / max(1, self.warmup_epochs)
             for i, group in enumerate(self.optimizer.param_groups):
                 group['lr'] = self.base_lrs[i] * scale
         else:
-            self.plateau.step(metric)
-            
+            # Cosine annealing: base_lr -> min_lr over remaining epochs
+            progress = (self.last_epoch - self.warmup_epochs) / max(
+                1, self.total_epochs - self.warmup_epochs
+            )
+            progress = min(progress, 1.0)
+            cos_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+            for i, group in enumerate(self.optimizer.param_groups):
+                group['lr'] = self.min_lr + (self.base_lrs[i] - self.min_lr) * cos_scale
+
     def state_dict(self):
-        return {'last_epoch': self.last_epoch, 'plateau': self.plateau.state_dict(), 'base_lrs': self.base_lrs}
-        
+        return {'last_epoch': self.last_epoch, 'base_lrs': self.base_lrs}
+
     def load_state_dict(self, state_dict):
         self.last_epoch = state_dict['last_epoch']
         self.base_lrs = state_dict['base_lrs']
-        self.plateau.load_state_dict(state_dict['plateau'])
 
 
 def freeze_backbone(model):
@@ -2418,6 +2543,12 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     total_loss, total_geom, total_triangle = 0.0, 0.0, 0.0
     total_geom_mae_A = 0.0
     total_ea_mae, total_ea_norm, n_batches = 0.0, 0.0, 0
+    # Non-finite guards: count (and loudly report) batches skipped because the
+    # loss or the gradients went NaN/inf, rather than silently masking them. The
+    # differentiable MDS path can emit non-finite grads on a degenerate eigh
+    # backward; surfacing the count makes an unstable geometry path visible
+    # instead of quietly zeroed. See CONFIG["mds_differentiable"].
+    nonfinite_loss_skips, nonfinite_grad_skips = 0, 0
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
     if ea_only:
         # Stage 2: Ea head is the sole objective; the loss is unweighted.
@@ -2454,9 +2585,10 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
             
             t0 = time.perf_counter()
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_DTS_coarse, ea_pred_norm = model(
+                p_DTS, p_DTS_coarse, ea_pred_norm, geom_logvar = model(
                     DR, DI, DP, mask, atom_ids, atom_phys,
                     None if geom_only else de_rxn, energy_feats,
+                    return_uncertainty=True,
                 )
             _sync()
             t_forward += time.perf_counter() - t0
@@ -2515,10 +2647,16 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # delta raised from 0.5 (config) so large reactive-bond misses stay
                 # in the quadratic regime and get real gradient (under-shoot fix).
                 huber_delta = config.get("geom_huber_delta", 0.5)
-                l_geom = (
-                    F.huber_loss(p_DTS, DTS, reduction='none', delta=huber_delta)
-                    * m2d_weighted
-                ).sum() / denom_weighted
+                per_pair_geom = F.huber_loss(p_DTS, DTS, reduction='none', delta=huber_delta)
+                if geom_logvar is not None:
+                    # Kendall-Gal heteroscedastic attenuation: precision-weight the
+                    # per-pair error (exp(-s)) and pay a log-variance penalty
+                    # (0.5*s), so the model can express uncertainty on genuinely
+                    # hard pairs instead of hedging every prediction toward the R/P
+                    # midpoint. s starts at 0 (zero-init head) -> neutral at t=0.
+                    lv_pair = 0.5 * (geom_logvar.unsqueeze(2) + geom_logvar.unsqueeze(1))  # [B,N,N]
+                    per_pair_geom = torch.exp(-lv_pair) * per_pair_geom + 0.5 * lv_pair
+                l_geom = (per_pair_geom * m2d_weighted).sum() / denom_weighted
                 # Auxiliary loss on the coarse (pre-EGNN) distances trains the
                 # geometry head directly, giving the EGNN a stable MDS seed.
                 l_geom_coarse = (
@@ -2621,6 +2759,10 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # Guard against a non-finite batch corrupting the weights: skip
                 # the step entirely rather than relying solely on GradScaler.
                 if not torch.isfinite(loss):
+                    nonfinite_loss_skips += 1
+                    if nonfinite_loss_skips <= 5:
+                        print(f"[nonfinite] epoch {epoch}: loss is {loss.item()} — "
+                              f"skipping step (loss-skip #{nonfinite_loss_skips})")
                     optimizer.zero_grad(set_to_none=True)
                     t_batch_start = time.perf_counter()
                     continue
@@ -2631,6 +2773,29 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
 
                 t0 = time.perf_counter()
                 scaler.unscale_(optimizer)
+                # Loud non-finite-gradient guard. A finite loss can still yield
+                # NaN/inf grads (e.g. the eigh backward in the differentiable MDS
+                # path); GradScaler would silently swallow the step (and with AMP
+                # off it would not skip at all, corrupting the weights). Detect it,
+                # log it, and skip — visibly — instead of stepping on poison or
+                # masking with nan_to_num. NB: a few skips in the first epoch can
+                # be benign fp16 GradScaler scale-calibration overflows; persistent
+                # skips (see the epoch summary) mean the geometry path is unstable.
+                grad_finite = all(
+                    (p.grad is None) or torch.isfinite(p.grad).all()
+                    for p in model.parameters()
+                )
+                if not grad_finite:
+                    nonfinite_grad_skips += 1
+                    if nonfinite_grad_skips <= 5:
+                        print(f"[nonfinite] epoch {epoch}: non-finite gradient — "
+                              f"skipping step (grad-skip #{nonfinite_grad_skips})")
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()  # keep GradScaler's state consistent after unscale
+                    _sync()
+                    t_opt += time.perf_counter() - t0
+                    t_batch_start = time.perf_counter()
+                    continue
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
                 scaler.step(optimizer)
                 scaler.update()
@@ -2649,6 +2814,13 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
             t_batch_start = time.perf_counter()
 
     nb = max(n_batches, 1)
+    if is_train and (nonfinite_loss_skips or nonfinite_grad_skips):
+        # Loud epoch-level summary so a persistently unstable path can't hide in
+        # the averages: a handful is tolerable, a large fraction means the
+        # geometry gradient (likely the differentiable MDS eigh) is unstable.
+        print(f"[nonfinite] epoch {epoch}: skipped {nonfinite_grad_skips} step(s) "
+              f"on non-finite gradients and {nonfinite_loss_skips} on non-finite "
+              f"loss (out of {n_batches} batches)")
     return {
         "loss": total_loss / nb,
         "geom": total_geom / nb,
@@ -2656,6 +2828,8 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         "triangle": total_triangle / nb,
         "ea_mae": total_ea_mae / nb,
         "ea_norm": total_ea_norm / nb,
+        "nonfinite_loss_skips": nonfinite_loss_skips,
+        "nonfinite_grad_skips": nonfinite_grad_skips,
         "timing": {
             "data": t_data,
             "forward": t_forward,
@@ -2848,8 +3022,11 @@ def _train_run(config, run_ctx):
     optimizer = build_ea_only_optimizer(model, config) if ea_only else build_optimizer(model, config)
     if hasattr(model, "ea_head"):
         print(f"Learning rates: base={config['lr']:.2e}, ea_head={config['ea_head_lr']:.2e}")
-    scheduler = PlateauWarmupScheduler(
-        optimizer, warmup_epochs=config["warmup_epochs"], factor=0.5, patience=15, min_lr=1e-6
+    scheduler = CosineWarmupScheduler(
+        optimizer,
+        warmup_epochs=config["warmup_epochs"],
+        total_epochs=config.get("swa_start", config["epochs"]),
+        min_lr=1e-6,
     )
     use_amp = config["amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -3185,6 +3362,24 @@ def _train_run(config, run_ctx):
     print(f"\nModel saved to {final_path}")
     print(f"Predictions saved to {output_path}")
     create_dashboard(output_path, config["save_dir"])
+
+    # --- Per-run geometry failure atlas (ultra-detailed per-sector diagnosis) ---
+    # Runs on the just-saved best checkpoint AFTER every primary output is on disk,
+    # so a diagnostic edge case can never cost the completed run -- on failure it
+    # prints the traceback loudly and returns rather than raising.
+    if config.get("run_geom_diagnostics", True):
+        print("\n[geom-diagnostics] writing per-sector geometry failure atlas...")
+        try:
+            import geom_diagnostics
+            geom_diagnostics.run(
+                split="val",
+                limit=config.get("geom_diagnostics_limit", -1),
+                ckpt=best_model_path,
+            )
+        except Exception:
+            import traceback
+            print("[geom-diagnostics] FAILED (all run outputs are already saved):")
+            traceback.print_exc()
 
 def predict_transition_state(config, reactant_path, product_path, model_path, output_path, xyz_path=None):
     device = resolve_device(config)
