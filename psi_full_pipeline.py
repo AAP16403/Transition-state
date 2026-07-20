@@ -878,6 +878,21 @@ CONFIG = {
     "geom_hinge_cross_weight": 3.0,          # active<->spectator cross pairs
     "geom_active_pair_weight": 2.0,          # active<->active pairs
     "geom_spectator_spectator_weight": 0.25, # static backbone pairs
+    # --- Under-shoot / midpoint-hedging fix (FAILURE_ANALYSIS mode A) ----------
+    # Diagnosis: the model systematically predicts TS distances ~20% closer to the
+    # R/P midpoint than truth (pred_dev = 0.86 * true_dev), worst on unimolecular
+    # rearrangements. Two causes in the geometry loss:
+    #  (1) Reaction-role reweighting damps spectator<->spectator pairs to 0.25x,
+    #      but in a rearrangement most *moving* pairs are non-reaction-center and
+    #      get under-trained. `geom_move_weight` lifts a pair's weight toward the
+    #      active-pair weight in proportion to how far it moves R->P (|D_R - D_P|),
+    #      so moving pairs are no longer damped. Set to 0.0 to recover old behavior.
+    #  (2) Huber delta=0.5 flattens the gradient past 0.5 A, so large reactive-bond
+    #      misses aren't pushed hard and hedging toward the midpoint minimizes loss.
+    #      `geom_huber_delta` raises the quadratic regime so tail misses get real
+    #      gradient.
+    "geom_move_weight": 2.0,                 # movement-aware weight ceiling (0 disables)
+    "geom_huber_delta": 1.0,                 # Huber transition (A) for geometry loss (was 0.5)
     # --- Throughput: MDS seed eigh location/precision --------------------
     # False = original CPU-float64 path. True keeps the embedding on the GPU,
     # removing the per-forward device sync + host<->device transfers (the real
@@ -2474,21 +2489,40 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                     + config["geom_active_pair_weight"] * (a_i * a_j)
                     + config["geom_spectator_spectator_weight"] * ((1.0 - a_i) * (1.0 - a_j))
                 )
+                # --- Movement-aware weight floor (under-shoot fix, mode A) ------
+                # How far each pair's distance moves from reactant to product is a
+                # reaction-relevance signal independent of the reaction-center
+                # classification. Pairs that move a lot but sit between two
+                # non-reaction-center atoms (the dominant case in unimolecular
+                # rearrangements) would otherwise be damped to the 0.25x spectator
+                # weight and under-trained -> the model hedges them toward the R/P
+                # midpoint. Lift each pair's weight toward `geom_move_weight` in
+                # proportion to its normalized R->P movement, keeping truly static
+                # backbone pairs (move ~ 0) at the original damped weight.
+                move_w = config.get("geom_move_weight", 0.0)
+                if move_w > 0.0:
+                    move = (torch.abs(DR - DP) * m2d).to(dist_weights.dtype)
+                    move_max = move.amax(dim=(1, 2), keepdim=True).clamp(min=1e-6)
+                    move_norm = move / move_max               # [B, N, N] in [0, 1]
+                    role_weight = torch.maximum(role_weight, move_w * move_norm)
                 dist_weights = dist_weights * role_weight
                 m2d_weighted = m2d * dist_weights
                 denom_weighted = m2d_weighted.sum().clamp(min=1)
-                
+
                 # Weight the per-pair Huber loss, rather than scaling its
                 # inputs. Scaling inputs would make Huber's transition delta
                 # vary with the pair weight and distort the robust objective.
+                # delta raised from 0.5 (config) so large reactive-bond misses stay
+                # in the quadratic regime and get real gradient (under-shoot fix).
+                huber_delta = config.get("geom_huber_delta", 0.5)
                 l_geom = (
-                    F.huber_loss(p_DTS, DTS, reduction='none', delta=0.5)
+                    F.huber_loss(p_DTS, DTS, reduction='none', delta=huber_delta)
                     * m2d_weighted
                 ).sum() / denom_weighted
                 # Auxiliary loss on the coarse (pre-EGNN) distances trains the
                 # geometry head directly, giving the EGNN a stable MDS seed.
                 l_geom_coarse = (
-                    F.huber_loss(p_DTS_coarse, DTS, reduction='none', delta=0.5)
+                    F.huber_loss(p_DTS_coarse, DTS, reduction='none', delta=huber_delta)
                     * m2d_weighted
                 ).sum() / denom_weighted
                 # Physical, unweighted interatomic-distance MAE (Angstrom): an
