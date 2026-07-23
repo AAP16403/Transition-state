@@ -131,6 +131,11 @@ def run_resumed_evaluation(args):
         print(f"Training history: {history_path}")
         print(f"Best recorded epoch: {best_history.get('epoch')}  value={best_value:.4f}")
 
+    coords_mode = config.get("geometry_mode") == "coords"
+    rc_xtb = config.get("rc_source", "distance") == "xtb"
+    print(f"Geometry mode: {config.get('geometry_mode')}  "
+          f"rc_source: {config.get('rc_source')}")
+
     samples, atom_vocab, atom_types_map = p.build_reaction_samples(config)
     if not samples:
         raise RuntimeError("No complete reaction triplets found.")
@@ -187,9 +192,16 @@ def run_resumed_evaluation(args):
                 _complexity_flag,
                 _risky_chem_flag,
             ) = p.move_batch_to_device(batch, device)
+            # Coordinate-native checkpoints refuse to run without the R/P midpoint
+            # seed, and rc_source='xtb' needs the cached Wiberg reactive-atom mask
+            # so the Ea head sees the same reaction centre it trained on. Both are
+            # already on the batch that this config's dataset built.
+            c_seed = p.coords_from_batch(batch, device)[0] if coords_mode else None
+            rc_atom = batch["rc_atom_xtb"].to(device) if rc_xtb else None
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 pred_dts, _, ea_pred_norm = model(
-                    _dr, di, dp_in, mask, atom_ids, atom_phys, de_rxn, energy_feats
+                    _dr, di, dp_in, mask, atom_ids, atom_phys, de_rxn, energy_feats,
+                    c_seed=c_seed, rc_atom=rc_atom,
                 )
             ea_pred_kcal = None
             ea_sigma_kcal = None

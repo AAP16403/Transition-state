@@ -1,4276 +1,1995 @@
+"""PSI transition-state pipeline — Kaggle edition (P100 or T4 x2).
+
+A single self-contained rewrite carrying ONLY the configuration the full pipeline
+converged on. Every superseded branch is deleted rather than disabled, so there is
+exactly one code path and nothing to configure:
+
+  geometry            coordinate-native (EGNN seeded with the real Kabsch-aligned
+                      R/P midpoint, supervised against the DFT TS coordinates).
+                      The interpolation-prior GeometryHead and the MDS/eigh seed
+                      are GONE — the geometry failure atlas attributed 45.9% of
+                      failing validation reactions to `geom_head_interpolation_bound`
+                      and only 0.2% to `mds_lossy`, and MDS cost 58% of the forward.
+  reaction centre     GFN2-xTB Wiberg bond orders. The covalent-radius cutoff it
+                      replaces misses 8,754 reactive atoms (22.0% of reactions get
+                      a different reactive-atom set).
+  uncertainty         heteroscedastic per-atom log-variance + Kendall-Gal loss
+                      attenuation, feeding detached geometry-trust features to the
+                      Ea head.
+  precision           fp16 AMP + GradScaler. Neither P100 (Pascal) nor T4 (Turing)
+                      supports bf16, so fp16 is not a choice, it is the only
+                      option. torch.compile is enabled only on sm_70+: Triton
+                      cannot lower for P100, and attempting it fails at the first
+                      kernel.
+  parallelism         One GPU (P100) trains in-process with NO distributed group
+                      at all -- initialising an NCCL group of size 1 is a real
+                      hang/failure point in a Kaggle notebook. Multiple GPUs (T4
+                      x2) use DDP via mp.spawn. Every collective is guarded
+                      (all_reduce_sum), so the training loop is the same code
+                      either way -- the only difference is whether a process group
+                      exists to reduce across.
+
+Deleted because coordinate-native makes them dead weight, not because they were
+turned off: the coarse-distance aux loss and both triangle-inequality losses (a
+distance matrix read off real coordinates satisfies the triangle inequality by
+construction), the delta-clamp, MDS, coord-noise augmentation, the geom-only /
+ea-only staging, and the distance-rule spectator mask.
+
+No config dict, no mode flags, no fallback branches, no try/except. Hyperparameters
+are module constants below. Anything that cannot proceed correctly raises.
+
+--------------------------------------------------------------------------------
+RUNNING ON KAGGLE
+--------------------------------------------------------------------------------
+Run each stage with `!python` from a notebook cell, as shown. `%run` works too --
+IPython injects its own argv ("-f /root/.../kernel-abc.json"), which resolve_stage
+ignores rather than mistaking for a stage name.
+
+Turn Internet ON: the first run streams RGD1_CHNO.h5 (~1.34 GB) and
+DFT_reaction_info.csv from Figshare into /kaggle/working/RGD1_Dataset, then parses
+them into samples_cache.pkl. Both are reused by every later session, so attach the
+saved output as a Dataset and the download happens exactly once.
+
+The simplest path is one command:
+
+      !pip install tblite
+      !python psi_cloud_pipeline.py train
+
+On the first run this parses RGD1, builds the GFN2-xTB bond-order cache (a one-time
+~1.5-2 h CPU precompute), then trains. Save the notebook output as a Kaggle Dataset
+and attach it to later sessions -- every resume then finds both caches and skips
+straight to training. Two facts make the auto-build worth understanding:
+
+  * On a GPU session the bond-order build spends its ~1.5-2 h on CPU before the GPU
+    does anything. To avoid burning GPU quota on it, run the `bond-orders` stage
+    ONCE in a cheaper CPU-only session first, save that as a Dataset, and attach it:
+
+        !pip install tblite
+        !python psi_cloud_pipeline.py bond-orders     # GPU OFF, Internet ON
+
+  * `train` auto-builds only when no cache is found (neither an attached dataset
+    nor /kaggle/working/bond_orders_cache.pkl).
+
+  Evaluation (GPU, minutes):
+
+      !python psi_cloud_pipeline.py eval
+
+    Scores psi_best.pt per reaction into results.json: distance MAE and coordinate
+    RMSD as mean AND median, Ea error, and the chirality-flip rate. Separate from
+    training on purpose -- a Kaggle session is cut long before the epoch budget
+    runs out, so an evaluation that only fired after the last epoch would never run.
+
+Kaggle sessions are capped at ~9-12 h, which is far short of a full run, so every
+epoch checkpoints to /kaggle/working/psi_latest.pt and training RESUMES from it
+automatically. Save the output as a Dataset, attach it to the next session, and
+re-run the same command until the epoch budget is exhausted.
+
+Per-epoch telemetry covers the two failure modes the legacy runs actually hit:
+`lvFloor` is the fraction of atoms pinned at the log-variance floor (it reached
+18% and was still climbing at epoch 143, meaning the NLL was partly being reduced
+by shrinking sigma rather than by predicting better), and `flip` is the
+chirality-flip rate, which is the only metric that can see an enantiomer error
+because distance matrices are chirality-blind.
+
+Data: RGD1_CHNO.h5 + DFT_reaction_info.csv are pulled from Figshare on first use
+and cached under /kaggle/working/RGD1_Dataset, or picked up from any attached
+Kaggle dataset.
+"""
+
 import os
+
+# MUST precede numpy/tblite in the parent AND in every spawned worker (spawn
+# re-imports this module, so module scope is the only place that works). Without
+# it each worker's BLAS grabs every core: measured 2.0 s per xTB single point
+# with 6 workers x 12 threads on 12 cores, against 0.276 s single-process.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import sys
 import json
 import math
+import time
+import glob
 import pickle
-import tarfile
-import argparse
-import subprocess
 import urllib.request
+from concurrent.futures import ProcessPoolExecutor
 
-# =============================================================================
-# Cloud bootstrap: ensure heavy deps exist before importing them.
-# On Kaggle/Colab these are usually pre-installed, so this is a no-op safety
-# net; it only kicks in on a bare environment.
-# =============================================================================
-def _ensure_deps():
-    """Install ONLY genuinely-missing deps, one at a time, never with --upgrade.
-
-    Critical: torch and numpy ship pre-built and GPU-matched on Kaggle/Colab.
-    Upgrading torch pulls the latest PyPI wheel, which may drop kernels for the
-    host GPU (e.g. Kaggle's Tesla P100 is CUDA capability sm_60, unsupported by
-    recent torch builds -> "no kernel image is available for execution").
-    So we check each module independently and install missing ones with a plain,
-    un-pinned `pip install` that pip will skip entirely if already present.
-    """
-    import importlib
-    for mod, pkg in (("numpy", "numpy"), ("torch", "torch"),
-                     ("h5py", "h5py"), ("pandas", "pandas")):
-        try:
-            importlib.import_module(mod)
-        except Exception:
-            print(f"[bootstrap] Installing missing dependency: {pkg}")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-
-_ensure_deps()
-
-import h5py
-import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 
 # =============================================================================
-# Chemistry / geometry utilities (formerly psi_utils.py)
+# Hyperparameters. Module constants, deliberately not a config dict: every value
+# here is the one the full pipeline converged on, and a knob that is never turned
+# is a branch that is never tested.
 # =============================================================================
+MAX_ATOMS = 30
+TARGET_REACTIONS = 40_000
+SKIP_NEGATIVE_EA = True
+FRAGMENT_BOND_SCALE = 1.45
+SPECTATOR_THRESHOLD = 0.15          # |D_R - D_P| above this = an "active" pair
 
-# Covalent radii table in Angstroms
-COVALENT_RADII = {
-    'H': 0.31, 'C': 0.76, 'N': 0.71, 'O': 0.66, 'F': 0.57,
-    'S': 1.05, 'Cl': 1.02, 'Br': 1.20, 'I': 1.39, 'P': 1.07,
-    'Si': 1.11, 'B': 0.84,
-}
+# Encoder
+N_GAUSSIANS = 32
+GAUSS_START, GAUSS_STOP = 0.4, 6.0
+ATOM_EMBED_DIM = 32
+GRU_HIDDEN, GRU_LAYERS, GRU_DROPOUT = 128, 2, 0.1
+ATTN_HEADS, ATTN_LAYERS, FF_DIM = 8, 3, 512
+DROPOUT = 0.1
 
-def covalent_radius(atom_type):
-    return COVALENT_RADII.get(atom_type, 0.76)
+# EGNN coordinate refiner
+EGNN_LAYERS, EGNN_HIDDEN = 8, 256
+EGNN_COORD_CLAMP = 3.5
 
-# Pauling electronegativity (dimensionless)
-PAULING_EN = {
-    'H': 2.20, 'C': 2.55, 'N': 3.04, 'O': 3.44, 'F': 3.98,
-    'S': 2.58, 'Cl': 3.16, 'Br': 2.96, 'I': 2.66, 'P': 2.19,
-    'Si': 1.90, 'B': 2.04,
-}
-# Atomic number Z
-ATOMIC_NUMBER = {
-    'H': 1, 'C': 6, 'N': 7, 'O': 8, 'F': 9,
-    'S': 16, 'Cl': 17, 'Br': 35, 'I': 53, 'P': 15,
-    'Si': 14, 'B': 5,
-}
-# Standard atomic mass (u)
-ATOMIC_MASS = {
-    'H': 1.008, 'C': 12.011, 'N': 14.007, 'O': 15.999, 'F': 18.998,
-    'S': 32.06, 'Cl': 35.45, 'Br': 79.904, 'I': 126.904, 'P': 30.974,
-    'Si': 28.085, 'B': 10.811,
-}
+# Ea head
+EA_LOSS_WEIGHT = 0.5
+EA_SELECT_WEIGHT = 4.0              # Ea contribution to checkpoint selection
+EA_HEAD_DROPOUT = 0.15
+EA_HEAD_LR = 3e-4
+EA_HEAD_WEIGHT_DECAY = 1e-3
 
-def electronegativity(atom_type):
-    return PAULING_EN.get(atom_type, 2.55)
+# Optimisation
+LR = 1.5e-4
+WEIGHT_DECAY = 1e-3
+WARMUP_EPOCHS = 5
+GRAD_CLIP = 1.0
+BATCH_SIZE = 48                     # PER RANK; global batch is 2x this on T4 x2
+EPOCHS = 800
+SWA_START = 450                     # also the cosine horizon
+PATIENCE = 120
+NUM_WORKERS = 2
+PREFETCH_FACTOR = 4
 
-def atomic_number(atom_type):
-    return ATOMIC_NUMBER.get(atom_type, 6)
+# Geometry loss: reaction-role reweighting
+GEOM_HINGE_CROSS_WEIGHT = 3.0       # active <-> spectator cross pairs
+GEOM_ACTIVE_PAIR_WEIGHT = 2.0       # active <-> active
+GEOM_SPECTATOR_SPECTATOR_WEIGHT = 0.25
+GEOM_MOVE_WEIGHT = 2.0              # movement-aware weight floor (under-shoot fix)
+GEOM_HUBER_DELTA = 1.0
+COORD_LOSS_WEIGHT = 1.0
+PINN_WEIGHT = 0.2
+STERIC_LOSS_WEIGHT = 1.0
+STERIC_FLOOR_FRAC = 0.75
+LOGVAR_CLAMP = 7.0                  # exp(7) ~ 1096 stays finite in fp16
 
-def atomic_mass(atom_type):
-    return ATOMIC_MASS.get(atom_type, 12.011)
+# Risk-weighted loss
+RISK_WEIGHT_ALPHA = 0.5
+RISK_WEIGHT_MAX = 3.0
+RISK_EA_LOSS_WEIGHT = 0.5
+RISK_GEOM_LOSS_WEIGHT = 0.2
 
-def bond_adjacency_from_coords(coords, atom_types, n, bond_scale=1.45):
-    """Bonded-neighbour lists for the first `n` atoms, by covalent-radius cutoff."""
-    adjacency = [[] for _ in range(n)]
+# xTB reaction centre
+BO_CHANGE_THRESHOLD = 0.5           # |bo_R - bo_P| above this = reactive pair
+BO_BONDED_MIN = 0.5
+
+# Split
+VAL_SPLIT = 0.15
+SPLIT_SEED = 42
+SPLIT_BINS = 5
+
+# Log-variance histogram. The range is EXACTLY the clamp, so bin 0 is
+# [-7.0, -6.9) and bin -1 is [6.9, 7.0] -- the two saturation boundaries. Widening
+# it (say to +/-8) would leave bin 0 permanently empty and report pinned_lo = 0
+# however hard the head is pressed against its floor, which is the single
+# diagnostic this histogram exists to provide.
+LOGVAR_HIST_BINS = 140
+LOGVAR_HIST_MIN, LOGVAR_HIST_MAX = -LOGVAR_CLAMP, LOGVAR_CLAMP
+# A reflected superposition fitting this much better than a proper rotation, on a
+# structure that is not already near-perfect, means the predicted TS is the
+# ENANTIOMER of the truth. Thresholds match the geometry failure atlas.
+CHIRALITY_FLIP_RATIO = 0.7
+CHIRALITY_MIN_RMSD = 0.2
+
+WORK_DIR = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.getcwd()
+SAMPLE_CACHE = os.path.join(WORK_DIR, "samples_cache.pkl")
+BOND_ORDER_CACHE = os.path.join(WORK_DIR, "bond_orders_cache.pkl")
+BEST_CKPT = os.path.join(WORK_DIR, "psi_best.pt")
+LATEST_CKPT = os.path.join(WORK_DIR, "psi_latest.pt")
+HISTORY_PATH = os.path.join(WORK_DIR, "training_history.json")
+RESULTS_PATH = os.path.join(WORK_DIR, "results.json")
+SPLIT_PATH = os.path.join(WORK_DIR, "split.json")
+# `__file__` is undefined in a notebook kernel (the code runs from a cell, not a
+# file), so it cannot be used to name the script in help text. Fall back to the
+# fixed name the instructions already use everywhere else.
+SCRIPT_NAME = os.path.basename(globals().get("__file__", "psi_cloud_pipeline.py"))
+
+# =============================================================================
+# Chemistry tables
+# =============================================================================
+COVALENT_RADII = {'H': 0.31, 'C': 0.76, 'N': 0.71, 'O': 0.66, 'F': 0.57,
+                  'S': 1.05, 'Cl': 1.02, 'Br': 1.20, 'I': 1.39, 'P': 1.07,
+                  'Si': 1.11, 'B': 0.84}
+PAULING_EN = {'H': 2.20, 'C': 2.55, 'N': 3.04, 'O': 3.44, 'F': 3.98,
+              'S': 2.58, 'Cl': 3.16, 'Br': 2.96, 'I': 2.66, 'P': 2.19,
+              'Si': 1.90, 'B': 2.04}
+ATOMIC_NUMBER = {'H': 1, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'S': 16, 'Cl': 17,
+                 'Br': 35, 'I': 53, 'P': 15, 'Si': 14, 'B': 5}
+ATOMIC_MASS = {'H': 1.008, 'C': 12.011, 'N': 14.007, 'O': 15.999, 'F': 18.998,
+               'S': 32.06, 'Cl': 35.45, 'Br': 79.904, 'I': 126.904, 'P': 30.974,
+               'Si': 28.085, 'B': 10.811}
+# Bond types whose reactions showed elevated validation Ea error.
+RISK_BOND_TYPES = {tuple(sorted(p)) for p in
+                   [("N", "N"), ("N", "O"), ("O", "O"), ("C", "N"), ("H", "N")]}
+
+ATOM_PHYS_DIM = 3                   # electronegativity, Z, mass
+ENERGY_FEAT_DIM = 28                # energetics + composition + angles + RC angles
+
+
+def covalent_radius(a):
+    return COVALENT_RADII.get(a, 0.76)
+
+
+def electronegativity(a):
+    return PAULING_EN.get(a, 2.55)
+
+
+def atomic_number(a):
+    return ATOMIC_NUMBER.get(a, 6)
+
+
+def atomic_mass(a):
+    return ATOMIC_MASS.get(a, 12.011)
+
+
+def build_atom_vocab():
+    return {a: i + 1 for i, a in enumerate(sorted(ATOMIC_NUMBER))}
+
+
+# =============================================================================
+# Geometry / graph utilities (numpy, dataset-build time only)
+# =============================================================================
+def compute_distance_matrix(coords):
+    diff = coords[:, None, :] - coords[None, :, :]
+    return np.sqrt((diff ** 2).sum(-1) + 1e-8).astype(np.float32)
+
+
+def bond_adjacency(coords, atom_types, n, scale=FRAGMENT_BOND_SCALE):
+    adj = [[] for _ in range(n)]
     for i in range(n):
         for j in range(i + 1, n):
-            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
-            if np.linalg.norm(coords[i] - coords[j]) <= cutoff:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    return adjacency
+            cut = scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
+            if np.linalg.norm(coords[i] - coords[j]) <= cut:
+                adj[i].append(j)
+                adj[j].append(i)
+    return adj
 
-def bond_angles_from_coords(coords, atom_types, n, bond_scale=1.45):
-    """Map each bonded triplet (i, j, k) with central atom j and i<k to its angle (deg).
 
-    The bond graph is derived from `coords`, so passing reactant vs product
-    coordinates yields the respective angle sets for comparison.
+def bond_set_from_distances(D, atom_types, n, scale=FRAGMENT_BOND_SCALE):
+    bonds = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            cut = scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
+            if D[i, j] <= cut:
+                bonds[(i, j)] = tuple(sorted((atom_types[i], atom_types[j])))
+    return bonds
+
+
+def connected_components(adj):
+    seen, frags = set(), []
+    for start in range(len(adj)):
+        if start in seen:
+            continue
+        stack, frag = [start], []
+        seen.add(start)
+        while stack:
+            node = stack.pop()
+            frag.append(node)
+            for nbr in adj[node]:
+                if nbr not in seen:
+                    seen.add(nbr)
+                    stack.append(nbr)
+        frags.append(sorted(frag))
+    return sorted(frags, key=lambda f: (f[0], len(f)))
+
+
+def find_fragments(coords, atom_types, n, scale=FRAGMENT_BOND_SCALE):
+    return connected_components(bond_adjacency(coords, atom_types, n, scale))
+
+
+def geometry_pair_mask(fragments, max_atoms):
+    """1 for intra-fragment pairs. Marks which distances are chemically bonded-ish."""
+    gm = np.zeros((max_atoms, max_atoms), dtype=np.float32)
+    for frag in fragments:
+        idx = np.array(frag, dtype=np.int64)
+        gm[np.ix_(idx, idx)] = 1.0
+    np.fill_diagonal(gm, 0.0)
+    return gm
+
+
+def kabsch(P, Q):
+    """Rotate+translate P onto Q. Reflection-corrected without a second SVD."""
+    Pc = P - P.mean(axis=0)
+    Qc = Q - Q.mean(axis=0)
+    V, _, W = np.linalg.svd(Pc.T @ Qc)
+    if np.linalg.det(V @ W) < 0.0:
+        V[:, -1] *= -1.0
+    return Pc @ (V @ W) + Q.mean(axis=0)
+
+
+def global_kabsch_align(c_R, c_P, n):
+    """ONE rigid transform for the whole reactant, never per fragment.
+
+    Per-fragment alignment translates every reactant fragment onto its PRODUCT
+    fragment's centroid, overwriting the reactant's inter-fragment arrangement
+    (separation, relative orientation, approach direction) with the product's.
+    For coordinate-native geometry that is fatal: the seed would carry zero
+    reactant information about how the fragments approach, and
+    `cross_fragment_orientation` is 31.9% of failing validation reactions. One
+    global transform fits each fragment worse but PRESERVES the degree of freedom
+    the model is supposed to predict. Refining a coarse seed is the EGNN's job;
+    recovering deleted information is not.
     """
-    adjacency = bond_adjacency_from_coords(coords, atom_types, n, bond_scale)
+    out = c_R.copy()
+    out[:n] = kabsch(c_R[:n], c_P[:n]) if n >= 2 else c_P[:n]
+    return out
+
+
+def kabsch_align_fragments(c_R, c_P, atom_types, n, scale=FRAGMENT_BOND_SCALE):
+    """Per-fragment alignment. ONLY for build_energy_features, never for the seed."""
+    out = c_R.copy()
+    frags_R = find_fragments(c_R, atom_types, n, scale)
+    frags_P = find_fragments(c_P, atom_types, n, scale)
+    frags = frags_P if len(frags_P) > len(frags_R) else frags_R
+    for frag in frags:
+        idx = np.array(frag, dtype=np.int64)
+        out[idx] = kabsch(c_R[idx], c_P[idx]) if len(idx) >= 2 else c_P[idx]
+    return out
+
+
+def coordinate_seed(c_R, c_P, n):
+    """The R/P midpoint the EGNN starts from, in the product frame."""
+    c_R_aligned = global_kabsch_align(c_R, c_P, n)
+    c_I = np.zeros_like(c_P)
+    c_I[:n] = 0.5 * (c_R_aligned[:n] + c_P[:n])
+    return c_I
+
+
+# =============================================================================
+# 28D energy descriptor for the Ea head
+# =============================================================================
+def _stats4(values):
+    arr = np.asarray(list(values), dtype=np.float64)
+    if arr.size == 0:
+        return 0.0, 0.0, 0.0, 0.0
+    return float(arr.mean()), float(arr.std()), float(arr.min()), float(arr.max())
+
+
+def bond_angles(coords, atom_types, n, scale=FRAGMENT_BOND_SCALE):
+    """Every bonded triplet (i, j, k) with central atom j and i<k -> angle in degrees."""
+    adj = bond_adjacency(coords, atom_types, n, scale)
     angles = {}
     for j in range(n):
-        nbrs = sorted(adjacency[j])
+        nbrs = sorted(adj[j])
         for a in range(len(nbrs)):
             for b in range(a + 1, len(nbrs)):
                 i, k = nbrs[a], nbrs[b]
-                v1 = coords[i] - coords[j]
-                v2 = coords[k] - coords[j]
-                n1 = np.linalg.norm(v1)
-                n2 = np.linalg.norm(v2)
+                v1, v2 = coords[i] - coords[j], coords[k] - coords[j]
+                n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
                 if n1 < 1e-9 or n2 < 1e-9:
                     continue
                 cos = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
                 angles[(i, j, k)] = float(np.degrees(np.arccos(cos)))
     return angles
 
-def _stats4(values):
-    """(mean, std, min, max) over a list/array, all 0.0 when empty."""
-    arr = np.asarray(list(values), dtype=np.float64)
-    if arr.size == 0:
-        return 0.0, 0.0, 0.0, 0.0
-    return float(arr.mean()), float(arr.std()), float(arr.min()), float(arr.max())
 
-# =============================================================================
-# Reaction-center angle features (targeted at forming/breaking bonds)
-# =============================================================================
+def _best_dihedral(coords, atom_types, n, bond_pair, adj):
+    """Representative dihedral i-a-b-j across bond (a,b), heaviest neighbour each side.
 
-def _reaction_center_atoms(D_R, D_P, atom_types, n, bond_scale=1.45):
-    """Identify atoms involved in forming/breaking bonds.
-
-    Returns the set of reaction-center atom indices, plus the sets of
-    formed and broken bond pairs (i, j) with i < j.
-    """
-    bonds_R = bond_set_from_distance_matrix(D_R, atom_types, n, bond_scale)
-    bonds_P = bond_set_from_distance_matrix(D_P, atom_types, n, bond_scale)
-    formed = set(bonds_P) - set(bonds_R)
-    broken = set(bonds_R) - set(bonds_P)
-    rc_atoms = set()
-    for (i, j) in formed | broken:
-        rc_atoms.add(i)
-        rc_atoms.add(j)
-    return rc_atoms, formed, broken
-
-
-def _rc_bond_angles(coords, atom_types, n, rc_atoms, bond_scale=1.45):
-    """Bond angles only at reaction-center atoms (central atom in rc_atoms)."""
-    all_angles = bond_angles_from_coords(coords, atom_types, n, bond_scale)
-    rc_angles = {k: v for k, v in all_angles.items() if k[1] in rc_atoms}
-    return rc_angles
-
-
-def _best_dihedral_across_bond(coords, atom_types, n, bond_pair, adjacency):
-    """Compute a single representative dihedral i-a-b-j across bond (a,b).
-
-    Picks the neighbor pair (i of a, j of b) with the heaviest atoms
-    to get the most chemically meaningful dihedral.
-
-    Returns (cos_phi, sin_phi) as a periodicity-safe encoding.
+    Returned as (cos, sin) so the encoding is periodicity-safe.
     """
     a, b = bond_pair
-    nbrs_a = [x for x in adjacency[a] if x != b and x < n]
-    nbrs_b = [x for x in adjacency[b] if x != a and x < n]
+    nbrs_a = [x for x in adj[a] if x != b and x < n]
+    nbrs_b = [x for x in adj[b] if x != a and x < n]
     if not nbrs_a or not nbrs_b:
-        return 0.0, 0.0  # degenerate — no neighbors to define a dihedral
-
-    # Pick heaviest neighbor on each side for chemical relevance
+        return 0.0, 0.0
     i = max(nbrs_a, key=lambda x: atomic_mass(atom_types[x]))
     j = max(nbrs_b, key=lambda x: atomic_mass(atom_types[x]))
-
-    # Dihedral i-a-b-j
-    b1 = coords[a] - coords[i]
-    b2 = coords[b] - coords[a]
-    b3 = coords[j] - coords[b]
-    n1 = np.cross(b1, b2)
-    n2 = np.cross(b2, b3)
-    n1_norm = np.linalg.norm(n1)
-    n2_norm = np.linalg.norm(n2)
-    if n1_norm < 1e-9 or n2_norm < 1e-9:
-        return 1.0, 0.0  # degenerate → 0 degrees
-    n1 /= n1_norm
-    n2 /= n2_norm
-    b2_hat = b2 / max(np.linalg.norm(b2), 1e-9)
-    cos_phi = float(np.clip(np.dot(n1, n2), -1.0, 1.0))
-    sin_phi = float(np.clip(np.dot(np.cross(n1, n2), b2_hat), -1.0, 1.0))
-    return cos_phi, sin_phi
+    b1, b2, b3 = coords[a] - coords[i], coords[b] - coords[a], coords[j] - coords[b]
+    n1, n2 = np.cross(b1, b2), np.cross(b2, b3)
+    n1n, n2n = np.linalg.norm(n1), np.linalg.norm(n2)
+    if n1n < 1e-9 or n2n < 1e-9:
+        return 1.0, 0.0
+    n1, n2 = n1 / n1n, n2 / n2n
+    b2h = b2 / max(np.linalg.norm(b2), 1e-9)
+    return (float(np.clip(np.dot(n1, n2), -1.0, 1.0)),
+            float(np.clip(np.dot(np.cross(n1, n2), b2h), -1.0, 1.0)))
 
 
-def _pyramidalization_angle(coords, center, neighbors):
-    """Out-of-plane angle for a trigonal center (degrees).
-
-    For a center atom with ≥3 neighbors, measures average deviation from
-    planarity. Captures sp2↔sp3 distortion at the reactive atom.
-    """
+def _pyramidalization(coords, center, neighbors):
+    """Mean out-of-plane angle (deg) at a trigonal centre — the sp2<->sp3 distortion."""
     if len(neighbors) < 3:
         return 0.0
-    # Take first 3 neighbors (sorted by index for reproducibility)
     nbrs = sorted(neighbors)[:3]
     v1 = coords[nbrs[0]] - coords[center]
     v2 = coords[nbrs[1]] - coords[center]
     v3 = coords[nbrs[2]] - coords[center]
-    # Normal to the plane of the 3 neighbor vectors
-    plane_normal = np.cross(v1 - v2, v1 - v3)
-    pn_norm = np.linalg.norm(plane_normal)
-    if pn_norm < 1e-9:
+    normal = np.cross(v1 - v2, v1 - v3)
+    nn = np.linalg.norm(normal)
+    if nn < 1e-9:
         return 0.0
-    plane_normal /= pn_norm
-    # Average deviation from planarity
+    normal /= nn
     angles = []
-    for v in [v1, v2, v3]:
-        v_norm = np.linalg.norm(v)
-        if v_norm < 1e-9:
+    for v in (v1, v2, v3):
+        vn = np.linalg.norm(v)
+        if vn < 1e-9:
             continue
-        sin_angle = abs(np.dot(v / v_norm, plane_normal))
-        angles.append(float(np.degrees(np.arcsin(np.clip(sin_angle, 0.0, 1.0)))))
+        angles.append(float(np.degrees(np.arcsin(
+            np.clip(abs(np.dot(v / vn, normal)), 0.0, 1.0)))))
     return float(np.mean(angles)) if angles else 0.0
 
 
-def _rc_angle_features(cR, cP, atom_types, n, bond_scale=1.45):
-    """Compute 8 reaction-center angle features from R and P geometries.
+def _rc_angle_features(cR, cP, atom_types, n, scale=FRAGMENT_BOND_SCALE):
+    """8D angular description of the reacting atoms specifically.
 
-    These target the exact gap in the existing feature set: no per-atom or
-    per-triplet angle information at the reactive atoms. All angles use
-    cos/sin encoding to handle periodicity.
-
-    Features (8D):
-      [0] rc_angle_R_mean    — mean cos(bond angle) at reacting atoms in R
-      [1] rc_angle_P_mean    — mean cos(bond angle) at reacting atoms in P
-      [2] rc_angle_change_max — max |Δangle| at any reacting-atom center, R→P
-      [3] rc_dihedral_forming_cos — cos(dihedral) across forming bond region
-      [4] rc_dihedral_forming_sin — sin(dihedral) across forming bond region
-      [5] rc_dihedral_breaking_cos — cos(dihedral) across breaking bond region
-      [6] rc_dihedral_breaking_sin — sin(dihedral) across breaking bond region
-      [7] rc_pyramidalization  — avg out-of-plane angle at reacting atoms (deg)
+    The rest of the descriptor is whole-molecule statistics, which say nothing
+    about the geometry AT the forming/breaking bonds.
     """
-    # Need distance matrices to identify forming/breaking bonds
-    D_R = np.zeros((n, n), dtype=np.float64)
-    D_P = np.zeros((n, n), dtype=np.float64)
-    for i in range(n):
-        for j in range(i + 1, n):
-            dr = np.linalg.norm(cR[i] - cR[j])
-            dp = np.linalg.norm(cP[i] - cP[j])
-            D_R[i, j] = D_R[j, i] = dr
-            D_P[i, j] = D_P[j, i] = dp
+    D_R = compute_distance_matrix(cR.astype(np.float32))[:n, :n].astype(np.float64)
+    D_P = compute_distance_matrix(cP.astype(np.float32))[:n, :n].astype(np.float64)
+    bonds_R = bond_set_from_distances(D_R, atom_types, n, scale)
+    bonds_P = bond_set_from_distances(D_P, atom_types, n, scale)
+    formed = set(bonds_P) - set(bonds_R)
+    broken = set(bonds_R) - set(bonds_P)
+    rc_atoms = {i for pair in (formed | broken) for i in pair}
 
-    rc_atoms, formed, broken = _reaction_center_atoms(
-        D_R, D_P, atom_types, n, bond_scale
-    )
+    all_R = bond_angles(cR, atom_types, n, scale)
+    all_P = bond_angles(cP, atom_types, n, scale)
+    rc_R = {k: v for k, v in all_R.items() if k[1] in rc_atoms}
+    rc_P = {k: v for k, v in all_P.items() if k[1] in rc_atoms}
+    mean_R = float(np.mean([np.cos(np.radians(a)) for a in rc_R.values()])) if rc_R else 0.0
+    mean_P = float(np.mean([np.cos(np.radians(a)) for a in rc_P.values()])) if rc_P else 0.0
+    common = set(rc_R) & set(rc_P)
+    change_max = float(max(abs(rc_R[t] - rc_P[t]) for t in common)) if common else 0.0
 
-    # --- Feature 0-1: Mean cos(bond angle) at reacting atoms in R and P ---
-    rc_ang_R = _rc_bond_angles(cR, atom_types, n, rc_atoms, bond_scale)
-    rc_ang_P = _rc_bond_angles(cP, atom_types, n, rc_atoms, bond_scale)
-    if rc_ang_R:
-        rc_angle_R_mean = float(np.mean([np.cos(np.radians(a)) for a in rc_ang_R.values()]))
-    else:
-        rc_angle_R_mean = 0.0
-    if rc_ang_P:
-        rc_angle_P_mean = float(np.mean([np.cos(np.radians(a)) for a in rc_ang_P.values()]))
-    else:
-        rc_angle_P_mean = 0.0
+    adj_R = bond_adjacency(cR, atom_types, n, scale)
+    adj_P = bond_adjacency(cP, atom_types, n, scale)
+    # Forming bonds are measured in P (where the bond exists), broken bonds in R.
+    fc = [_best_dihedral(cP, atom_types, n, p, adj_P) for p in formed]
+    bc = [_best_dihedral(cR, atom_types, n, p, adj_R) for p in broken]
+    f_cos = float(np.mean([x[0] for x in fc])) if fc else 0.0
+    f_sin = float(np.mean([x[1] for x in fc])) if fc else 0.0
+    b_cos = float(np.mean([x[0] for x in bc])) if bc else 0.0
+    b_sin = float(np.mean([x[1] for x in bc])) if bc else 0.0
 
-    # --- Feature 2: Max angle change at any reacting-atom center ----------
-    common_rc = set(rc_ang_R) & set(rc_ang_P)
-    if common_rc:
-        rc_changes = np.array([abs(rc_ang_R[t] - rc_ang_P[t]) for t in common_rc],
-                              dtype=np.float64)
-        rc_angle_change_max = float(rc_changes.max())
-    else:
-        rc_angle_change_max = 0.0
-
-    # --- Features 3-6: Dihedrals across forming/breaking bonds ------------
-    # Use the *product* adjacency for formed bonds, *reactant* for broken
-    adj_R = bond_adjacency_from_coords(cR, atom_types, n, bond_scale)
-    adj_P = bond_adjacency_from_coords(cP, atom_types, n, bond_scale)
-
-    # Forming bonds: average dihedral in P geometry (where bond exists)
-    form_cos_list, form_sin_list = [], []
-    for (a, b) in formed:
-        c, s = _best_dihedral_across_bond(cP, atom_types, n, (a, b), adj_P)
-        form_cos_list.append(c)
-        form_sin_list.append(s)
-    rc_dih_form_cos = float(np.mean(form_cos_list)) if form_cos_list else 0.0
-    rc_dih_form_sin = float(np.mean(form_sin_list)) if form_sin_list else 0.0
-
-    # Breaking bonds: average dihedral in R geometry (where bond exists)
-    break_cos_list, break_sin_list = [], []
-    for (a, b) in broken:
-        c, s = _best_dihedral_across_bond(cR, atom_types, n, (a, b), adj_R)
-        break_cos_list.append(c)
-        break_sin_list.append(s)
-    rc_dih_break_cos = float(np.mean(break_cos_list)) if break_cos_list else 0.0
-    rc_dih_break_sin = float(np.mean(break_sin_list)) if break_sin_list else 0.0
-
-    # --- Feature 7: Pyramidalization at reacting atoms --------------------
-    # Average across R and P to capture the sp2↔sp3 distortion trend
-    pyram_vals = []
-    for atom_idx in rc_atoms:
-        nbrs_R = [x for x in adj_R[atom_idx] if x < n]
-        nbrs_P = [x for x in adj_P[atom_idx] if x < n]
-        pR = _pyramidalization_angle(cR, atom_idx, nbrs_R)
-        pP = _pyramidalization_angle(cP, atom_idx, nbrs_P)
-        pyram_vals.append((pR + pP) / 2.0)
-    rc_pyramidalization = float(np.mean(pyram_vals)) if pyram_vals else 0.0
-
-    return np.array([
-        rc_angle_R_mean, rc_angle_P_mean, rc_angle_change_max,
-        rc_dih_form_cos, rc_dih_form_sin,
-        rc_dih_break_cos, rc_dih_break_sin,
-        rc_pyramidalization,
-    ], dtype=np.float32)
+    pyr = [0.5 * (_pyramidalization(cR, i, [x for x in adj_R[i] if x < n])
+                  + _pyramidalization(cP, i, [x for x in adj_P[i] if x < n]))
+           for i in rc_atoms]
+    return np.array([mean_R, mean_P, change_max, f_cos, f_sin, b_cos, b_sin,
+                     float(np.mean(pyr)) if pyr else 0.0], dtype=np.float32)
 
 
-def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p, bond_scale=1.45):
-    """Construct the energy-head input feature vector from reactant + product only.
+def build_energy_features(atom_types, n, c_R_aligned, c_P, e_r, e_p,
+                          scale=FRAGMENT_BOND_SCALE):
+    """28D reaction descriptor, computable from R and P alone (no TS leakage).
 
-    Shared by training (build_reaction_samples) and inference
-    (predict_transition_state) so the two can never drift out of sync. All
-    inputs are available before the TS is known. Returns float32 of fixed length.
-
-    Feature groups (28D total):
-      [0:10]  reaction energetics + composition
-      [10:20] bond-angle statistics for reactant, product, and their change
-      [20:28] reaction-center angle features (targeted at forming/breaking bonds)
-
-    Note: per-atom atomic descriptors (EN, Z, Mass) have been moved out of this
-    global vector and are now attached directly to each atom in PSICore via
-    build_atom_physical_features(), preserving their spatial identity.
+      [0:10]  energetics + composition
+      [10:20] bond-angle statistics for R, P, and their change
+      [20:28] reaction-centre angle features
     """
     cR = np.asarray(c_R_aligned, dtype=np.float64)[:n]
     cP = np.asarray(c_P, dtype=np.float64)[:n]
     types = list(atom_types[:n])
-
-    # --- reaction energetics + composition -------------------------------
-    de_rxn = abs(e_r - e_p)
-    de_rxn_signed = e_p - e_r  # signed reaction energy (Bell-Evans-Polanyi driver)
     diff_norms = np.linalg.norm(cR - cP, axis=1)
-    c_count = sum(1 for t in types if t == 'C')
-    h_count = sum(1 for t in types if t == 'H')
-    n_count = sum(1 for t in types if t == 'N')
-    o_count = sum(1 for t in types if t == 'O')
-
-    # --- bond-angle statistics -------------------------------------------
-    ang_R = bond_angles_from_coords(cR, types, n, bond_scale)
-    ang_P = bond_angles_from_coords(cP, types, n, bond_scale)
-    aR_mean, aR_std, aR_min, aR_max = _stats4(ang_R.values())
-    aP_mean, aP_std, aP_min, aP_max = _stats4(ang_P.values())
+    ang_R, ang_P = bond_angles(cR, types, n, scale), bond_angles(cP, types, n, scale)
+    aR = _stats4(ang_R.values())
+    aP = _stats4(ang_P.values())
     common = set(ang_R) & set(ang_P)
-    if common:
-        changes = np.array([abs(ang_R[t] - ang_P[t]) for t in common], dtype=np.float64)
-        ang_change_mean = float(changes.mean())
-        ang_change_max = float(changes.max())
-    else:
-        ang_change_mean = 0.0
-        ang_change_max = 0.0
-
-    # --- reaction-center angle features (8D) -----------------------------
-    rc_feats = _rc_angle_features(cR, cP, types, n, bond_scale)
-
-    feats = np.array([
-        # reaction energetics + composition (10 features)
-        de_rxn, de_rxn_signed, float(diff_norms.mean()), float(diff_norms.std()),
-        float(diff_norms.max()), float(n),
-        float(c_count), float(h_count), float(n_count), float(o_count),
-        # bond-angle statistics (10 features)
-        aR_mean, aR_std, aR_min, aR_max,
-        aP_mean, aP_std, aP_min, aP_max,
-        ang_change_mean, ang_change_max,
-        # reaction-center angle features (8 features)
-        rc_feats[0], rc_feats[1], rc_feats[2],
-        rc_feats[3], rc_feats[4],
-        rc_feats[5], rc_feats[6],
-        rc_feats[7],
+    changes = np.array([abs(ang_R[t] - ang_P[t]) for t in common]) if common else np.zeros(1)
+    rc = _rc_angle_features(cR, cP, types, n, scale)
+    return np.array([
+        abs(e_r - e_p), e_p - e_r,
+        float(diff_norms.mean()), float(diff_norms.std()), float(diff_norms.max()),
+        float(n),
+        float(sum(1 for t in types if t == 'C')), float(sum(1 for t in types if t == 'H')),
+        float(sum(1 for t in types if t == 'N')), float(sum(1 for t in types if t == 'O')),
+        aR[0], aR[1], aR[2], aR[3], aP[0], aP[1], aP[2], aP[3],
+        float(changes.mean()) if common else 0.0,
+        float(changes.max()) if common else 0.0,
+        rc[0], rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7],
     ], dtype=np.float32)
-    return feats
 
-ATOM_PHYS_DIM = 3  # electronegativity, atomic number, mass
-ENERGY_FEAT_DIM = 28  # reaction energetics + composition + bond-angle statistics + RC angles
 
 def build_atom_physical_features(atom_types, n, max_atoms):
-    """Per-atom physical descriptors: [EN, Z, Mass] for each atom, zero-padded.
-
-    These features are attached directly to each atom node in PSICore so the
-    Transformer can reason about *which* atom has which property spatially,
-    rather than receiving only global min/max/mean statistics.
-    """
+    """Per-atom [EN, Z, mass], zero-padded. Attached to nodes so the encoder knows
+    WHICH atom carries which property, not just global statistics."""
     feats = np.zeros((max_atoms, ATOM_PHYS_DIM), dtype=np.float32)
     for i in range(n):
         t = atom_types[i]
         feats[i] = [electronegativity(t), float(atomic_number(t)), atomic_mass(t)]
     return feats
 
-def compute_distance_matrix(coords):
-    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
-    dist = np.sqrt(np.sum(diff ** 2, axis=-1) + 1e-8)
-    return dist.astype(np.float32)
 
-def mds(D, dim=3):
-    n = D.shape[0]
-    H = np.eye(n) - np.ones((n, n)) / n
-    B = -0.5 * H @ (D ** 2) @ H
-    evals, evecs = np.linalg.eigh(B)
-    idx = np.argsort(evals)[::-1]
-    evals = evals[idx]
-    evecs = evecs[:, idx]
-    n_dims = min(dim, n)
-    X = evecs[:, :n_dims] @ np.diag(np.sqrt(np.maximum(evals[:n_dims], 0)))
-    if n_dims < dim:
-        X = np.pad(X, ((0, 0), (0, dim - n_dims)))
-    return X
-
-def kabsch(P, Q):
-    """Align P onto Q using the Kabsch algorithm.
-
-    Includes reflection correction without re-running SVD.
-    """
-    P_centered = P - P.mean(axis=0)
-    Q_centered = Q - Q.mean(axis=0)
-    C = P_centered.T @ Q_centered
-    V, _, W = np.linalg.svd(C)
-    if np.linalg.det(V @ W) < 0.0:
-        V[:, -1] *= -1.0
-    R = V @ W
-    return P_centered @ R + Q.mean(axis=0)
-
-def connected_components(adjacency):
-    seen = set()
-    fragments = []
-    for start in range(len(adjacency)):
-        if start in seen:
-            continue
-        stack = [start]
-        seen.add(start)
-        frag = []
-        while stack:
-            node = stack.pop()
-            frag.append(node)
-            for nbr in adjacency[node]:
-                if nbr not in seen:
-                    seen.add(nbr)
-                    stack.append(nbr)
-        fragments.append(sorted(frag))
-    return sorted(fragments, key=lambda frag: (frag[0], len(frag)))
-
-def find_fragments_from_coords(coords, atom_types, n, bond_scale=1.45):
-    adjacency = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
-            if np.linalg.norm(coords[i] - coords[j]) <= cutoff:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    return connected_components(adjacency)
-
-def find_fragments_from_distances(D, atom_types, bond_scale=1.45):
-    n = len(atom_types)
-    adjacency = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
-            if D[i, j] <= cutoff:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    return connected_components(adjacency)
-
-def geometry_pair_mask_from_fragments(fragments, max_atoms, include_diagonal=False):
-    geom_mask = np.zeros((max_atoms, max_atoms), dtype=np.float32)
-    for frag in fragments:
-        idx = np.array(frag, dtype=np.int64)
-        geom_mask[np.ix_(idx, idx)] = 1.0
-    if not include_diagonal:
-        np.fill_diagonal(geom_mask, 0.0)
-    return geom_mask
-
-def choose_alignment_fragments(c_R, c_P, atom_types, n, bond_scale=1.45):
-    frags_R = find_fragments_from_coords(c_R, atom_types, n, bond_scale)
-    frags_P = find_fragments_from_coords(c_P, atom_types, n, bond_scale)
-    if len(frags_P) > len(frags_R):
-        return frags_P
-    if len(frags_R) > len(frags_P):
-        return frags_R
-    return frags_R
-
-def kabsch_align_reactant_fragments(c_R, c_P, atom_types, n, bond_scale=1.45):
-    c_R_aligned = c_R.copy()
-    fragments = choose_alignment_fragments(c_R, c_P, atom_types, n, bond_scale)
-    for frag in fragments:
-        idx = np.array(frag, dtype=np.int64)
-        if len(idx) >= 2:
-            c_R_aligned[idx] = kabsch(c_R[idx], c_P[idx])
-        else:
-            c_R_aligned[idx] = c_P[idx]
-    return c_R_aligned
-
-def mds_aligned(D, reference_coords=None, dim=3):
-    """Recover one global coordinate set from a full distance matrix.
-
-    A single MDS embedding preserves inter-fragment distances. When a reference
-    frame is available, only one global rigid alignment is applied.
-    """
-    X = mds(D, dim=dim)
-    if reference_coords is not None:
-        ref = np.asarray(reference_coords, dtype=np.float64)
-        if len(X) >= 2:
-            X = kabsch(X, ref)
-        elif len(X) == 1:
-            X[0] = ref[0]
-    elif len(X) > 0:
-        X = X - X.mean(axis=0)
-    return X.astype(np.float32)
-
-STERIC_FLOOR_FRAC = 0.75
-
-def clamp_steric_collisions(pred_dist, atom_types, floor_frac=STERIC_FLOOR_FRAC):
-    n = len(atom_types)
-    for i in range(n):
-        for j in range(i + 1, n):
-            r_i = covalent_radius(atom_types[i])
-            r_j = covalent_radius(atom_types[j])
-            min_d = floor_frac * (r_i + r_j)
-            if pred_dist[i, j] < min_d:
-                pred_dist[i, j] = min_d
-                pred_dist[j, i] = min_d
-    return pred_dist
-
-def spectator_pairs(D_R, D_P, n, threshold=0.15):
-    spectator = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            if abs(D_R[i, j] - D_P[i, j]) <= threshold:
-                spectator.append((i, j))
-    return spectator
-
-RISK_BOND_TYPES = {
-    tuple(sorted(pair))
-    for pair in [("N", "N"), ("N", "O"), ("O", "O"), ("C", "N"), ("H", "N")]
-}
-
-def bond_set_from_distance_matrix(D, atom_types, n, bond_scale=1.45):
-    bonds = {}
-    for i in range(n):
-        for j in range(i + 1, n):
-            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
-            if D[i, j] <= cutoff:
-                bonds[(i, j)] = tuple(sorted((atom_types[i], atom_types[j])))
-    return bonds
-
-def reaction_risk_features(D_R, D_P, atom_types, n, max_atoms, bond_scale=1.45, active_threshold=0.15):
-    """Risk flags for reaction classes that showed higher validation Ea error."""
-    bonds_R = bond_set_from_distance_matrix(D_R, atom_types, n, bond_scale)
-    bonds_P = bond_set_from_distance_matrix(D_P, atom_types, n, bond_scale)
+def reaction_risk_features(D_R, D_P, atom_types, n, max_atoms):
+    """Complexity/chemistry flags for the reaction classes with elevated Ea error."""
+    bonds_R = bond_set_from_distances(D_R, atom_types, n)
+    bonds_P = bond_set_from_distances(D_P, atom_types, n)
     formed = set(bonds_P) - set(bonds_R)
     broken = set(bonds_R) - set(bonds_P)
-
     risk_pair_mask = np.zeros((max_atoms, max_atoms), dtype=np.float32)
-    risky_bond_types = set()
+    risky_types = set()
     for i in range(n):
         for j in range(i + 1, n):
-            bond_type = tuple(sorted((atom_types[i], atom_types[j])))
-            is_active = abs(D_R[i, j] - D_P[i, j]) > active_threshold
-            is_formed_or_broken = (i, j) in formed or (i, j) in broken
-            is_risky_type = bond_type in RISK_BOND_TYPES
-            if is_active:
-                if is_risky_type:
-                    risky_bond_types.add(bond_type)
-            if is_formed_or_broken and is_risky_type:
-                risky_bond_types.add(bond_type)
-            if is_active or is_formed_or_broken:
+            btype = tuple(sorted((atom_types[i], atom_types[j])))
+            active = abs(D_R[i, j] - D_P[i, j]) > SPECTATOR_THRESHOLD
+            fb = (i, j) in formed or (i, j) in broken
+            if (active or fb) and btype in RISK_BOND_TYPES:
+                risky_types.add(btype)
+            if active or fb:
                 risk_pair_mask[i, j] = risk_pair_mask[j, i] = 1.0
-
-    formed_n = len(formed)
-    broken_n = len(broken)
-    changed_n = formed_n + broken_n
-    complexity_flag = float((formed_n + broken_n) >= 4 or broken_n >= 3)
-    risky_chem_flag = float(len(risky_bond_types) > 0)
-    risk_score = complexity_flag + risky_chem_flag
-    complexity_margin_penalty = max(0.0, changed_n - 3.0) ** 2 + max(0.0, 1.0 - changed_n) ** 2
-    complexity_sigmoid_penalty = 1.0 / (1.0 + math.exp(-1.25 * (changed_n - 4.0)))
-    risk_penalty = complexity_margin_penalty + 0.5 * risky_chem_flag
+    formed_n, broken_n = len(formed), len(broken)
+    changed = formed_n + broken_n
+    risky_chem = float(len(risky_types) > 0)
     return {
-        "formed_bonds": formed_n,
-        "broken_bonds": broken_n,
-        "changed_bonds": changed_n,
-        "complexity_flag": complexity_flag,
-        "risky_chem_flag": risky_chem_flag,
-        "risk_score": risk_score,
-        "complexity_margin_penalty": complexity_margin_penalty,
-        "complexity_sigmoid_penalty": complexity_sigmoid_penalty,
-        "risk_penalty": risk_penalty,
+        "formed_bonds": formed_n, "broken_bonds": broken_n, "changed_bonds": changed,
+        "complexity_flag": float(changed >= 4 or broken_n >= 3),
+        "risky_chem_flag": risky_chem,
+        "risk_score": float(changed >= 4 or broken_n >= 3) + risky_chem,
+        # Margin penalty: quadratic outside the 1..3 changed-bond "safe" band.
+        "risk_penalty": max(0.0, changed - 3.0) ** 2 + max(0.0, 1.0 - changed) ** 2
+                        + 0.5 * risky_chem,
         "risk_pair_mask": risk_pair_mask,
-        "risky_bond_types": sorted("-".join(t) for t in risky_bond_types),
-    }
-
-def continuous_risk_penalty(formed_n, broken_n, risky_chem_flag, mode="margin", safe_min=1.0,
-                            safe_max=3.0, sigmoid_center=4.0, sigmoid_k=1.25):
-    """Smooth reaction-complexity penalty used for sample-level loss weighting."""
-    changed = float(formed_n + broken_n)
-    if mode == "binary":
-        complexity = float(changed >= safe_max + 1.0 or broken_n >= safe_max)
-    elif mode == "sigmoid":
-        complexity = 1.0 / (1.0 + math.exp(-sigmoid_k * (changed - sigmoid_center)))
-    elif mode == "margin":
-        complexity = max(0.0, changed - safe_max) ** 2 + max(0.0, safe_min - changed) ** 2
-    else:
-        raise ValueError(f"Unknown risk_penalty_mode '{mode}'. Use 'binary', 'margin', or 'sigmoid'.")
-    return float(complexity + 0.5 * float(risky_chem_flag > 0.0))
-
-def ensure_sample_risk_features(sample, config, atom_types=None):
-    """Populate risk masks/flags for samples created before these fields existed."""
-    max_atoms = config["max_atoms"]
-    expected_shape = (max_atoms, max_atoms)
-    risk_mask = sample.get("risk_pair_mask")
-    masks_ready = (
-        risk_mask is not None
-        and tuple(risk_mask.shape) == expected_shape
-    )
-    flags_ready = all(
-        key in sample
-        for key in ("risk_score", "complexity_flag", "risky_chem_flag", "risk_penalty")
-    )
-    if masks_ready and flags_ready:
-        return
-
-    atom_types = atom_types or sample.get("atom_types")
-    if atom_types is None:
-        rxn_id = sample.get("rxn_id", "<unknown>")
-        raise KeyError(
-            f"Sample {rxn_id} is missing risk fields and atom types, "
-            "so risk_pair_mask cannot be rebuilt."
-        )
-
-    n = sample["n_atoms"]
-    D_R = compute_distance_matrix(sample["c_R"])
-    D_P = compute_distance_matrix(sample["c_P"])
-    risk = reaction_risk_features(
-        D_R,
-        D_P,
-        atom_types,
-        n,
-        max_atoms,
-        config["fragment_bond_scale"],
-        config["spectator_threshold"],
-    )
-
-    sample["risk_pair_mask"] = torch.from_numpy(risk["risk_pair_mask"])
-    sample["risk_score"] = risk["risk_score"]
-    sample["complexity_flag"] = risk["complexity_flag"]
-    sample["risky_chem_flag"] = risk["risky_chem_flag"]
-    sample.setdefault("formed_bonds", risk["formed_bonds"])
-    sample.setdefault("broken_bonds", risk["broken_bonds"])
-    sample.setdefault("changed_bonds", risk["changed_bonds"])
-    sample["complexity_margin_penalty"] = risk["complexity_margin_penalty"]
-    sample["complexity_sigmoid_penalty"] = risk["complexity_sigmoid_penalty"]
-    sample["risk_penalty"] = risk["risk_penalty"]
-    sample.setdefault("risky_bond_types", risk["risky_bond_types"])
-
-def apply_spectator_constraints(pred_dist, D_R, D_P, n, threshold=0.15, tol=0.05, pair_mask=None):
-    for (i, j) in spectator_pairs(D_R, D_P, n, threshold):
-        if pair_mask is not None and pair_mask[i, j] <= 0:
-            continue
-        d_ref = (D_R[i, j] + D_P[i, j]) / 2.0
-        lo = d_ref * (1.0 - tol)
-        hi = d_ref * (1.0 + tol)
-        clamped = float(np.clip(pred_dist[i, j], lo, hi))
-        pred_dist[i, j] = clamped
-        pred_dist[j, i] = clamped
-    return pred_dist
-
-def enforce_triangle_inequality(D, tol=0.05):
-    D = D.copy()
-    n = D.shape[0]
-    for k in range(n):
-        for i in range(n):
-            for j in range(n):
-                shortcut = D[i, k] + D[k, j]
-                if D[i, j] - shortcut > tol:
-                    D[i, j] = D[j, i] = shortcut
-    return D
-
-def validate_ts_geometry(pred_dist, atom_types, n):
-    issues = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            r_i = covalent_radius(atom_types[i])
-            r_j = covalent_radius(atom_types[j])
-            min_d = STERIC_FLOOR_FRAC * (r_i + r_j)
-            if pred_dist[i, j] < min_d:
-                issues.append(f"  STERIC   {atom_types[i]}{i}-{atom_types[j]}{j}: {pred_dist[i,j]:.3f} Å < floor {min_d:.3f} Å")
-    if issues:
-        print(f"[TS Validation] {len(issues)} issue(s) detected:")
-        for iss in issues:
-            print(iss)
-    else:
-        print("[TS Validation] Geometry passed all physical checks.")
-    return len(issues) == 0
-
-def padded_coords(atoms, max_atoms):
-    coords = np.zeros((max_atoms, 3), dtype=np.float32)
-    for i, atom in enumerate(atoms):
-        coords[i] = [atom["x"], atom["y"], atom["z"]]
-    return coords
-
-def parse_log_content(file_content):
-    atoms = []
-    energy = None
-    lines = file_content.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if "Standard Nuclear Orientation" in line:
-            current_atoms = []
-            i += 3
-            while i < len(lines) and not lines[i].strip().startswith("---"):
-                parts = lines[i].split()
-                if len(parts) == 5:
-                    current_atoms.append({
-                        "atom": parts[1],
-                        "x": float(parts[2]), "y": float(parts[3]), "z": float(parts[4])
-                    })
-                i += 1
-            atoms = current_atoms
-        elif "Final energy is" in line:
-            energy = float(line.split()[-1])
-        elif "Total energy in the final basis set =" in line:
-            energy = float(line.split()[-1])
-        i += 1
-    return {"energy": energy, "atoms": atoms}
-
-def load_log_file(path):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        parsed = parse_log_content(f.read())
-    if not parsed["atoms"]:
-        raise ValueError(f"No atoms found in {path}")
-    return parsed
-
-def write_xyz(path, atom_types, coords, comment):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"{len(atom_types)}\n")
-        f.write(f"{comment}\n")
-        for atom, (x, y, z) in zip(atom_types, coords):
-            f.write(f"{atom:<2} {x: .8f} {y: .8f} {z: .8f}\n")
-
-def masked_mae(A, B, mask=None):
-    diff = np.abs(np.array(A) - np.array(B))
-    if mask is None:
-        return float(diff.mean())
-    mask = np.array(mask, dtype=np.float64)
-    return float((diff * mask).sum() / max(mask.sum(), 1.0))
-
-def fragments_from_mask(mask):
-    mask = np.array(mask)
-    n = mask.shape[0]
-    adjacency = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if mask[i, j] > 0:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    return connected_components(adjacency)
-
-def get_bonds_from_distances(D, atom_types, fragments=None, bond_scale=1.45):
-    bonds = []
-    n = len(atom_types)
-    allowed = np.zeros((n, n), dtype=bool)
-    if fragments is None:
-        allowed[:, :] = True
-    else:
-        for frag in fragments:
-            idx = np.array(frag, dtype=np.int64)
-            allowed[np.ix_(idx, idx)] = True
-    for i in range(n):
-        for j in range(i+1, n):
-            if not allowed[i, j]:
-                continue
-            r_i = covalent_radius(atom_types[i])
-            r_j = covalent_radius(atom_types[j])
-            if D[i, j] < bond_scale * (r_i + r_j):
-                bonds.append((i, j))
-    return bonds
-
-# =============================================================================
-# Training / prediction pipeline (formerly psi_full_pipeline.py)
-# =============================================================================
-
-CONFIG = {
-    "dataset": "b97d3",             # b97d3 or wb97xd3
-    "tar_path": "b97d3.tar.gz",
-    "dataset_json": "extracted_b97d3.json",
-    "save_dir": ".",
-    # ~3 logs (r/p/ts) per reaction, minus those dropped by the max_atoms and
-    # negative-Ea filters. Stage-A scale-up targets roughly 20k usable triplets.
-    # extraction limit. Set to 1,000,000 to process the entire dataset.
-    "extraction_limit": 1000000,
-    "target_reactions": 40000,      # RGD1 subset: ~2.5x the old b97d3 set, fast to build/train
-    "force_extract": False,
-    # --- Built-sample cache ------------------------------------------------
-    # build_reaction_samples() does heavy per-reaction feature engineering
-    # (Kabsch alignment, fragment detection, risk features). Cache the built
-    # samples to disk so subsequent runs skip the rebuild. Invalidated
-    # automatically when any feature-affecting param below changes, or with
-    # --force-extract.
-    "sample_cache_enabled": True,
-    "sample_cache_path": None,      # None -> auto: <save_dir>/samples_cache_rgd1.pkl
-    "max_atoms": 30,
-    "n_gaussians": 32,
-    "gauss_start": 0.4,
-    "gauss_stop": 6.0,
-    "atom_embed_dim": 32,
-    "gru_hidden": 128,
-    "gru_layers": 2,
-    "gru_dropout": 0.1,
-    "attn_heads": 8,
-    "attn_layers": 3,
-    "ff_dim": 512,
-    "dropout": 0.1,
-    "delta_clamp": 3.0,
-    # --- EGNN coordinate refiner -----------------------------------------
-    # After the geometry head predicts a TS distance matrix, we embed it to 3D
-    # (differentiable MDS) and refine the coordinates with an E(n)-equivariant
-    # GNN that consumes a per-atom chemical-property vector + the TS coords.
-    "egnn_enabled": True,
-    "egnn_layers": 8,
-    "egnn_hidden": 256,
-    "egnn_coord_clamp": 3.5,  # max per-step coordinate displacement (Angstrom)
-    "geom_coarse_weight": 0.5,  # weight on the pre-EGNN (coarse) distance aux loss
-    # --- MoE swarm (mixture-of-experts geometry/Ea refiners) -------------
-    # When egnn_enabled, the refiner is a top-k routed swarm: `num_experts`
-    # parallel EGNN/Ea experts, each token routed to its best `top_k`, with
-    # a cross-talk consensus layer. A load-balancing loss keeps routing even.
-    "num_experts": 5,
-    "top_k": 2,
-    # --- Learned activation-energy (Ea) head -----------------------------
-    # A small head consumes the EGNN's refined per-atom features (h_ts) + the
-    # signed reaction energy and regresses Ea. It trains from the start on
-    # detached TS features, then after warmup its gradient can reshape the EGNN
-    # once predicted TS geometries are good enough to learn from. PhysicsEa
-    # (Marcus/Hammond/OLS) is kept as a side-by-side baseline.
-    "ea_loss_weight": 0.5,          # de-emphasized: Ea head already converged (~5 kcal); free gradient budget for TS geometry
-    "ea_loss_start_epoch": 1,       # train Ea head from the first epoch
-    "ea_warmup_loss_weight": 1.0,   # detached-feature Ea weight before joint mode
-    "ea_warmup_epochs": 0,          # 0 = Ea head and TS geometry co-train jointly from epoch 1
-                                    # (full Ea weight + Ea in checkpoint selection immediately).
-                                    # Safe here because ea_uncertainty is off (no NLL collapse).
-    "ea_select_weight": 0.5,        # Ea contribution to checkpoint selection
-    "ea_head_dropout": 0.15,        # dropout inside the Ea head MLP
-    "ea_head_lr": 3e-4,             # faster LR for the Ea mean/variance head
-    "ea_head_weight_decay": 1e-3,
-    "ea_uncertainty_enabled": False, # predict normalized Ea mean + log-variance
-    "ea_log_var_init": 0.0,         # initial sigma ~= 1 normalized Ea std
-    "ea_log_var_min": -1.5,         # lower clamp for Gaussian NLL stability
-    "ea_log_var_max": 4.0,          # upper clamp still allows very uncertain outliers
-    "ea_detach_during_warmup": False,  # off: variance floor already tames NLL collapse; keep the
-                                        # structure->energy gradient flowing. Rip-cord: --ea-detach-warmup
-                                        # if the MoE swarm destabilizes during warmup.
-    # --- Phase 2: optional high-Ea tail weighting ------------------------
-    # Disabled by default with Gaussian NLL uncertainty: the learned variance
-    # now handles high-barrier outliers without multiplying their gradients.
-    "ea_tail_weighting_enabled": False,
-    "ea_tail_weight_mode": "piecewise",
-    "ea_tail_weight_bins": [80.0, 100.0, 120.0],
-    "ea_tail_weight_values": [1.0, 1.5, 2.0, 2.5],
-    "ea_tail_weight_max": 2.5,
-    "lr": 1.5e-4,
-    "weight_decay": 1e-3,
-    "warmup_epochs": 40,
-    "grad_clip": 1.0,
-    "batch_size": 32,
-    "num_workers": 2,
-    "pin_memory": True,
-    "device": "cuda",
-    "require_cuda": True,
-    "amp": True,
-    "epochs": 800,
-    "swa_enabled": True,
-    "swa_start": 450,
-    "print_every": 25,
-    "val_split": 0.15,
-    "split_seed": 42,
-    "split_strategy": "stratified",
-    "split_bins": 5,
-    "patience": 120,
-    "spectator_threshold": 0.15,
-    "spectator_tol": 0.05,
-    "risk_penalty_mode": "margin",
-    "risk_safe_min": 1.0,
-    "risk_safe_max": 3.0,
-    "risk_sigmoid_center": 4.0,
-    "risk_sigmoid_k": 1.25,
-    "risk_weight_alpha": 0.5,
-    "risk_weight_max": 3.0,
-    "risk_ea_loss_weight": 0.5,      # extra Ea objective weight on high-risk reaction classes
-    "risk_geom_loss_weight": 0.2,    # extra geometry loss on active/formed/broken risky pairs
-    "triangle_loss_weight": 0.05,
-    "triangle_coarse_weight": 0.25,
-    "triangle_refined_weight": 1.0,
-    "triangle_tolerance": 0.02,
-    "triangle_triplet_samples": 1024,
-    "fragment_bond_scale": 1.45,
-    "hartree_to_kcal": 627.509,
-    "skip_negative_ea": True,
-    "coord_noise": 0.01,
-    # --- Fix 1: Active-atom gradient masking (Section 6 of Failure Analysis) ---
-    # Downweight spectator-to-spectator distances to reduce gradient pollution.
-    "active_masking_enabled": True,
-    "spectator_spectator_weight": 0.1,  # 10% gradient on static backbone pairs
-    # --- Fix 2: Hinge cross-distance boost (Section 5 of Failure Analysis) ----
-    # Upweight active-to-spectator cross-distances to preserve global rotation.
-    "hinge_boost_enabled": True,
-    "hinge_cross_weight": 3.0,          # 3x gradient on active-spectator pairs
-    # --- Fix 3: Error-tail oversampling (Section 4.2 of Failure Analysis) -----
-    # Physically oversample high-barrier reactions via WeightedRandomSampler.
-    "tail_oversampling_enabled": False,  # off: with the larger RGD1 pool the natural
-                                         # high-barrier frequency is enough; oversampling
-                                         # was a small-data crutch that distorts the train
-                                         # distribution.
-    "tail_oversample_threshold": 100.0,  # Ea above this gets oversampled
-    "tail_oversample_factor": 5.0,       # sample weight multiplier for tail
-    "tail_mid_threshold": 80.0,          # moderate boost zone starts here
-    "tail_mid_factor": 2.0,              # sample weight multiplier for mid tail
-}
-
-def resolve_device(config):
-    print("WARNING: Forcing CUDA device, CPU fallback removed.")
-    return torch.device("cuda")
-
-def configure_torch_runtime(device):
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        torch.set_float32_matmul_precision("high")
-
-def move_batch_to_device(batch, device):
-    return (
-        batch["D_R"].to(device, non_blocking=True),
-        batch["D_I"].to(device, non_blocking=True),
-        batch["D_P"].to(device, non_blocking=True),
-        batch["D_TS"].to(device, non_blocking=True),
-        batch["mask"].to(device, non_blocking=True),
-        batch["geom_mask"].to(device, non_blocking=True),
-        batch["atom_ids"].to(device, non_blocking=True),
-        batch["atom_phys"].to(device, non_blocking=True),
-        batch["Ea"].to(device, non_blocking=True),
-        batch["de_rxn"].to(device, non_blocking=True),
-        batch["energy_feats"].to(device, non_blocking=True),
-        batch["risk_pair_mask"].to(device, non_blocking=True),
-        batch["risk_score"].to(device, non_blocking=True),
-        batch["risk_penalty"].to(device, non_blocking=True),
-        batch["complexity_flag"].to(device, non_blocking=True),
-        batch["risky_chem_flag"].to(device, non_blocking=True),
-    )
-
-def extract_raw_data(config):
-    pass # Skipped for RGD1 dataset
-
-def build_atom_vocab():
-    sorted_atoms = sorted(ATOMIC_NUMBER.keys())
-    vocab = {atom: i + 1 for i, atom in enumerate(sorted_atoms)}
-    return vocab
-
-def _sample_cache_meta(config):
-    """Feature-affecting params. A change to any of these invalidates the cache."""
-    return {
-        "cache_version": 2,  # v2: drop reactions with empty reaction center (no changed bonds)
-        "dataset": "rgd1",
-        "max_atoms": config["max_atoms"],
-        "fragment_bond_scale": config["fragment_bond_scale"],
-        "spectator_threshold": config["spectator_threshold"],
-        "skip_negative_ea": config.get("skip_negative_ea", True),
     }
 
 
-def _samples_cache_path(config):
-    p = config.get("sample_cache_path")
-    if p:
-        return p
-    return os.path.join(config.get("save_dir", "."), "samples_cache_rgd1.pkl")
-
-
-def build_reaction_samples(config):
-    """Return built reaction samples, using an on-disk cache when possible.
-
-    The cache stores the full built pool. If a later run requests fewer
-    reactions than the cached pool holds (and feature params are unchanged),
-    the first N deterministic samples are sliced out without rebuilding.
-    """
-    target_reactions = config.get("target_reactions", 30000)
-    cache_path = _samples_cache_path(config)
-    meta = _sample_cache_meta(config)
-
-    if (config.get("sample_cache_enabled", True)
-            and not config.get("force_extract", False)
-            and os.path.exists(cache_path)):
-        try:
-            with open(cache_path, "rb") as fh:
-                cached = pickle.load(fh)
-            pool = cached.get("samples", [])
-            # Valid when the cached pool covers the request, OR the cache already
-            # exhausted the whole dataset (can't produce more no matter the target).
-            covers = len(pool) >= target_reactions or cached.get("exhausted", False)
-            if cached.get("meta") == meta and covers:
-                samples = pool[:target_reactions]
-                atom_types_map = {s["rxn_id"]: s["atom_types"] for s in samples}
-                print(f"Loaded {len(samples)} reaction samples from cache "
-                      f"{cache_path} (built pool={len(pool)}"
-                      f"{', dataset-exhausted' if cached.get('exhausted') else ''}).")
-                return samples, cached["atom_vocab"], atom_types_map
-            if cached.get("meta") != meta:
-                print("Sample cache present but feature params changed; rebuilding.")
-            else:
-                print(f"Sample cache holds {len(pool)} < requested "
-                      f"{target_reactions}; rebuilding.")
-        except Exception as e:
-            print(f"Warning: failed to read sample cache ({e}); rebuilding.")
-
-    samples, atom_vocab, atom_types_map = _build_reaction_samples_from_h5(config)
-    # If we produced fewer than requested, the dataset is exhausted: record it so
-    # future runs reuse this cache instead of rebuilding to chase an unreachable target.
-    exhausted = len(samples) < target_reactions
-
-    if config.get("sample_cache_enabled", True):
-        try:
-            with open(cache_path, "wb") as fh:
-                pickle.dump(
-                    {"meta": meta, "samples": samples,
-                     "atom_vocab": atom_vocab, "exhausted": exhausted},
-                    fh, protocol=pickle.HIGHEST_PROTOCOL,
-                )
-            print(f"Cached {len(samples)} reaction samples to {cache_path}.")
-        except Exception as e:
-            print(f"Warning: failed to write sample cache ({e}).")
-
-    return samples, atom_vocab, atom_types_map
-
-
 # =============================================================================
-# RGD1 dataset resolution (Kaggle / cloud friendly)
-# -----------------------------------------------------------------------------
-# The full RGD1_CHNO.h5 is ~1.34 GB, too large to hand-upload to Kaggle. Instead
-# we resolve the data at runtime in this order:
-#   1. An explicit config["data_dir"] / RGD1_DATA_DIR env var holding the files.
-#   2. Any attached Kaggle dataset under /kaggle/input/**  (glob search).
-#   3. A local cache dir; if the files are absent there, stream them straight
-#      from Figshare (needs the notebook's "Internet" toggle ON).
-# Only the two files training actually needs are fetched: the CHNO geometries
-# and the reaction-info CSV.
+# RGD1 data resolution — Kaggle input, then Figshare
 # =============================================================================
 RGD1_FILES = {
     "RGD1_CHNO.h5": "https://ndownloader.figshare.com/files/38170323",
     "DFT_reaction_info.csv": "https://ndownloader.figshare.com/files/40273231",
 }
-# Approx sizes (bytes) used only for a sanity check on cached/partial files.
-RGD1_MIN_SIZES = {
-    "RGD1_CHNO.h5": 1_200_000_000,
-    "DFT_reaction_info.csv": 20_000_000,
-}
+RGD1_MIN_SIZES = {"RGD1_CHNO.h5": 1_200_000_000, "DFT_reaction_info.csv": 20_000_000}
 
 
-def _default_cache_dir():
-    """Writable cache dir, preferring Kaggle's persistent working dir."""
-    if os.path.isdir("/kaggle/working"):
-        return "/kaggle/working/RGD1_Dataset"
-    return os.path.join(os.getcwd(), "RGD1_Dataset")
-
-
-def _download_with_progress(url, dest):
-    """Stream `url` to `dest` (atomic via .part), printing coarse progress."""
+def _download(url, dest):
+    """Stream to `dest`, atomic via .part so an interrupted session leaves no
+    half-file that a later run would mistake for a complete download."""
     tmp = dest + ".part"
-    print(f"[download] {os.path.basename(dest)} <- {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": "psi-cloud-pipeline"})
+    print(f"[data] downloading {os.path.basename(dest)}", flush=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "psi-cloud"})
     with urllib.request.urlopen(req) as resp, open(tmp, "wb") as out:
         total = int(resp.headers.get("Content-Length", 0))
-        done = 0
-        last_pct = -5
-        chunk = 1024 * 1024
+        done, last = 0, -5
         while True:
-            buf = resp.read(chunk)
+            buf = resp.read(1 << 20)
             if not buf:
                 break
             out.write(buf)
             done += len(buf)
-            if total:
-                pct = int(done * 100 / total)
-                if pct >= last_pct + 5:
-                    print(f"  {os.path.basename(dest)}: {pct}% "
-                          f"({done/1e6:.0f}/{total/1e6:.0f} MB)", flush=True)
-                    last_pct = pct
+            pct = int(done * 100 / total) if total else 0
+            if pct >= last + 5:
+                print(f"  {pct}% ({done/1e6:.0f}/{total/1e6:.0f} MB)", flush=True)
+                last = pct
     os.replace(tmp, dest)
-    print(f"[download] done: {dest} ({os.path.getsize(dest)/1e6:.0f} MB)")
 
 
-def _find_in_kaggle_input(filename):
-    """Return a path to `filename` under /kaggle/input, if an attached dataset has it."""
-    root = "/kaggle/input"
-    if not os.path.isdir(root):
-        return None
-    for dirpath, _dirs, files in os.walk(root):
-        if filename in files:
-            return os.path.join(dirpath, filename)
-    return None
+def resolve_rgd1():
+    """(h5_path, csv_path) from an attached Kaggle dataset, else Figshare."""
+    found = {}
+    for fname in RGD1_FILES:
+        hits = glob.glob(f"/kaggle/input/**/{fname}", recursive=True)
+        found[fname] = hits[0] if hits else None
+    if all(found.values()):
+        print(f"[data] using attached Kaggle dataset:\n       " +
+              "\n       ".join(found.values()))
+        return found["RGD1_CHNO.h5"], found["DFT_reaction_info.csv"]
 
-
-def resolve_rgd1_data(config):
-    """Return (h5_path, csv_path), fetching from Figshare online if needed."""
-    # 1. Explicit override.
-    data_dir = config.get("data_dir") or os.environ.get("RGD1_DATA_DIR")
-    if data_dir:
-        h5_path = os.path.join(data_dir, "RGD1_CHNO.h5")
-        csv_path = os.path.join(data_dir, "DFT_reaction_info.csv")
-        if os.path.exists(h5_path) and os.path.exists(csv_path):
-            print(f"[data] Using RGD1 files from data_dir={data_dir}")
-            return h5_path, csv_path
-        print(f"[data] data_dir={data_dir} set but files missing; falling back.")
-
-    # 2. Attached Kaggle dataset.
-    kaggle_h5 = _find_in_kaggle_input("RGD1_CHNO.h5")
-    kaggle_csv = _find_in_kaggle_input("DFT_reaction_info.csv")
-    if kaggle_h5 and kaggle_csv:
-        print(f"[data] Using RGD1 files from Kaggle input:\n"
-              f"       {kaggle_h5}\n       {kaggle_csv}")
-        return kaggle_h5, kaggle_csv
-
-    # 3. Local cache, downloading from Figshare when absent.
-    cache_dir = config.get("data_cache_dir") or _default_cache_dir()
-    os.makedirs(cache_dir, exist_ok=True)
+    cache = os.path.join(WORK_DIR, "RGD1_Dataset")
+    os.makedirs(cache, exist_ok=True)
     paths = {}
     for fname, url in RGD1_FILES.items():
-        dest = os.path.join(cache_dir, fname)
-        min_size = RGD1_MIN_SIZES.get(fname, 0)
-        if os.path.exists(dest) and os.path.getsize(dest) >= min_size:
-            print(f"[data] Cached {fname} ({os.path.getsize(dest)/1e6:.0f} MB) at {dest}")
-        else:
-            if os.path.exists(dest):
-                print(f"[data] {fname} looks truncated; re-downloading.")
-            try:
-                _download_with_progress(url, dest)
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to download {fname} from Figshare ({e}). On Kaggle, "
-                    "enable the notebook's 'Internet' setting, or attach RGD1 as a "
-                    "dataset and set config['data_dir'] / RGD1_DATA_DIR."
-                ) from e
+        dest = os.path.join(cache, fname)
+        big_enough = os.path.exists(dest) and os.path.getsize(dest) >= RGD1_MIN_SIZES[fname]
+        if not big_enough:
+            _download(url, dest)
+        print(f"[data] {fname}: {os.path.getsize(dest)/1e6:.0f} MB")
         paths[fname] = dest
     return paths["RGD1_CHNO.h5"], paths["DFT_reaction_info.csv"]
 
 
-def _build_reaction_samples_from_h5(config):
+# =============================================================================
+# Sample construction
+# =============================================================================
+def _find_cache(filename, working_path):
+    """An existing on-disk cache, or None. Looks at an ATTACHED Kaggle dataset
+    (/kaggle/input) first, then the working dir. This is what makes a saved and
+    re-attached cache actually get reused across sessions instead of rebuilt:
+    /kaggle/working does not persist, so a cache from a prior session only comes
+    back mounted read-only under /kaggle/input."""
+    hits = glob.glob(f"/kaggle/input/**/{filename}", recursive=True)
+    if hits:
+        return hits[0]
+    return working_path if os.path.exists(working_path) else None
+
+
+def find_sample_cache():
+    return _find_cache("samples_cache.pkl", SAMPLE_CACHE)
+
+
+def build_samples():
+    """Parse RGD1 into training samples, cached to disk after the first pass.
+
+    Reactions with an empty reaction centre under the covalent-radius rule are
+    dropped here: the Ea head pools over the forming/breaking atoms and refuses to
+    spread an empty mask over the whole molecule.
+    """
+    cached = find_sample_cache()
+    if cached is not None:
+        # Reused as-is: no re-parse, and resolve_rgd1() is never called, so the
+        # 1.34 GB RGD1 download is skipped entirely when the samples already exist.
+        with open(cached, "rb") as fh:
+            blob = pickle.load(fh)
+        print(f"[data] loaded {len(blob['samples'])} samples from {cached}")
+        return blob["samples"], blob["atom_vocab"]
+
     import h5py
     import pandas as pd
-
-    h5_path, csv_path = resolve_rgd1_data(config)
-
-    print(f"Loading metadata from {csv_path}...")
+    h5_path, csv_path = resolve_rgd1()
+    print(f"[data] parsing {h5_path}", flush=True)
     df = pd.read_csv(csv_path)
-    df = df[df['DE_F'].notna()]
-    
+    df = df[df["DE_F"].notna()]
     atom_vocab = build_atom_vocab()
-    INV_ATOMIC_NUMBER = {v: k for k, v in ATOMIC_NUMBER.items()}
-    
-    samples = []
-    atom_types_map = {}
-    skipped_no_rc = 0
-    target_reactions = config.get("target_reactions", 30000)
-    
-    print(f"Opening HDF5 dataset at {h5_path} to extract {target_reactions} samples...")
-    with h5py.File(h5_path, 'r') as f:
-        for idx, row in df.iterrows():
-            if len(samples) >= target_reactions:
+    inv_z = {v: k for k, v in ATOMIC_NUMBER.items()}
+    samples, skipped_no_rc, t0 = [], 0, time.time()
+
+    with h5py.File(h5_path, "r") as f:
+        for _, row in df.iterrows():
+            if len(samples) >= TARGET_REACTIONS:
                 break
-                
-            rxn_id = str(row['channel']) if 'channel' in df else str(row.name)
+            rxn_id = str(row["channel"])
             if rxn_id not in f:
                 continue
-                
-            group = f[rxn_id]
-            
-            c_R_raw = group['RG'][:]
-            c_P_raw = group['PG'][:]
-            c_TS_raw = group['TSG'][:]
-            elements = group['elements'][:]
+            grp = f[rxn_id]
+            elements = grp["elements"][:]
             n = len(elements)
-            
-            if n > config["max_atoms"]:
+            if n > MAX_ATOMS:
                 continue
-                
-            atom_types = [INV_ATOMIC_NUMBER.get(int(z), 'C') for z in elements]
-            atom_ids = np.zeros(config["max_atoms"], dtype=np.int64)
+            ea = float(row["DE_F"])
+            if SKIP_NEGATIVE_EA and ea < 0:
+                continue
+            dh = float(row["DH"])
+
+            atom_types = [inv_z.get(int(z), "C") for z in elements]
+            atom_ids = np.zeros(MAX_ATOMS, dtype=np.int64)
             for i, a in enumerate(atom_types):
                 atom_ids[i] = atom_vocab.get(a, 0)
-                
-            mask = np.zeros(config["max_atoms"], dtype=np.float32)
+            mask = np.zeros(MAX_ATOMS, dtype=np.float32)
             mask[:n] = 1.0
-            
-            ea = float(row['DE_F'])
-            dh = float(row['DH'])
-            if config.get("skip_negative_ea", True) and ea < 0:
-                continue
-                
-            c_R = np.zeros((config["max_atoms"], 3), dtype=np.float32)
-            c_P = np.zeros((config["max_atoms"], 3), dtype=np.float32)
-            c_TS = np.zeros((config["max_atoms"], 3), dtype=np.float32)
-            c_R[:n] = c_R_raw
-            c_P[:n] = c_P_raw
-            c_TS[:n] = c_TS_raw
-            
-            e_r = 0.0
-            e_p = dh
-            
-            c_R_aligned_init = kabsch_align_reactant_fragments(
-                c_R, c_P, atom_types, n, config["fragment_bond_scale"]
-            )
-            
-            energy_feats = build_energy_features(
-                atom_types, n, c_R_aligned_init, c_P, e_r, e_p, config["fragment_bond_scale"]
-            )
-            atom_phys = build_atom_physical_features(
-                atom_types, n, config["max_atoms"]
-            )
-            
-            D_R_raw = compute_distance_matrix(c_R)
-            D_P_raw = compute_distance_matrix(c_P)
-            D_TS = compute_distance_matrix(c_TS)
-            
-            risk = reaction_risk_features(
-                D_R_raw, D_P_raw, atom_types, n, config["max_atoms"],
-                config["fragment_bond_scale"], config["spectator_threshold"],
-            )
-            # Reaction-center pooling requires at least one forming/breaking bond.
-            # A reaction whose covalent bond sets are identical in R and P yields an
-            # empty RC mask, which the Ea head refuses to pool over (it raises). Drop
-            # these at load time rather than degrade the pooling downstream.
+
+            c_R = np.zeros((MAX_ATOMS, 3), dtype=np.float32)
+            c_P = np.zeros((MAX_ATOMS, 3), dtype=np.float32)
+            c_TS = np.zeros((MAX_ATOMS, 3), dtype=np.float32)
+            c_R[:n], c_P[:n], c_TS[:n] = grp["RG"][:], grp["PG"][:], grp["TSG"][:]
+
+            D_R = compute_distance_matrix(c_R)
+            D_P = compute_distance_matrix(c_P)
+            risk = reaction_risk_features(D_R, D_P, atom_types, n, MAX_ATOMS)
             if risk["changed_bonds"] == 0:
                 skipped_no_rc += 1
                 continue
-            ts_fragments = find_fragments_from_coords(
-                c_TS, atom_types, n, config["fragment_bond_scale"]
-            )
-            geom_mask = geometry_pair_mask_from_fragments(ts_fragments, config["max_atoms"])
-            atom_types_map[rxn_id] = atom_types
-            
+
+            # Per-fragment alignment ONLY here: the descriptor wants each fragment's
+            # internal geometry compared like-for-like. The EGNN seed uses the
+            # global alignment instead (see global_kabsch_align).
+            c_R_frag = kabsch_align_fragments(c_R, c_P, atom_types, n)
             samples.append({
-                "rxn_id": rxn_id, "n_atoms": n,
-                "c_R": c_R, "c_P": c_P,
-                "atom_types": atom_types,
-                "atom_ids": torch.from_numpy(atom_ids),
-                "mask": torch.from_numpy(mask),
-                "Ea_raw": ea,
-                "de_rxn_raw": dh,
-                "energy_feats_raw": energy_feats,
-                "atom_phys_raw": atom_phys,
-                "D_TS": torch.from_numpy(D_TS),
-                "geom_mask": torch.from_numpy(geom_mask),
-                "risk_pair_mask": torch.from_numpy(risk["risk_pair_mask"]),
+                "rxn_id": rxn_id, "n_atoms": n, "atom_types": atom_types,
+                "c_R": c_R, "c_P": c_P, "c_TS": c_TS,
+                "c_I": coordinate_seed(c_R, c_P, n),
+                "atom_ids": atom_ids, "mask": mask,
+                "D_R": D_R, "D_P": D_P, "D_TS": compute_distance_matrix(c_TS),
+                "geom_mask": geometry_pair_mask(
+                    find_fragments(c_TS, atom_types, n), MAX_ATOMS),
+                "Ea_raw": ea, "de_rxn_raw": dh,
+                "energy_feats_raw": build_energy_features(
+                    atom_types, n, c_R_frag, c_P, 0.0, dh),
+                "atom_phys_raw": build_atom_physical_features(atom_types, n, MAX_ATOMS),
+                "risk_pair_mask": risk["risk_pair_mask"],
                 "risk_score": risk["risk_score"],
                 "risk_penalty": risk["risk_penalty"],
-                "complexity_margin_penalty": risk["complexity_margin_penalty"],
-                "complexity_sigmoid_penalty": risk["complexity_sigmoid_penalty"],
                 "complexity_flag": risk["complexity_flag"],
                 "risky_chem_flag": risk["risky_chem_flag"],
                 "formed_bonds": risk["formed_bonds"],
                 "broken_bonds": risk["broken_bonds"],
-                "changed_bonds": risk["changed_bonds"],
-                "risky_bond_types": risk["risky_bond_types"],
             })
-            
-            if len(samples) % 1000 == 0:
-                print(f"  Processed {len(samples)}/{target_reactions} reactions...", flush=True)
+            if len(samples) % 2000 == 0:
+                print(f"  {len(samples)}/{TARGET_REACTIONS} "
+                      f"({time.time()-t0:.0f}s)", flush=True)
 
-    if skipped_no_rc:
-        print(f"Skipped {skipped_no_rc} reactions with no forming/breaking bonds (empty reaction center).", flush=True)
-    print(f"Loaded {len(samples)} complete reaction triplets.", flush=True)
-    return samples, atom_vocab, atom_types_map
+    print(f"[data] built {len(samples)} samples; "
+          f"skipped {skipped_no_rc} with an empty reaction centre")
+    with open(SAMPLE_CACHE, "wb") as fh:
+        pickle.dump({"samples": samples, "atom_vocab": atom_vocab}, fh,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+    return samples, atom_vocab
 
 
-def _split_profile(samples, indices):
-    """Compact distribution summary for one dataset split."""
-    if not indices:
-        return {
-            "count": 0,
-            "ea_mean": None,
-            "ea_std": None,
-            "ea_min": None,
-            "ea_max": None,
-            "atom_mean": None,
-            "atom_min": None,
-            "atom_max": None,
-            "changed_mean": None,
-            "changed_max": None,
-            "formed_mean": None,
-            "broken_mean": None,
-            "risk_fraction": None,
-            "complex_fraction": None,
-            "risky_chem_fraction": None,
-        }
+# =============================================================================
+# Stage 1: GFN2-xTB Wiberg bond orders
+# =============================================================================
+BOHR = 1.8897259886
 
-    ea = np.array([samples[i]["Ea_raw"] for i in indices], dtype=np.float64)
-    atoms = np.array([samples[i]["n_atoms"] for i in indices], dtype=np.float64)
-    formed = np.array([samples[i].get("formed_bonds", 0) for i in indices], dtype=np.float64)
-    broken = np.array([samples[i].get("broken_bonds", 0) for i in indices], dtype=np.float64)
-    changed = formed + broken
-    risk = np.array([samples[i].get("risk_score", 0.0) for i in indices], dtype=np.float64)
-    complex_flag = np.array([samples[i].get("complexity_flag", 0.0) for i in indices], dtype=np.float64)
-    risky_chem = np.array([samples[i].get("risky_chem_flag", 0.0) for i in indices], dtype=np.float64)
-    return {
-        "count": int(len(indices)),
-        "ea_mean": float(ea.mean()),
-        "ea_std": float(ea.std()),
-        "ea_min": float(ea.min()),
-        "ea_max": float(ea.max()),
-        "atom_mean": float(atoms.mean()),
-        "atom_min": int(atoms.min()),
-        "atom_max": int(atoms.max()),
-        "changed_mean": float(changed.mean()),
-        "changed_max": int(changed.max()),
-        "formed_mean": float(formed.mean()),
-        "broken_mean": float(broken.mean()),
-        "risk_fraction": float(np.mean(risk > 0.0)),
-        "complex_fraction": float(np.mean(complex_flag > 0.0)),
-        "risky_chem_fraction": float(np.mean(risky_chem > 0.0)),
-    }
 
-def _print_split_profile(label, profile):
-    if profile["count"] == 0:
-        print(f"  {label:<10} N=0")
+def _bond_orders_one(args):
+    """One reaction -> (rxn_id, {n, bo_R, bo_P}) or (rxn_id, {"error": ...}).
+
+    Only R and P are computed. TS bond orders are deliberately NOT cached: the TS
+    is the prediction target, so feeding TS-derived quantities to the model is
+    label leakage.
+
+    This is the ONE deliberate try/except in the file. GFN2-xTB fails to converge
+    on a handful of geometries (measured: 6 of 40,000) and there is no way to ask
+    in advance, so without it a single unavoidable failure destroys a ~2 h
+    precompute at an arbitrary point. Recording the failure is not a fallback:
+    the reaction is EXCLUDED downstream by filter_to_bond_orders, never patched up
+    with a substitute. Returning a zero matrix here would read as "every bond
+    broke" and silently poison the reaction centre for that reaction.
+    """
+    from tblite.interface import Calculator
+    rxn_id, numbers, c_R, c_P, n = args
+    out = []
+    try:
+        for coords in (c_R, c_P):
+            # RGD1 CHNO is neutral and closed-shell throughout; stated explicitly
+            # rather than left to a library default.
+            calc = Calculator("GFN2-xTB", numbers, coords[:n] * BOHR, charge=0, uhf=0)
+            calc.set("verbosity", 0)
+            bo = np.asarray(calc.singlepoint().get("bond-orders"))
+            # tblite can return [n, n, nspin]. Summing over spin is required, not
+            # cosmetic: leaving it 3-D makes every downstream [n, n] index wrong,
+            # and this is a ~2 h precompute to discover that at the end of.
+            bo = bo.sum(axis=2) if bo.ndim == 3 else bo
+            out.append(bo.astype(np.float16))
+    except Exception as exc:
+        return rxn_id, {"error": f"{type(exc).__name__}: {exc}"}
+    return rxn_id, {"n": n, "bo_R": out[0], "bo_P": out[1]}
+
+
+def _require_tblite():
+    """Import tblite, or raise the one-line install command. Checked ONCE in the
+    parent so a missing package fails immediately and legibly, instead of every
+    worker throwing ImportError, being recorded as an SCF 'failure', and the run
+    ending with the misleading 'left no usable reactions'."""
+    try:
+        import tblite.interface  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "GFN2-xTB bond orders need the 'tblite' package, which is not "
+            "installed. In a Kaggle cell run:\n    !pip install tblite\nthen "
+            "re-run. (tblite is CPU-only; it is not needed once the cache exists.)"
+        ) from exc
+
+
+def find_bond_order_cache():
+    """Path to an existing bond-order cache (attached Kaggle dataset first, then
+    the working dir), or None if it has not been built yet."""
+    return _find_cache("bond_orders_cache.pkl", BOND_ORDER_CACHE)
+
+
+def stage_bond_orders():
+    """Precompute the Wiberg bond orders for every reaction and cache them.
+
+    A fitted bond-order(length) curve was tried first and rejected: calibrated
+    from mode pairing alone it flagged 76.5% of pairs whose length changed by a
+    mere 0.05-0.10 A -- ordinary conformational relaxation -- as order changes.
+    GFN2-xTB reads the order off the wavefunction, so there is nothing to calibrate.
+
+    ~0.28 s per single point x 2 geometries x 40k reactions, hence the process
+    pool and the on-disk cache: pay it once per dataset, never per run.
+
+    Idempotent: if a cache already exists (an attached Kaggle dataset, or a build
+    from an earlier session in this working dir) it is left untouched and the
+    ~1.5-2 h recompute is skipped. Delete the file to force a rebuild -- e.g. after
+    changing BO_CHANGE_THRESHOLD, the only parameter that alters what it contains.
+    """
+    existing = find_bond_order_cache()
+    if existing is not None:
+        print(f"[xtb] cache already present at {existing}; skipping rebuild. "
+              f"Delete it to recompute.")
         return
-    print(
-        f"  {label:<10} N={profile['count']:>6} | "
-        f"Ea {profile['ea_mean']:7.2f}+/-{profile['ea_std']:<6.2f} "
-        f"[{profile['ea_min']:.2f}, {profile['ea_max']:.2f}] | "
-        f"atoms {profile['atom_mean']:5.1f} [{profile['atom_min']}-{profile['atom_max']}] | "
-        f"changed {profile['changed_mean']:4.2f} max {profile['changed_max']:>2} | "
-        f"risk {profile['risk_fraction'] * 100:5.1f}%"
-    )
+    _require_tblite()
+    samples, _ = build_samples()
+    n_workers = max(1, os.cpu_count() or 1)
+    print(f"[xtb] {len(samples)} reactions on {n_workers} workers", flush=True)
 
-def _validate_split(samples, train_indices, val_indices):
-    train_set = set(train_indices)
-    val_set = set(val_indices)
-    overlap = sorted(train_set & val_set)
-    if overlap:
-        raise ValueError(f"Train/validation split overlap detected at indices: {overlap[:10]}")
-    if len(train_indices) != len(train_set) or len(val_indices) != len(val_set):
-        raise ValueError("Train/validation split contains duplicate indices.")
-    covered = train_set | val_set
-    if len(covered) != len(samples):
-        missing = sorted(set(range(len(samples))) - covered)
-        raise ValueError(f"Train/validation split does not cover all samples. Missing: {missing[:10]}")
+    jobs = [(s["rxn_id"],
+             np.array([atomic_number(a) for a in s["atom_types"]], dtype=np.int64),
+             s["c_R"].astype(np.float64), s["c_P"].astype(np.float64), s["n_atoms"])
+            for s in samples]
 
-    seen_rxns, duplicate_rxns = set(), set()
-    for s in samples:
-        rxn_id = s["rxn_id"]
-        if rxn_id in seen_rxns:
-            duplicate_rxns.add(rxn_id)
-        seen_rxns.add(rxn_id)
-    train_rxns = {samples[i]["rxn_id"] for i in train_indices}
-    val_rxns = {samples[i]["rxn_id"] for i in val_indices}
-    leaked_rxns = sorted(train_rxns & val_rxns)
-    return {
-        "duplicate_rxn_ids": sorted(duplicate_rxns)[:20],
-        "leaked_rxn_ids": leaked_rxns[:20],
-        "has_leakage": bool(leaked_rxns),
-    }
+    orders, failures, t0 = {}, {}, time.time()
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        for k, (rxn_id, rec) in enumerate(pool.map(_bond_orders_one, jobs, chunksize=16), 1):
+            # Failures are collected, never written into `orders`. A reaction
+            # absent from `orders` is dropped by filter_to_bond_orders, which is
+            # the correct outcome; an entry with garbage in it would not be.
+            target = failures if "error" in rec else orders
+            target[rxn_id] = rec.get("error", rec)
+            if k % 500 == 0:
+                rate = k / (time.time() - t0)
+                print(f"  {k}/{len(jobs)}  {rate:.1f} rxn/s  "
+                      f"eta {(len(jobs)-k)/rate/60:.0f} min  "
+                      f"{len(failures)} SCF failure(s)", flush=True)
 
-def make_train_val_split(samples, config):
-    """Create a deterministic train/validation split and report its balance."""
+    with open(BOND_ORDER_CACHE, "wb") as fh:
+        pickle.dump({"meta": {"method": "GFN2-xTB", "n_reactions": len(orders),
+                              "n_failures": len(failures)},
+                     "orders": orders, "failures": failures},
+                    fh, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[xtb] wrote {BOND_ORDER_CACHE} ({len(orders)} reactions, "
+          f"{len(failures)} SCF failures, {(time.time()-t0)/60:.0f} min)")
+    print("[xtb] Save this notebook's output as a Kaggle Dataset and attach it to "
+          "your training sessions.")
+
+
+def load_bond_orders():
+    """Load the cached bond orders. `train` builds the cache before calling this
+    (see stage_train), so an absence here means a direct `eval` on a session that
+    never trained -- point at how to produce it rather than the covalent-radius
+    cutoff, which is a different reaction-centre definition."""
+    path = find_bond_order_cache()
+    if path is None:
+        raise FileNotFoundError(
+            f"No bond-order cache found (looked under /kaggle/input and at "
+            f"{BOND_ORDER_CACHE}). Build it with:\n"
+            f"    !pip install tblite\n"
+            f"    !python {SCRIPT_NAME} bond-orders\n"
+            "or just run `train`, which builds it automatically on first use. "
+            "Refusing to substitute the covalent-radius cutoff, which is a "
+            "different reaction-centre definition."
+        )
+    with open(path, "rb") as fh:
+        orders = pickle.load(fh)["orders"]
+    print(f"[xtb] loaded bond orders for {len(orders)} reactions from {path}")
+    return orders
+
+
+def bond_order_masks(bo_R, bo_P, n):
+    """(reactive_atom [MAX_ATOMS], spectator_pair [MAX_ATOMS, MAX_ATOMS]), both bool.
+
+    reactive pair : |bo_R - bo_P| > BO_CHANGE_THRESHOLD
+    reactive atom : incident on any reactive pair
+    spectator pair: bonded in BOTH R and P and not reactive — the only pairs whose
+                    true TS distance actually sits near the R/P midpoint (measured
+                    |D_TS - D_I| = 0.0143 A, against 0.1218 A for the distance rule).
+
+    Bool, not float32: these are memoised per sample in every persistent worker,
+    where the [30, 30] spectator mask costs 3,600 B/sample as float32 (~123 MB per
+    worker over 34k samples) against 900 B as bool. Every consumer casts anyway.
+    """
+    d = np.abs(bo_R.astype(np.float32) - bo_P.astype(np.float32))
+    off = ~np.eye(n, dtype=bool)
+    reactive = (d > BO_CHANGE_THRESHOLD) & off
+    rc_atom = np.zeros(MAX_ATOMS, dtype=bool)
+    rc_atom[:n] = reactive.any(axis=1)
+    bonded_both = ((bo_R.astype(np.float32) > BO_BONDED_MIN)
+                   & (bo_P.astype(np.float32) > BO_BONDED_MIN) & off)
+    spec = np.zeros((MAX_ATOMS, MAX_ATOMS), dtype=bool)
+    spec[:n, :n] = bonded_both & ~reactive
+    return rc_atom, spec
+
+
+def filter_to_bond_orders(samples, orders):
+    """Drop every reaction the xTB reaction centre cannot describe.
+
+    Two disjoint reasons, both fatal later if left in:
+      * no cached bond orders — GFN2-xTB fails to converge on a handful of
+        geometries (6 of 40,000 measured).
+      * an EMPTY xTB reaction centre — 76 of 39,994 at threshold 0.5. The sample
+        builder's empty-RC check uses the DISTANCE rule, and that guarantee does
+        NOT carry over to a different definition. These reach the Ea head's
+        empty-RC guard, which raises: a crash partway through epoch 1, not a
+        silent degradation. Measured by threshold: 0.3 -> 0, 0.5 -> 76, 0.7 -> 337.
+    """
+    def empty_rc(rec):
+        d = np.abs(rec["bo_R"].astype(np.float32) - rec["bo_P"].astype(np.float32))
+        return not ((d > BO_CHANGE_THRESHOLD) & ~np.eye(rec["n"], dtype=bool)).any()
+
+    missing = [s["rxn_id"] for s in samples if s["rxn_id"] not in orders]
+    empty = [s["rxn_id"] for s in samples
+             if s["rxn_id"] in orders and empty_rc(orders[s["rxn_id"]])]
+    drop = set(missing) | set(empty)
+    keep = [s for s in samples if s["rxn_id"] not in drop]
+    print(f"[xtb] dropped {len(drop)} reaction(s): {len(missing)} without bond "
+          f"orders, {len(empty)} with an empty xTB reaction centre; {len(keep)} remain")
+    if not keep:
+        raise RuntimeError("The bond-order cache does not match this sample set.")
+    return keep, sorted(drop)
+
+
+# =============================================================================
+# Split and normalisation
+# =============================================================================
+def make_split(samples):
+    """Stratified train/val split over (Ea bin, size bin, changed-bond bin, risk)."""
     n_total = len(samples)
-    if n_total < 2:
-        raise ValueError("Need at least two complete reaction triplets to create train/validation splits.")
+    n_val = min(max(1, int(round(n_total * VAL_SPLIT))), n_total - 1)
+    rng = np.random.default_rng(SPLIT_SEED)
+    ea = np.array([s["Ea_raw"] for s in samples], dtype=np.float64)
+    edges = np.unique(np.quantile(ea, np.linspace(0, 1, SPLIT_BINS + 1)[1:-1]))
+    strata = {}
+    for i, s in enumerate(samples):
+        key = (int(np.searchsorted(edges, s["Ea_raw"], side="right")),
+               min(int(s["n_atoms"] // 5), 6),
+               min(int(s["formed_bonds"] + s["broken_bonds"]), 4),
+               int(s["risk_score"] > 0.0))
+        strata.setdefault(key, []).append(i)
+    train_idx, val_idx = [], []
+    for key in sorted(strata):
+        group = np.array(strata[key], dtype=np.int64)
+        rng.shuffle(group)
+        k = 0 if len(group) <= 1 else min(int(round(len(group) * VAL_SPLIT)), len(group) - 1)
+        val_idx.extend(group[:k].tolist())
+        train_idx.extend(group[k:].tolist())
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+    assert not (set(train_idx) & set(val_idx)), "train/val leakage"
+    print(f"[split] {len(train_idx)} train / {len(val_idx)} val "
+          f"(requested {n_val} val)")
+    return train_idx, val_idx
 
-    val_split = float(config["val_split"])
-    if not 0.0 < val_split < 1.0:
-        raise ValueError(f"val_split must be between 0 and 1, got {val_split}.")
-    n_val = min(max(1, int(round(n_total * val_split))), n_total - 1)
-    seed = int(config.get("split_seed", 42))
-    strategy = config.get("split_strategy", "random").lower()
-    rng = np.random.default_rng(seed)
-
-    if strategy == "random":
-        indices = np.arange(n_total, dtype=np.int64)
-        rng.shuffle(indices)
-        val_indices = indices[:n_val].tolist()
-        train_indices = indices[n_val:].tolist()
-    elif strategy == "stratified":
-        ea_values = np.array([s["Ea_raw"] for s in samples], dtype=np.float64)
-        n_bins = max(1, int(config.get("split_bins", 5)))
-        quantiles = np.linspace(0.0, 1.0, min(n_bins, n_total) + 1)[1:-1]
-        ea_edges = np.unique(np.quantile(ea_values, quantiles)) if len(quantiles) else np.array([])
-        strata = {}
-        for i, s in enumerate(samples):
-            ea_bin = int(np.searchsorted(ea_edges, s["Ea_raw"], side="right"))
-            atom_bin = min(int(s["n_atoms"] // 5), 6)
-            changed_bin = min(int(s.get("formed_bonds", 0) + s.get("broken_bonds", 0)), 4)
-            risk_bin = int(float(s.get("risk_score", 0.0)) > 0.0)
-            key = (ea_bin, atom_bin, changed_bin, risk_bin)
-            strata.setdefault(key, []).append(i)
-
-        train_indices, val_indices = [], []
-        for key in sorted(strata):
-            group = np.array(strata[key], dtype=np.int64)
-            rng.shuffle(group)
-            group_val = int(round(len(group) * val_split))
-            if len(group) <= 1:
-                group_val = 0
-            else:
-                group_val = min(group_val, len(group) - 1)
-            val_indices.extend(group[:group_val].tolist())
-            train_indices.extend(group[group_val:].tolist())
-
-        rng.shuffle(train_indices)
-        rng.shuffle(val_indices)
-        if len(val_indices) < n_val:
-            move_n = min(n_val - len(val_indices), len(train_indices) - 1)
-            val_indices.extend(train_indices[:move_n])
-            train_indices = train_indices[move_n:]
-        elif len(val_indices) > n_val:
-            move_n = len(val_indices) - n_val
-            train_indices.extend(val_indices[:move_n])
-            val_indices = val_indices[move_n:]
-    else:
-        raise ValueError(f"Unknown split_strategy '{strategy}'. Use 'random' or 'stratified'.")
-
-    integrity = _validate_split(samples, train_indices, val_indices)
-    if integrity["has_leakage"]:
-        raise ValueError(f"Reaction IDs leaked across train/validation: {integrity['leaked_rxn_ids']}")
-
-    report = {
-        "strategy": strategy,
-        "seed": seed,
-        "val_split": val_split,
-        "n_total": n_total,
-        "n_train": len(train_indices),
-        "n_val": len(val_indices),
-        "integrity": integrity,
-        "profiles": {
-            "all": _split_profile(samples, list(range(n_total))),
-            "train": _split_profile(samples, train_indices),
-            "validation": _split_profile(samples, val_indices),
-        },
-    }
-
-    print(f"\nData split ({strategy}, seed={seed}, requested val_split={val_split:.3f}):")
-    _print_split_profile("All", report["profiles"]["all"])
-    _print_split_profile("Train", report["profiles"]["train"])
-    _print_split_profile("Val", report["profiles"]["validation"])
-    if integrity["duplicate_rxn_ids"]:
-        print(f"  Warning: duplicate rxn_id values found: {integrity['duplicate_rxn_ids']}")
-
-    split_path = os.path.join(config["save_dir"], "split_diagnostics.json")
-    with open(split_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
-    print(f"Split diagnostics saved to {split_path}")
-    return train_indices, val_indices, report
 
 def compute_normalization(samples, indices):
-    """Compute atom-phys + Ea + de_rxn normalization stats over the given indices.
-
-    Restricting to the training indices keeps validation reactions out of the
-    normalization statistics.  Ea and de_rxn are normalized (z-scored) so the
-    learned Ea head regresses a well-scaled target/input; the physics Ea
-    baseline is unaffected (it reads raw kcal/mol values directly).
-    """
-    if not indices:
-        raise ValueError("Cannot compute normalization without at least one training sample.")
-
-    # Atom-physics normalization: collect all *valid* (non-padding) atom rows
-    # across training samples and compute per-feature mean/std.
-    all_aphys_rows = []
-    for i in indices:
-        s = samples[i]
-        n = s["n_atoms"]
-        all_aphys_rows.append(s["atom_phys_raw"][:n])  # (n, 3)
-    all_aphys = np.concatenate(all_aphys_rows, axis=0)   # (total_atoms, 3)
-    aphys_mean = all_aphys.mean(axis=0).astype(np.float32)
-    aphys_std = all_aphys.std(axis=0).astype(np.float32)
+    """z-score statistics from the TRAIN split only."""
+    aphys = np.stack([samples[i]["atom_phys_raw"] for i in indices])
+    real = aphys.reshape(-1, ATOM_PHYS_DIM)
+    real = real[real.any(axis=1)]                       # padding rows would skew it
+    aphys_mean, aphys_std = real.mean(0), real.std(0)
     aphys_std[aphys_std < 1e-6] = 1.0
-    # Ea z-score stats (target for the learned head).
-    all_ea = np.array([samples[i]["Ea_raw"] for i in indices], dtype=np.float64)
-    ea_mean = float(all_ea.mean())
-    ea_std = float(all_ea.std())
-    if ea_std < 1e-6:
-        ea_std = 1.0
-    # de_rxn z-score stats (input feature to the head).
-    all_de = np.array([samples[i]["de_rxn_raw"] for i in indices], dtype=np.float64)
-    de_rxn_mean = float(all_de.mean())
-    de_rxn_std = float(all_de.std())
-    if de_rxn_std < 1e-6:
-        de_rxn_std = 1.0
-    print(f"Ea stats (train split): mean={ea_mean:.2f}, std={ea_std:.2f} kcal/mol")
-    print(f"Ea range (train split): [{all_ea.min():.2f}, {all_ea.max():.2f}] kcal/mol")
-    print(f"de_rxn stats (train split): mean={de_rxn_mean:.2f}, std={de_rxn_std:.2f} kcal/mol")
-    print(f"Atom-phys stats (train): mean={aphys_mean}, std={aphys_std}")
-    # Energy-feature normalization: z-score the 28D reaction descriptor vector.
-    all_efeats = np.array([samples[i]["energy_feats_raw"] for i in indices], dtype=np.float32)
-    efeat_mean = all_efeats.mean(axis=0).astype(np.float32)
-    efeat_std = all_efeats.std(axis=0).astype(np.float32)
-    efeat_std[efeat_std < 1e-6] = 1.0
-    print(f"Energy-feats stats (train): mean_range=[{efeat_mean.min():.2f}, {efeat_mean.max():.2f}]")
-    return {
-        "aphys_mean": aphys_mean,
-        "aphys_std": aphys_std,
-        "ea_mean": ea_mean,
-        "ea_std": ea_std,
-        "de_rxn_mean": de_rxn_mean,
-        "de_rxn_std": de_rxn_std,
-        "efeat_mean": efeat_mean,
-        "efeat_std": efeat_std,
+    ea = np.array([samples[i]["Ea_raw"] for i in indices], dtype=np.float64)
+    de = np.array([samples[i]["de_rxn_raw"] for i in indices], dtype=np.float64)
+    ef = np.stack([samples[i]["energy_feats_raw"] for i in indices]).astype(np.float32)
+    ef_std = ef.std(0)
+    ef_std[ef_std < 1e-6] = 1.0
+    stats = {
+        "aphys_mean": aphys_mean.astype(np.float32), "aphys_std": aphys_std.astype(np.float32),
+        "ea_mean": float(ea.mean()), "ea_std": max(float(ea.std()), 1e-6),
+        "de_rxn_mean": float(de.mean()), "de_rxn_std": max(float(de.std()), 1e-6),
+        "efeat_mean": ef.mean(0), "efeat_std": ef_std,
     }
+    print(f"[norm] Ea {stats['ea_mean']:.2f} +/- {stats['ea_std']:.2f} kcal/mol")
+    return stats
 
+
+# =============================================================================
+# Dataset
+# =============================================================================
 class ReactionDataset(Dataset):
-    """Thin view over a shared list of prebuilt samples.
+    """Prebuilt samples -> tensors, memoised after first touch.
 
-    Returns the raw Ea target (kcal/mol) and the z-scored de_rxn feature for the
-    learned Ea head; Ea is normalized inside the training loop using ea_mean/std.
+    Everything per-sample is deterministic (there is no augmentation), so an item
+    is built once per worker and reused for every later epoch.
     """
-    def __init__(self, config, samples, atom_vocab, atom_types_map, stats, is_train=False):
-        self.config = config
-        self.samples = samples
-        self.atom_vocab = atom_vocab
-        self.atom_types_map = atom_types_map
-        self.aphys_mean = stats["aphys_mean"]
-        self.aphys_std = stats["aphys_std"]
-        self.de_rxn_mean = stats["de_rxn_mean"]
-        self.de_rxn_std = stats["de_rxn_std"]
-        self.efeat_mean = stats["efeat_mean"]
-        self.efeat_std = stats["efeat_std"]
-        self.is_train = is_train
 
-    def __len__(self): return len(self.samples)
+    def __init__(self, samples, stats, orders):
+        self.samples = samples
+        self.stats = stats
+        self.orders = orders
+        self.cache = {}
+
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
+        hit = self.cache.get(idx)
+        if hit is not None:
+            return hit
         s = self.samples[idx]
-        ensure_sample_risk_features(
-            s,
-            self.config,
-            self.atom_types_map.get(s.get("rxn_id"), s.get("atom_types")),
-        )
         n = s["n_atoms"]
-        c_R = s["c_R"].copy()
-        c_P = s["c_P"].copy()
-        
-        if self.is_train and self.config.get("coord_noise", 0.0) > 0.0:
-            noise_std = self.config["coord_noise"]
-            c_R[:n] += np.random.normal(scale=noise_std, size=(n, 3)).astype(np.float32)
-            c_P[:n] += np.random.normal(scale=noise_std, size=(n, 3)).astype(np.float32)
-            
-        # Distance matrices are rotation/translation invariant, so no alignment
-        # of the coordinates is needed before computing them.
-        D_R = compute_distance_matrix(c_R)
-        D_P = compute_distance_matrix(c_P)
-        D_I = (D_R + D_P) / 2.0
-        aphys_norm = (s["atom_phys_raw"] - self.aphys_mean) / self.aphys_std
-        de_rxn_norm = (s["de_rxn_raw"] - self.de_rxn_mean) / self.de_rxn_std
-        efeat_norm = (s["energy_feats_raw"] - self.efeat_mean) / self.efeat_std
-        risk_penalty = continuous_risk_penalty(
-            s.get("formed_bonds", 0),
-            s.get("broken_bonds", 0),
-            s.get("risky_chem_flag", 0.0),
-            mode=self.config.get("risk_penalty_mode", "margin"),
-            safe_min=self.config.get("risk_safe_min", 1.0),
-            safe_max=self.config.get("risk_safe_max", 3.0),
-            sigmoid_center=self.config.get("risk_sigmoid_center", 4.0),
-            sigmoid_k=self.config.get("risk_sigmoid_k", 1.25),
-        )
-        return {
+        st = self.stats
+        D_R = torch.from_numpy(s["D_R"])
+        D_P = torch.from_numpy(s["D_P"])
+        rc_atom, spec = bond_order_masks(
+            self.orders[s["rxn_id"]]["bo_R"], self.orders[s["rxn_id"]]["bo_P"], n)
+        item = {
             "rxn_id": s["rxn_id"],
-            "n_atoms": n,
-            "D_R": torch.from_numpy(D_R),
-            "D_I": torch.from_numpy(D_I),
-            "D_P": torch.from_numpy(D_P),
-            "D_TS": s["D_TS"],
-            "mask": s["mask"],
-            "geom_mask": s["geom_mask"],
-            "atom_ids": s["atom_ids"],
-            "atom_phys": torch.from_numpy(aphys_norm.astype(np.float32)),
+            "D_R": D_R, "D_P": D_P, "D_I": (D_R + D_P) / 2.0,
+            "D_TS": torch.from_numpy(s["D_TS"]),
+            "c_I": torch.from_numpy(s["c_I"].astype(np.float32)),
+            "c_TS": torch.from_numpy(s["c_TS"].astype(np.float32)),
+            "mask": torch.from_numpy(s["mask"]),
+            "geom_mask": torch.from_numpy(s["geom_mask"]),
+            "atom_ids": torch.from_numpy(s["atom_ids"]),
+            "atom_phys": torch.from_numpy(
+                ((s["atom_phys_raw"] - st["aphys_mean"]) / st["aphys_std"]).astype(np.float32)),
             "Ea": torch.tensor(s["Ea_raw"], dtype=torch.float32),
-            "de_rxn": torch.tensor(de_rxn_norm, dtype=torch.float32),
-            "energy_feats": torch.from_numpy(efeat_norm.astype(np.float32)),
-            "risk_pair_mask": s["risk_pair_mask"],
-            "risk_score": torch.tensor(s["risk_score"], dtype=torch.float32),
-            "risk_penalty": torch.tensor(risk_penalty, dtype=torch.float32),
-            "complexity_flag": torch.tensor(s["complexity_flag"], dtype=torch.float32),
-            "risky_chem_flag": torch.tensor(s["risky_chem_flag"], dtype=torch.float32),
+            "de_rxn": torch.tensor(
+                (s["de_rxn_raw"] - st["de_rxn_mean"]) / st["de_rxn_std"], dtype=torch.float32),
+            "energy_feats": torch.from_numpy(
+                ((s["energy_feats_raw"] - st["efeat_mean"]) / st["efeat_std"]).astype(np.float32)),
+            "risk_pair_mask": torch.from_numpy(s["risk_pair_mask"]),
+            "risk_penalty": torch.tensor(s["risk_penalty"], dtype=torch.float32),
+            "rc_atom": torch.from_numpy(rc_atom),
+            "spectator_pair": torch.from_numpy(spec),
         }
+        self.cache[idx] = item
+        return item
 
+
+def to_device(batch, device):
+    """Every tensor field to GPU. rxn_id is a list of str and stays on the host."""
+    return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+            for k, v in batch.items()}
+
+
+# =============================================================================
+# Model
+# =============================================================================
 class GaussianEmbedding(nn.Module):
-    def __init__(self, n_gaussians=50, start=0.4, stop=6.0):
+    """Radial basis expansion of a distance matrix."""
+
+    def __init__(self):
         super().__init__()
-        centers = torch.linspace(start, stop, n_gaussians)
-        self.register_buffer("centers", centers)
-        self.sigma = (stop - start) / (n_gaussians - 1) * 0.5
+        self.register_buffer("centers", torch.linspace(GAUSS_START, GAUSS_STOP, N_GAUSSIANS))
+        self.sigma = (GAUSS_STOP - GAUSS_START) / (N_GAUSSIANS - 1) * 0.5
 
     def forward(self, D):
         return torch.exp(-0.5 * ((D.unsqueeze(-1) - self.centers) / self.sigma) ** 2)
 
+
 class PreNormTransformerLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+    def __init__(self, d_model):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.attn = nn.MultiheadAttention(d_model, ATTN_HEADS, dropout=DROPOUT,
+                                          batch_first=True)
         self.norm2 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout),
-        )
+            nn.Linear(d_model, FF_DIM), nn.GELU(), nn.Dropout(DROPOUT),
+            nn.Linear(FF_DIM, d_model), nn.Dropout(DROPOUT))
 
-    def forward(self, x, src_key_padding_mask=None):
-        x2 = self.norm1(x)
-        x2, _ = self.attn(x2, x2, x2, key_padding_mask=src_key_padding_mask)
-        x = x + x2
-        x2 = self.norm2(x)
-        x = x + self.ff(x2)
-        return x
+    def forward(self, x, pad_mask):
+        h = self.norm1(x)
+        x = x + self.attn(h, h, h, key_padding_mask=pad_mask, need_weights=False)[0]
+        return x + self.ff(self.norm2(x))
+
 
 class PSICore(nn.Module):
-    def __init__(self, config, num_atom_types):
+    """Reaction encoder: (D_R, D_I, D_P) + atom identity -> per-atom context.
+
+    Each atom's row of each distance matrix is expanded into radial bases, so the
+    three endpoint geometries become a length-3 sequence per atom; a bidirectional
+    GRU reads that sequence (R -> midpoint -> P is a reaction coordinate), and the
+    transformer then mixes information between atoms.
+    """
+
+    def __init__(self, num_atom_types):
         super().__init__()
-        N = config["max_atoms"]
-        K = config["n_gaussians"]
-        atom_dim = config["atom_embed_dim"]
-        gru_hidden = config["gru_hidden"]
-        d_model = gru_hidden * 2
-        self.atom_embed = nn.Embedding(num_atom_types + 1, atom_dim, padding_idx=0)
-        self.gaussian = GaussianEmbedding(K, config["gauss_start"], config["gauss_stop"])
-        # Per-atom feature width = learnable embedding + physical descriptors (EN, Z, Mass)
-        atom_feat_dim = atom_dim + ATOM_PHYS_DIM
+        d_model = GRU_HIDDEN * 2
+        self.atom_embed = nn.Embedding(num_atom_types + 1, ATOM_EMBED_DIM, padding_idx=0)
+        self.gaussian = GaussianEmbedding()
         self.input_proj = nn.Sequential(
-            nn.Linear(N * K + atom_feat_dim, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
-            nn.Dropout(config["dropout"]),
-        )
-        self.gru = nn.GRU(
-            input_size=d_model,
-            hidden_size=gru_hidden,
-            num_layers=config["gru_layers"],
-            batch_first=True,
-            bidirectional=True,
-            dropout=config["gru_dropout"] if config["gru_layers"] > 1 else 0.0,
-        )
-        self.gru_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-        )
-        self.transformer_layers = nn.ModuleList([
-            PreNormTransformerLayer(d_model, config["attn_heads"], config["ff_dim"], config["dropout"])
-            for _ in range(config["attn_layers"])
-        ])
+            nn.Linear(MAX_ATOMS * N_GAUSSIANS + ATOM_EMBED_DIM + ATOM_PHYS_DIM, d_model),
+            nn.LayerNorm(d_model), nn.GELU(), nn.Dropout(DROPOUT))
+        self.gru = nn.GRU(d_model, GRU_HIDDEN, num_layers=GRU_LAYERS, batch_first=True,
+                          bidirectional=True, dropout=GRU_DROPOUT)
+        self.gru_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.LayerNorm(d_model))
+        self.layers = nn.ModuleList([PreNormTransformerLayer(d_model)
+                                     for _ in range(ATTN_LAYERS)])
         self.final_norm = nn.LayerNorm(d_model)
 
     def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys):
         B, N, _ = D_R.shape
-        atom_emb = self.atom_embed(atom_ids)
-        # Concatenate learnable embedding with explicit physical descriptors
-        atom_feat = torch.cat([atom_emb, atom_phys], dim=-1)  # [B, N, atom_dim + 3]
-        emb_R = self.gaussian(D_R).view(B, N, -1)
-        emb_I = self.gaussian(D_I).view(B, N, -1)
-        emb_P = self.gaussian(D_P).view(B, N, -1)
-        emb_R = torch.cat([emb_R, atom_feat], dim=-1)
-        emb_I = torch.cat([emb_I, atom_feat], dim=-1)
-        emb_P = torch.cat([emb_P, atom_feat], dim=-1)
-        emb_R = self.input_proj(emb_R)
-        emb_I = self.input_proj(emb_I)
-        emb_P = self.input_proj(emb_P)
-        seq = torch.stack([emb_R, emb_I, emb_P], dim=2).view(B * N, 3, -1)
-        out, _ = self.gru(seq)
-        context = out[:, 1, :].view(B, N, -1)
-        context = self.gru_proj(context)
-        pad_mask = (mask == 0)
-        x = context
-        for layer in self.transformer_layers:
-            x = layer(x, src_key_padding_mask=pad_mask)
-        return self.final_norm(x)
-
-class GeometryHead(nn.Module):
-    def __init__(self, d_model, atom_embed_dim, atom_phys_dim=ATOM_PHYS_DIM, dropout=0.25, delta_clamp=3.0):
-        super().__init__()
-        self.delta_clamp = delta_clamp
-        # Pairwise features: transformer features (i,j) + atom embeddings (i,j)
-        # + physical descriptors (i,j) + raw distances (R,I,P)
-        pair_dim = d_model * 2 + (atom_embed_dim + atom_phys_dim) * 2 + 3
-        self.net = nn.Sequential(
-            nn.Linear(pair_dim, 256),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 2),
-        )
-        # Initialize: alpha_logit=0 → sigmoid=0.5 (starts at midpoint), delta=0
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, features, atom_emb, atom_phys, D_R, D_I, D_P, mask):
-        B, N, D = features.shape
-        # Concatenate learnable atom embedding with physical descriptors
-        atom_feat = torch.cat([atom_emb, atom_phys], dim=-1)  # [B, N, atom_dim + 3]
-        atom_feat_dim = atom_feat.shape[-1]
-        fi = features.unsqueeze(2).expand(B, N, N, D)
-        fj = features.unsqueeze(1).expand(B, N, N, D)
-        ai = atom_feat.unsqueeze(2).expand(B, N, N, atom_feat_dim)
-        aj = atom_feat.unsqueeze(1).expand(B, N, N, atom_feat_dim)
-        pair_dist = torch.stack([D_R, D_I, D_P], dim=-1)
-        pair = torch.cat([fi, fj, ai, aj, pair_dist], dim=-1)
-        out = self.net(pair)
-        alpha = torch.sigmoid(out[..., 0])
-        delta = torch.clamp(out[..., 1], min=-self.delta_clamp, max=self.delta_clamp)
-        D_base = alpha * D_R + (1.0 - alpha) * D_P
-        D_TS_pred = torch.clamp(D_base + delta, min=0.0)
-        D_TS_pred = (D_TS_pred + D_TS_pred.transpose(1, 2)) / 2.0
-        eye = torch.eye(N, device=D_TS_pred.device, dtype=D_TS_pred.dtype).unsqueeze(0)
-        valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
-        return D_TS_pred * (1.0 - eye) * valid
-
-# =============================================================================
-# Physics-based activation energy (replaces NN EnergyHead + EnergyRefiner)
-# =============================================================================
-
-# Approximate harmonic bond force constants in kcal/(mol·Å²).
-# Derived from simplified Badger's rule and UFF-like parameters.
-# These are rough but sufficient for estimating the reorganization energy λ.
-BOND_FORCE_CONSTANTS = {
-    ('C', 'C'): 600.0,  ('C', 'H'): 700.0,  ('C', 'N'): 650.0,
-    ('C', 'O'): 750.0,  ('C', 'F'): 800.0,  ('C', 'S'): 400.0,
-    ('C', 'Cl'): 450.0, ('C', 'Br'): 350.0, ('C', 'I'): 300.0,
-    ('C', 'P'): 400.0,  ('C', 'Si'): 350.0, ('C', 'B'): 500.0,
-    ('N', 'H'): 750.0,  ('N', 'N'): 600.0,  ('N', 'O'): 700.0,
-    ('O', 'H'): 800.0,  ('O', 'O'): 600.0,  ('S', 'H'): 500.0,
-    ('S', 'S'): 350.0,  ('S', 'O'): 550.0,  ('S', 'N'): 450.0,
-    ('P', 'O'): 500.0,  ('P', 'H'): 400.0,  ('P', 'N'): 400.0,
-    ('Si', 'H'): 400.0, ('Si', 'O'): 500.0, ('Si', 'N'): 400.0,
-    ('B', 'H'): 500.0,  ('B', 'O'): 600.0,  ('B', 'N'): 550.0,
-    ('H', 'H'): 750.0,  ('F', 'H'): 900.0,  ('Cl', 'H'): 550.0,
-    ('Br', 'H'): 450.0, ('I', 'H'): 350.0,
-}
-
-def estimate_bond_force_constant(a1, a2):
-    """Look up an approximate force constant k (kcal/(mol·Å²)) for a bond pair.
-
-    """
-    key = (a1, a2) if (a1, a2) in BOND_FORCE_CONSTANTS else (a2, a1)
-    if key in BOND_FORCE_CONSTANTS:
-        return BOND_FORCE_CONSTANTS[key]
-    raise KeyError(f"Bond force constant not found for pair: {a1}-{a2}")
-
-
-def compute_reorganization_energy(coords_R, coords_TS, coords_P, atom_types, n,
-                                   bond_scale=1.45):
-    """Geometric reorganization energy λ from bond-stretching displacements.
-
-    For every bond in the TS geometry, accumulates:
-        λ += 0.5 · k_ij · [(d_TS - d_R)² + (d_P - d_TS)²]
-
-    This captures how much bond stretching/compression the molecule undergoes
-    along the R → TS → P reaction coordinate.  Units: kcal/mol.
-    """
-    D_R = np.zeros((n, n), dtype=np.float64)
-    D_TS = np.zeros((n, n), dtype=np.float64)
-    D_P = np.zeros((n, n), dtype=np.float64)
-    for i in range(n):
-        for j in range(i + 1, n):
-            dr = np.linalg.norm(coords_R[i] - coords_R[j])
-            dts = np.linalg.norm(coords_TS[i] - coords_TS[j])
-            dp = np.linalg.norm(coords_P[i] - coords_P[j])
-            D_R[i, j] = D_R[j, i] = dr
-            D_TS[i, j] = D_TS[j, i] = dts
-            D_P[i, j] = D_P[j, i] = dp
-
-    # Use bonds from the *union* of R, TS, and P topologies so we capture both
-    # forming and breaking bonds.
-    bonds_set = set()
-    for D in (D_R, D_TS, D_P):
-        for i in range(n):
-            for j in range(i + 1, n):
-                cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
-                if D[i, j] <= cutoff:
-                    bonds_set.add((i, j))
-
-    lam = 0.0
-    for (i, j) in bonds_set:
-        k_ij = estimate_bond_force_constant(atom_types[i], atom_types[j])
-        dr_fwd = D_TS[i, j] - D_R[i, j]   # R → TS displacement
-        dr_rev = D_P[i, j] - D_TS[i, j]   # TS → P displacement
-        lam += 0.5 * k_ij * (dr_fwd ** 2 + dr_rev ** 2)
-    return lam
-
-
-def hammond_index(coords_R, coords_TS, coords_P, atom_types, n,
-                  threshold=0.15, bond_scale=1.45):
-    """Hammond postulate index η ∈ [0, 1] from active-bond displacements.
-
-    η ≈ 0: TS resembles reactant (early, exothermic).
-    η ≈ 1: TS resembles product  (late, endothermic).
-
-    Computed over the active bonds (those whose distance changes by more than
-    `threshold` Å between R and P).
-    """
-    sum_r, sum_p = 0.0, 0.0
-    D_R = np.zeros((n, n), dtype=np.float64)
-    D_TS = np.zeros((n, n), dtype=np.float64)
-    D_P = np.zeros((n, n), dtype=np.float64)
-    for i in range(n):
-        for j in range(i + 1, n):
-            D_R[i, j] = np.linalg.norm(coords_R[i] - coords_R[j])
-            D_TS[i, j] = np.linalg.norm(coords_TS[i] - coords_TS[j])
-            D_P[i, j] = np.linalg.norm(coords_P[i] - coords_P[j])
-
-    active_count = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            # Only look at bonds in the reactive region
-            cutoff = bond_scale * (covalent_radius(atom_types[i]) + covalent_radius(atom_types[j]))
-            is_bonded = (D_R[i, j] <= cutoff or D_TS[i, j] <= cutoff or D_P[i, j] <= cutoff)
-            if not is_bonded:
-                continue
-            if abs(D_R[i, j] - D_P[i, j]) > threshold:
-                sum_r += abs(D_TS[i, j] - D_R[i, j])
-                sum_p += abs(D_TS[i, j] - D_P[i, j])
-                active_count += 1
-
-    if active_count == 0 or (sum_r + sum_p) < 1e-8:
-        return 0.5  # no active bonds → ambiguous, return midpoint
-    return sum_r / (sum_r + sum_p)
-
-
-class PhysicsEaCalculator:
-    """Physics-based activation energy from 3D TS geometry.
-
-    Replaces the NN-based EnergyHead + EnergyRefiner (~80K parameters) with
-    actual chemistry equations and only 4 OLS-fitted scaling parameters:
-
-        Ea_pred = a * Ea_marcus + b * η_hammond + c * ΔE_rxn + d
-
-    where:
-        - Ea_marcus = (λ / 4) · (1 + ΔE / λ)² (Marcus theory)
-        - λ = geometric reorganization energy from bond displacements
-        - η = Hammond postulate index (early vs late TS)
-        - ΔE_rxn = E_product - E_reactant (signed reaction energy)
-
-    The model focuses 100% on predicting the best TS geometry; Ea follows
-    from physics applied to those predicted 3D coordinates.
-    """
-    def __init__(self, bond_scale=1.45, spectator_threshold=0.15):
-        self.bond_scale = bond_scale
-        self.threshold = spectator_threshold
-        # OLS coefficients: fit by .fit() on training data
-        self.coeffs = None   # [a, b, c, d] for the 4 features
-        self.fitted = False
-
-    def _compute_features(self, coords_R, coords_TS, coords_P, atom_types, n,
-                          de_rxn):
-        """Compute the 4 physics-based features for one reaction."""
-        lam = compute_reorganization_energy(
-            coords_R, coords_TS, coords_P, atom_types, n, self.bond_scale
-        )
-        if not np.isfinite(lam) or lam < 0.0:
-            lam = 0.0
-        eta = hammond_index(
-            coords_R, coords_TS, coords_P, atom_types, n,
-            self.threshold, self.bond_scale
-        )
-        # Marcus theory: Ea = (λ/4)(1 + ΔE/λ)²
-        if lam > 1e-6:
-            ea_marcus = (lam / 4.0) * (1.0 + de_rxn / lam) ** 2
-        else:
-            # Zero reorganization → pure BEP-like
-            ea_marcus = abs(de_rxn) * 0.5
-        return np.array([ea_marcus, eta, de_rxn, 1.0], dtype=np.float64)
-
-    def compute_features_batch(self, samples, coords_TS_list, config):
-        """Compute physics features for a list of samples + predicted TS coords.
-
-        Args:
-            samples: list of sample dicts (with c_R, c_P, atom_types, n_atoms, Ea_raw)
-            coords_TS_list: list of (n, 3) numpy arrays with predicted TS coords
-            config: pipeline config dict
-        Returns:
-            X: (N, 4) feature matrix
-            y: (N,) true Ea values
-        """
-        X, y = [], []
-        for s, coords_ts in zip(samples, coords_TS_list):
-            n = s["n_atoms"]
-            c_R = np.asarray(s["c_R"][:n], dtype=np.float64)
-            c_P = np.asarray(s["c_P"][:n], dtype=np.float64)
-            c_TS = np.asarray(coords_ts[:n], dtype=np.float64)
-            atom_types = s["atom_types"]
-            # de_rxn is the signed reaction energy in kcal/mol
-            # It was computed as e_p - e_r at build time; reconstruct from energy_feats
-            de_rxn = float(s["energy_feats_raw"][1])  # index 1 = de_rxn_signed
-            feats = self._compute_features(c_R, c_TS, c_P, atom_types, n, de_rxn)
-            X.append(feats)
-            y.append(s["Ea_raw"])
-        return np.array(X, dtype=np.float64), np.array(y, dtype=np.float64)
-
-    def fit(self, X, y):
-        """Fit the 4 OLS coefficients on training data.
-
-        Uses np.linalg.lstsq (ordinary least squares) — no iterative optimizer,
-        no learning rate, no epochs. Just a single closed-form solution.
-        """
-        self.coeffs, residuals, rank, sv = np.linalg.lstsq(X, y, rcond=None)
-        self.fitted = True
-        y_pred = X @ self.coeffs
-        mae = float(np.mean(np.abs(y_pred - y)))
-        rmse = float(np.sqrt(np.mean((y_pred - y) ** 2)))
-        corr = float(np.corrcoef(y, y_pred)[0, 1]) if len(y) > 1 else 0.0
-        print(f"\n[PhysicsEa] OLS fit on {len(y)} training reactions:")
-        print(f"  Coefficients: a_marcus={self.coeffs[0]:.4f}, b_hammond={self.coeffs[1]:.4f}, "
-              f"c_dErxn={self.coeffs[2]:.4f}, d_intercept={self.coeffs[3]:.4f}")
-        print(f"  Train MAE:  {mae:.2f} kcal/mol")
-        print(f"  Train RMSE: {rmse:.2f} kcal/mol")
-        print(f"  Train R:    {corr:.4f}")
-        return self.coeffs
-
-    def predict(self, X):
-        """Predict Ea for a feature matrix X (N, 4)."""
-        if not self.fitted:
-            raise RuntimeError("PhysicsEaCalculator not fitted yet. Call .fit() first.")
-        return X @ self.coeffs
-
-    def predict_single(self, coords_R, coords_TS, coords_P, atom_types, n,
-                       de_rxn):
-        """Predict Ea for a single reaction from its 3D coordinates."""
-        feats = self._compute_features(coords_R, coords_TS, coords_P,
-                                        atom_types, n, de_rxn)
-        return float(feats @ self.coeffs)
-
-
-def torch_mds_coords(D, mask, dim=3):
-    """Differentiable-friendly classical MDS: distance matrix -> 3D coordinates.
-
-    Embeds each molecule's predicted TS distance matrix into Cartesian space so
-    an EGNN can refine the geometry. Double-centering is masked so padded atoms
-    never contaminate the per-molecule centroid. The eigendecomposition is run
-    in float64 for numerical stability; callers should pass a *detached* D (the
-    geometry head is supervised directly on the coarse distances, while the EGNN
-    learns the coordinate refinement on top), which keeps the unstable backward
-    pass of eigh out of the graph.
-
-    Args:
-        D:    [B, N, N] pairwise distances (padded entries should be ~0).
-        mask: [B, N] 1 for real atoms, 0 for padding.
-    Returns:
-        [B, N, dim] coordinates, zeroed on padded atoms.
-    """
-    B, N, _ = D.shape
-    # Move to CPU for eigh: CPU LAPACK is far faster than GPU for small (30x30)
-    # batched matrices, and this path is detached so no backward is needed.
-    D_cpu = D.detach().cpu()
-    mask_cpu = mask.detach().cpu()
-    m = mask_cpu.to(torch.float64)                       # [B, N]
-    pair = m.unsqueeze(-1) * m.unsqueeze(-2)         # [B, N, N] valid atom pairs
-    cnt = m.sum(dim=1).clamp(min=1.0)                # [B] atoms per molecule
-    S = (D_cpu.to(torch.float64) ** 2) * pair            # squared, masked
-    # Masked double centering: subtract row/col/grand means over valid atoms.
-    row_mean = S.sum(dim=2) / cnt.unsqueeze(-1)                      # [B, N]
-    grand = S.sum(dim=(1, 2)) / (cnt ** 2)                          # [B]
-    Bmat = -0.5 * (S - row_mean.unsqueeze(-1) - row_mean.unsqueeze(-2)
-                   + grand.view(B, 1, 1))
-    Bmat = Bmat * pair                               # keep padded rows/cols at 0
-    # Symmetrize defensively before eigh.
-    Bmat = 0.5 * (Bmat + Bmat.transpose(1, 2))
-    # Keep padded atoms out of the top eigenspace. A global positive jitter makes
-    # padded dummy modes tie with true zero modes from planar fragments; shifting
-    # only dummy diagonals negative prevents that mixing while preserving the
-    # valid-block jitter.
-    eyeN = torch.eye(N, dtype=Bmat.dtype, device=Bmat.device).unsqueeze(0)
-    dummy_shift = (1.0 - m).unsqueeze(-1) * eyeN
-    Bmat = Bmat - dummy_shift + 1e-6 * eyeN
-    evals, evecs = torch.linalg.eigh(Bmat)       # ascending eigenvalues
-    top_vals = evals[:, -dim:].flip(-1).clamp(min=0.0)              # [B, dim]
-    top_vecs = evecs[:, :, -dim:].flip(-1)                          # [B, N, dim]
-    coords = top_vecs * top_vals.clamp(min=0.0).sqrt().unsqueeze(1)
-    coords = coords * m.unsqueeze(-1)                # zero padded atoms
-    # eigh can silently return NaN eigenvectors on a degenerate Bmat (no
-    # LinAlgError raised), which would poison the EGNN every forward pass. This
-    # seed is detached, so replacing a bad embedding with zeros is harmless.
-    coords = torch.nan_to_num(coords, nan=0.0, posinf=0.0, neginf=0.0)
-    # Move result back to the original device (GPU) for the EGNN.
-    return coords.to(D.dtype).to(D.device)
-
-
-def triangle_inequality_loss(
-    D, mask, geom_mask=None, tol=0.02, triplet_samples=1024, stochastic=True
-):
-    """Differentiable penalty for predicted distances that violate triangle inequality."""
-    B, N, _ = D.shape
-    if N < 3:
-        return D.new_tensor(0.0)
-
-    device = D.device
-    triplets = torch.cartesian_prod(
-        torch.arange(N, device=device),
-        torch.arange(N, device=device),
-        torch.arange(N, device=device),
-    )
-    distinct = (
-        (triplets[:, 0] != triplets[:, 1])
-        & (triplets[:, 0] != triplets[:, 2])
-        & (triplets[:, 1] != triplets[:, 2])
-    )
-    triplets = triplets[distinct]
-    if triplet_samples and 0 < triplet_samples < triplets.shape[0]:
-        n_pick = int(triplet_samples)
-        if stochastic:
-            pick = torch.randperm(triplets.shape[0], device=device)[:n_pick]
-        else:
-            pick = torch.linspace(
-                0,
-                triplets.shape[0] - 1,
-                steps=n_pick,
-                device=device,
-            ).long()
-        triplets = triplets[pick]
-
-    i, j, k = triplets[:, 0], triplets[:, 1], triplets[:, 2]
-    Dij = D[:, i, j].float()
-    Dik = D[:, i, k].float()
-    Dkj = D[:, k, j].float()
-    valid = (mask[:, i] * mask[:, j] * mask[:, k]).float()
-    if geom_mask is not None:
-        valid = valid * geom_mask[:, i, j].float() * geom_mask[:, i, k].float() * geom_mask[:, k, j].float()
-    violation = F.relu(Dij - (Dik + Dkj) - float(tol))
-    return ((violation ** 2) * valid).sum() / valid.sum().clamp(min=1.0)
+        atom_feat = torch.cat([self.atom_embed(atom_ids), atom_phys], dim=-1)
+        embs = [self.input_proj(torch.cat([self.gaussian(D).view(B, N, -1), atom_feat], -1))
+                for D in (D_R, D_I, D_P)]
+        seq = torch.stack(embs, dim=2).view(B * N, 3, -1)
+        # The midpoint step carries both directions of the bidirectional pass.
+        context = self.gru_proj(self.gru(seq)[0][:, 1, :].view(B, N, -1))
+        pad_mask = mask == 0
+        for layer in self.layers:
+            context = layer(context, pad_mask)
+        return self.final_norm(context)
 
 
 class EGCL(nn.Module):
-    """One E(n)-equivariant graph convolution layer (Satorras et al., 2021).
+    """One E(n)-equivariant graph convolution (Satorras et al., 2021).
 
-    Operates on node features `h` (the chemical-property vector) and node
-    coordinates `x` (the TS geometry). Messages depend only on squared
-    interatomic distances, so node features stay E(3)-invariant while the
-    coordinate update is E(3)-equivariant.
+    Messages depend only on squared interatomic distances, so node features stay
+    E(3)-invariant while the coordinate update is E(3)-equivariant.
     """
-    def __init__(self, hidden, coord_clamp=2.0, dropout=0.25):
+
+    def __init__(self):
         super().__init__()
-        self.coord_clamp = coord_clamp
+        h = EGNN_HIDDEN
         self.edge_mlp = nn.Sequential(
-            nn.Linear(hidden * 2 + 1, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-        )
+            nn.Linear(h * 2 + 1, h), nn.GELU(), nn.Dropout(DROPOUT),
+            nn.Linear(h, h), nn.GELU())
         self.node_mlp = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-        )
-        # Scalar coordinate weight per edge. Zero-initialized so the layer starts
-        # as an identity map on coordinates (no displacement at init).
-        self.coord_mlp = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, 1),
-        )
+            nn.Linear(h * 2, h), nn.GELU(), nn.Dropout(DROPOUT), nn.Linear(h, h))
+        self.coord_mlp = nn.Sequential(nn.Linear(h, h), nn.GELU(), nn.Linear(h, 1))
+        # Zero-init: the layer starts as an identity map on coordinates, so the
+        # EGNN begins exactly at the R/P midpoint seed and learns to move away.
         nn.init.zeros_(self.coord_mlp[-1].weight)
         nn.init.zeros_(self.coord_mlp[-1].bias)
 
     def forward(self, h, x, mask):
         B, N, H = h.shape
-        # Edge mask: valid atom pairs, excluding self-loops.
-        pair = mask.unsqueeze(-1) * mask.unsqueeze(-2)                # [B, N, N]
+        pair = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         eye = torch.eye(N, device=h.device, dtype=h.dtype).unsqueeze(0)
-        emask = (pair * (1.0 - eye)).unsqueeze(-1)                    # [B, N, N, 1]
-        rel = x.unsqueeze(2) - x.unsqueeze(1)                         # [B, N, N, 3]
-        dist2 = (rel ** 2).sum(dim=-1, keepdim=True)                  # [B, N, N, 1]
+        emask = (pair * (1.0 - eye)).unsqueeze(-1)
+        rel = x.unsqueeze(2) - x.unsqueeze(1)
+        dist2 = (rel ** 2).sum(-1, keepdim=True)
         hi = h.unsqueeze(2).expand(B, N, N, H)
         hj = h.unsqueeze(1).expand(B, N, N, H)
-        edge_in = torch.cat([hi, hj, dist2], dim=-1)
-        m_ij = self.edge_mlp(edge_in) * emask                        # masked messages
-        # Equivariant coordinate update (normalized by neighbor count). Clamp
-        # the actual displacement vector norm, not just the scalar edge weight.
-        raw_trans = rel * self.coord_mlp(m_ij)
-        trans_norm = torch.norm(raw_trans, dim=-1, keepdim=True).clamp(min=1e-8)
-        trans = raw_trans * (torch.clamp(trans_norm, max=self.coord_clamp) / trans_norm)
-        trans = trans * emask
-        deg = emask.sum(dim=2).clamp(min=1.0)                        # [B, N, 1]
-        x = x + trans.sum(dim=2) / deg
-        x = x * mask.unsqueeze(-1)
-        # Invariant node update from aggregated messages.
-        agg = m_ij.sum(dim=2)                                        # [B, N, H]
-        h = h + self.node_mlp(torch.cat([h, agg], dim=-1))
-        h = h * mask.unsqueeze(-1)
+        m = self.edge_mlp(torch.cat([hi, hj, dist2], dim=-1)) * emask
+
+        # Equivariant coordinate update. The per-edge displacement VECTOR is what
+        # gets length-limited, not the scalar edge weight, so a single layer cannot
+        # translate an atom further than EGNN_COORD_CLAMP no matter how many edges
+        # agree. The epsilon lives INSIDE the sqrt on purpose: d/dr sqrt(r) is
+        # infinite at r = 0, and raw is exactly zero on every self-pair, on every
+        # padded pair, and on EVERY edge at initialisation (coord_mlp is zero-init).
+        # Adding it after the sqrt instead would emit NaN into `rel`, and from there
+        # into the encoder, on the very first backward pass.
+        raw = rel * self.coord_mlp(m)
+        norm = raw.pow(2).sum(-1, keepdim=True).add(1e-12).sqrt()
+        trans = raw * (norm.clamp(max=EGNN_COORD_CLAMP) / norm) * emask
+        deg = emask.sum(dim=2).clamp(min=1.0)
+        x = (x + trans.sum(dim=2) / deg) * mask.unsqueeze(-1)
+
+        # Zero centre-of-mass. The output IS coordinates, so a free global
+        # translation would otherwise be an unconstrained direction for the loss to
+        # wander along: `m` is built from the ORDERED pair (h_i, h_j, d_ij), so
+        # w_ij != w_ji and the displacements do not cancel. Masked mean, never
+        # x.mean(1) -- padded rows are zero, so dividing by N would drag real atoms
+        # toward the origin in proportion to how much padding a molecule carries.
+        com = (x * mask.unsqueeze(-1)).sum(1, keepdim=True) / mask.sum(1).view(B, 1, 1).clamp(min=1.0)
+        x = (x - com) * mask.unsqueeze(-1)
+
+        h = (h + self.node_mlp(torch.cat([h, m.sum(dim=2)], dim=-1))) * mask.unsqueeze(-1)
         return h, x
 
 
 class EGNN(nn.Module):
-    """E(n)-equivariant refiner: chemical-property vector + TS coords -> coords.
-
-    The node features come entirely from chemistry (learned atom embedding +
-    physical descriptors EN/Z/Mass); the coordinates come from the MDS embedding
-    of the geometry head's predicted TS distance matrix. Stacked EGCL layers nudge
-    the coordinates into a refined transition-state geometry.
-    """
-    def __init__(self, node_in_dim, hidden, n_layers, coord_clamp=2.0, dropout=0.25):
+    def __init__(self, node_in_dim):
         super().__init__()
         self.embed_in = nn.Sequential(
-            nn.Linear(node_in_dim, hidden),
-            nn.GELU(),
-            nn.LayerNorm(hidden),
-        )
-        self.layers = nn.ModuleList([
-            EGCL(hidden, coord_clamp, dropout) for _ in range(n_layers)
-        ])
+            nn.Linear(node_in_dim, EGNN_HIDDEN), nn.GELU(), nn.LayerNorm(EGNN_HIDDEN))
+        self.layers = nn.ModuleList([EGCL() for _ in range(EGNN_LAYERS)])
 
     def forward(self, node_feats, x, mask):
         h = self.embed_in(node_feats) * mask.unsqueeze(-1)
         for layer in self.layers:
             h, x = layer(h, x, mask)
-        # Return the refined node features too: `h` now encodes each atom's
-        # local 3D environment (angles, neighbour distances) after message
-        # passing, which the energy refiner consumes directly instead of a
-        # 7-scalar summary of the distance matrix.
         return h, x
 
 
 class EaHead(nn.Module):
-    """Learned activation-energy head on the EGNN's refined node features.
+    """Activation energy from the EGNN's refined node features.
 
-    After the EGNN message-passing, each atom's feature vector `h_ts` encodes its
-    local 3D environment in the predicted TS (neighbour distances, angles). We
-    attention-pool those per-atom features into a reactive-region descriptor,
-    concatenate a masked mean descriptor for global context, append the signed
-    reaction energy (z-scored de_rxn -- the Bell-Evans-Polanyi driver), and
-    regress a *normalized* Ea mean plus optional log-variance. The gradient flows back into the EGNN, so the
-    same message-passing that places the TS atoms also learns the
-    structure->energy relationship ("learn physics using the EGNN").
+    Three pooled views of the TS (attention, mean, reaction-centre) are fused with
+    a separately-encoded physics stream, FiLM-modulated by the energetics
+    (Hammond/BEP: where the TS sits along the reaction coordinate depends on the
+    reaction energy), plus a direct linear BEP term so the dominant near-linear
+    driver is not rederived inside the MLP.
 
-    Output is [normalized Ea mean, log-variance] when uncertainty is enabled,
-    otherwise a scalar normalized Ea for legacy checkpoints.
+    `h_ts` is detached by the caller, so this gradient never reshapes geometry.
     """
-    def __init__(
-        self, node_dim, hidden, energy_feat_dim=0, dropout=0.25,
-        uncertainty_enabled=True, log_var_init=0.0,
-    ):
+
+    def __init__(self, geom_trust_dim):
         super().__init__()
-        self.energy_feat_dim = int(energy_feat_dim)
-        self.uncertainty_enabled = bool(uncertainty_enabled)
-        self.attn = nn.Sequential(
-            nn.Linear(node_dim, hidden // 2),
-            nn.GELU(),
-            nn.Linear(hidden // 2, 1),
-        )
-        # Input: attention-pooled + mean-pooled EGNN features + de_rxn + descriptors
-        in_dim = 2 * node_dim + 1 + self.energy_feat_dim
-        out_dim = 2 if self.uncertainty_enabled else 1
-        final = nn.Linear(hidden // 2, out_dim)
+        h = EGNN_HIDDEN
+        self.geom_trust_dim = geom_trust_dim
+        self.attn = nn.Sequential(nn.Linear(h, h // 2), nn.GELU(), nn.Linear(h // 2, 1))
+        # Softmax temperature on the reaction-centre mask: large -> a near-uniform
+        # mean over the forming/breaking atoms.
+        self.rc_attn_bias = nn.Parameter(torch.tensor(4.0))
+        self.ts_proj = nn.Sequential(nn.Linear(3 * h, h), nn.GELU(), nn.Dropout(EA_HEAD_DROPOUT))
+        self.phys_enc = nn.Sequential(
+            nn.Linear(1 + ENERGY_FEAT_DIM, h), nn.GELU(), nn.Dropout(EA_HEAD_DROPOUT))
+        # Trust stream gets its own encoder and running normalisation: its channels
+        # are raw model quantities on wildly different scales (Angstrom displacement
+        # vs clamped log-variance) and in a flat concat they swamped the z-scored
+        # descriptors. Zero-init means it contributes EXACTLY zero at step 0, so the
+        # head starts identical to the no-trust baseline and self-gates upward only
+        # once displacement becomes meaningful.
+        self.register_buffer("trust_mean", torch.zeros(geom_trust_dim))
+        self.register_buffer("trust_var", torch.ones(geom_trust_dim))
+        self.trust_enc = nn.Sequential(
+            nn.Linear(geom_trust_dim, h), nn.GELU(), nn.Dropout(EA_HEAD_DROPOUT),
+            nn.Linear(h, h))
+        nn.init.zeros_(self.trust_enc[-1].weight)
+        nn.init.zeros_(self.trust_enc[-1].bias)
+        self.film = nn.Linear(h, 2 * h)
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+        final = nn.Linear(h // 2, 1)
         nn.init.xavier_uniform_(final.weight, gain=0.1)
         nn.init.zeros_(final.bias)
-        if self.uncertainty_enabled:
-            nn.init.constant_(final.bias[1], float(log_var_init))
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            final,
-        )
+            nn.Linear(2 * h, h), nn.GELU(), nn.Dropout(EA_HEAD_DROPOUT),
+            nn.Linear(h, h // 2), nn.GELU(), nn.Dropout(EA_HEAD_DROPOUT), final)
+        self.bep = nn.Linear(1, 1)
+        nn.init.constant_(self.bep.weight, 0.5)
+        nn.init.zeros_(self.bep.bias)
 
-    def forward(self, h_ts, mask, de_rxn, energy_feats=None):
-        m = mask.unsqueeze(-1)                                   # [B, N, 1]
-        mean_pooled = (h_ts * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
-        attn_logits = self.attn(h_ts).squeeze(-1)                 # [B, N]
-        attn_logits = attn_logits.masked_fill(mask <= 0, -1e4)
-        attn_weights = torch.softmax(attn_logits, dim=1).unsqueeze(-1)
-        attn_pooled = (h_ts * attn_weights * m).sum(dim=1)
-        pooled = torch.cat([attn_pooled, mean_pooled], dim=-1)
-        parts = [
-            pooled,
-            de_rxn.to(device=pooled.device, dtype=pooled.dtype).unsqueeze(-1),
-        ]
-        if self.energy_feat_dim > 0:
-            if energy_feats is None:
-                energy_feats = pooled.new_zeros(pooled.size(0), self.energy_feat_dim)
-            else:
-                if (
-                    energy_feats.dim() != 2
-                    or energy_feats.size(0) != pooled.size(0)
-                    or energy_feats.size(-1) != self.energy_feat_dim
-                ):
-                    raise ValueError(
-                        f"energy_feats must have shape [{pooled.size(0)}, {self.energy_feat_dim}], "
-                        f"got {tuple(energy_feats.shape)}"
-                    )
-                energy_feats = energy_feats.to(device=pooled.device, dtype=pooled.dtype)
-            parts.append(energy_feats)
-        elif energy_feats is not None and energy_feats.numel() > 0:
-            raise ValueError("energy_feats were provided but this EaHead was built with energy_feat_dim=0")
-        feat = torch.cat(parts, dim=-1)
-        out = self.net(feat)
-        return out if self.uncertainty_enabled else out.squeeze(-1)
+    def forward(self, h_ts, mask, de_rxn, energy_feats, rc_mask, geom_trust):
+        pad = mask <= 0
+        m = mask.unsqueeze(-1).to(h_ts.dtype)
+        mean_pooled = (h_ts * m).sum(1) / m.sum(1).clamp(min=1.0)
+        logits = self.attn(h_ts).squeeze(-1).masked_fill(pad, -1e4)
+        attn_pooled = (h_ts * torch.softmax(logits, 1).unsqueeze(-1) * m).sum(1)
+        # An all-false reaction-centre mask must NOT reach the softmax: every
+        # logit would be equal and the "reaction-centre pool" would quietly become
+        # a whole-molecule mean, training on a silently different feature. That is
+        # how the 76 empty-xTB-centre reactions stay findable -- filter_to_bond_orders
+        # removes them at load time, and this is the assertion that the filter
+        # actually worked. Costs one sync per forward; worth it.
+        if not bool(torch.all((rc_mask & (mask > 0)).sum(1) > 0)):
+            raise ValueError(
+                "Reaction-centre mask is empty for at least one sample. Refusing to "
+                "pool over every atom instead. filter_to_bond_orders should have "
+                "dropped this reaction -- the bond-order cache and the sample set "
+                "are out of step."
+            )
+        rc_logits = (self.rc_attn_bias * rc_mask.to(h_ts.dtype)).masked_fill(pad, -1e4)
+        rc_pooled = (h_ts * torch.softmax(rc_logits, 1).unsqueeze(-1)).sum(1)
+        ts = self.ts_proj(torch.cat([attn_pooled, mean_pooled, rc_pooled], -1))
 
+        de_col = de_rxn.to(h_ts.dtype).unsqueeze(-1)
+        phys = self.phys_enc(torch.cat([de_col, energy_feats.to(h_ts.dtype)], -1))
+        gt = geom_trust.float()
+        if self.training and gt.size(0) > 1:
+            with torch.no_grad():
+                self.trust_mean.mul_(0.9).add_(0.1 * gt.mean(0))
+                self.trust_var.mul_(0.9).add_(0.1 * gt.var(0, unbiased=False))
+        phys = phys + self.trust_enc(
+            (gt - self.trust_mean) / (self.trust_var + 1e-5).sqrt()).to(phys.dtype)
 
-class ExpertCrossTalk(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
-        
-    def forward(self, expert_features):
-        consensus_feats, attn_weights = self.attention(expert_features, expert_features, expert_features)
-        return consensus_feats + expert_features, attn_weights
+        gamma, beta = self.film(phys).chunk(2, dim=-1)
+        out = self.net(torch.cat([ts * (1.0 + gamma) + beta, phys], -1))
+        return (out + self.bep(de_col)).squeeze(-1)
+
 
 class PSI(nn.Module):
-    def __init__(self, config, num_atom_types):
+    """Coordinate-native transition-state predictor.
+
+    encoder -> EGNN (seeded at the R/P midpoint) -> TS coordinates
+                                                 -> distances, log-variance, Ea
+    """
+
+    def __init__(self, num_atom_types):
         super().__init__()
-        self.coord_noise = config.get("coord_noise", 0.005)
-        d_model = config["gru_hidden"] * 2
-        atom_dim = config["atom_embed_dim"]
-        drop = config["dropout"]
-        delta_clamp = config["delta_clamp"]
-        self.core = PSICore(config, num_atom_types)
-        self.geom_head = GeometryHead(d_model, atom_dim, ATOM_PHYS_DIM, drop, delta_clamp)
-        self.egnn_enabled = config.get("egnn_enabled", True)
-        
-        if self.egnn_enabled:
-            self.num_experts = int(config.get("num_experts", 5))
-            self.top_k = int(config.get("top_k", 2))
-            if self.num_experts < 1:
-                raise ValueError("num_experts must be at least 1")
-            if not 1 <= self.top_k <= self.num_experts:
-                raise ValueError("top_k must be between 1 and num_experts")
-            self.egnn_hidden = config["egnn_hidden"]
-            self.ea_out_dim = 2 if config.get("ea_uncertainty_enabled", True) else 1
-            node_in_dim = atom_dim + ATOM_PHYS_DIM
-            
-            # Routers consume the backbone's reaction-aware representation
-            # (pooled f), not just mean atomic composition, so experts can
-            # specialize by reaction mechanism. The energy router additionally
-            # sees the explicit reaction energetics.
-            router_hidden = max(64, self.num_experts * 8)
-            self.geom_router = nn.Sequential(
-                nn.Linear(d_model, router_hidden), nn.GELU(),
-                nn.Linear(router_hidden, self.num_experts),
-            )
-            self.energy_router = nn.Sequential(
-                nn.Linear(d_model + ENERGY_FEAT_DIM + 1, router_hidden), nn.GELU(),
-                nn.Linear(router_hidden, self.num_experts),
-            )
-            
-            self.egnn_swarm = nn.ModuleList([
-                EGNN(node_in_dim, hidden=config["egnn_hidden"], n_layers=config["egnn_layers"], coord_clamp=config["egnn_coord_clamp"], dropout=drop)
-                for _ in range(self.num_experts)
-            ])
-            self.ea_swarm = nn.ModuleList([
-                EaHead(node_dim=config["egnn_hidden"], hidden=config["egnn_hidden"], energy_feat_dim=ENERGY_FEAT_DIM, dropout=config.get("ea_head_dropout", drop), uncertainty_enabled=config.get("ea_uncertainty_enabled", True), log_var_init=config.get("ea_log_var_init", 0.0))
-                for _ in range(self.num_experts)
-            ])
-            self.energy_expert_adapters = nn.ModuleList([
-                nn.Sequential(
-                    nn.LayerNorm(config["egnn_hidden"]),
-                    nn.Linear(config["egnn_hidden"], config["egnn_hidden"]),
-                    nn.GELU(),
-                    nn.Linear(config["egnn_hidden"], config["egnn_hidden"]),
-                )
-                for _ in range(self.num_experts)
-            ])
-            self.cross_talk = ExpertCrossTalk(config["egnn_hidden"])
+        d_model = GRU_HIDDEN * 2
+        self.core = PSICore(num_atom_types)
+        # The encoder output feeds the EGNN's node features directly. This is the
+        # ONLY consumer of `core` now that the geometry head is gone -- omit it and
+        # PSICore would run every forward, receive zero gradient and be discarded,
+        # while the EGNN saw no reaction context at all: nothing would tell it
+        # which bonds are forming or breaking.
+        self.egnn = EGNN(ATOM_EMBED_DIM + ATOM_PHYS_DIM + d_model)
+        # 3 displacement scalars (mean/max/reaction-centre) + 2 log-variance scalars.
+        self.geom_trust_dim = 5
+        self.ea_head = EaHead(self.geom_trust_dim)
+        self.geom_logvar_head = nn.Sequential(
+            nn.Linear(EGNN_HIDDEN, EGNN_HIDDEN // 2), nn.GELU(),
+            nn.Linear(EGNN_HIDDEN // 2, 1))
+        # Zero-init -> log-variance starts at 0 (variance 1) -> the Kendall-Gal
+        # attenuation is exactly neutral at step 0.
+        nn.init.zeros_(self.geom_logvar_head[-1].weight)
+        nn.init.zeros_(self.geom_logvar_head[-1].bias)
 
     @staticmethod
-    def _coords_to_distance(x, mask):
+    def coords_to_distance(x, mask):
         N = x.shape[1]
-        diff = x.unsqueeze(2) - x.unsqueeze(1)
-        dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)
+        d = torch.sqrt(((x.unsqueeze(2) - x.unsqueeze(1)) ** 2).sum(-1) + 1e-8)
         eye = torch.eye(N, device=x.device, dtype=x.dtype).unsqueeze(0)
-        valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
-        return dist * (1.0 - eye) * valid
+        return d * (1.0 - eye) * (mask.unsqueeze(-1) * mask.unsqueeze(-2))
 
-    def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys, de_rxn=None, energy_feats=None, detach_ea_features=False):
+    def geom_trust(self, x_init, x_ts, logvar, mask, rc_mask):
+        """Detached confidence/asynchronicity descriptors for the Ea head.
+
+        Large or reaction-centre-concentrated displacement off the midpoint seed
+        marks a non-interpolative, asynchronous TS — the hard structural class.
+        Every term is detached: this informs the Ea head, never geometry.
+        """
+        m = mask.to(x_ts.dtype)
+        cnt = m.sum(1).clamp(min=1.0)
+        rc = rc_mask.to(x_ts.dtype) * m
+        rc_cnt = rc.sum(1).clamp(min=1.0)
+        disp = ((x_ts - x_init).detach() ** 2).sum(-1).clamp(min=0.0).sqrt() * m
+        lv = logvar.detach() * m
+        return torch.stack([
+            disp.sum(1) / cnt, disp.max(1).values, (disp * rc).sum(1) / rc_cnt,
+            lv.sum(1) / cnt, (lv * rc).sum(1) / rc_cnt], dim=-1)
+
+    def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys, de_rxn,
+                energy_feats, c_seed, rc_atom):
         f = self.core(D_R, D_I, D_P, mask, atom_ids, atom_phys)
         atom_emb = self.core.atom_embed(atom_ids)
-        D_TS_coarse = self.geom_head(f, atom_emb, atom_phys, D_R, D_I, D_P, mask)
-        
-        ea_pred_norm = None
-        aux_outputs = None
-        
-        if self.egnn_enabled:
-            B, N = atom_ids.shape
-            node_feats = torch.cat([atom_emb, atom_phys], dim=-1)
-            
-            with torch.amp.autocast(device_type=D_R.device.type, enabled=False):
-                x_init = torch_mds_coords(D_TS_coarse.detach().float(), mask)
-                
-            if self.training and self.coord_noise > 0.0:
-                noise = torch.randn_like(x_init) * self.coord_noise
-                x_init = x_init + (noise * mask.unsqueeze(-1))
-                
-            # Reaction-aware routing signal: pool the backbone features f, which
-            # encode R/P/TS geometry through the transformer core (not just the
-            # static per-atom composition that node_feats carries).
-            pooled_f = (f * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True)
-
-            # GEOMETRY SWARM
-            geom_logits = self.geom_router(pooled_f)
-            geom_weights, geom_indices = torch.topk(torch.softmax(geom_logits, dim=-1), self.top_k, dim=-1)
-            geom_weights = geom_weights / geom_weights.sum(dim=-1, keepdim=True)
-            
-            final_coords = torch.zeros_like(x_init)
-            consensus_h_ts = torch.zeros(B, N, self.egnn_hidden, device=x_init.device)
-            
-            # VECTORIZED GEOMETRY ROUTING
-            for expert_idx in range(self.num_experts):
-                expert_mask = (geom_indices == expert_idx)
-                batch_idx, k_idx = torch.where(expert_mask)
-                if len(batch_idx) == 0:
-                    continue
-                nf_sub = node_feats[batch_idx]
-                x_sub = x_init[batch_idx]
-                m_sub = mask[batch_idx]
-                w_sub = geom_weights[batch_idx, k_idx].view(-1, 1, 1)
-                
-                h_k, x_k = self.egnn_swarm[expert_idx](nf_sub, x_sub, m_sub)
-                
-                final_coords[batch_idx] += x_k * w_sub
-                consensus_h_ts[batch_idx] += h_k * w_sub
-            
-            D_TS_pred = self._coords_to_distance(final_coords, mask)
-            
-            # ENERGY SWARM & CROSS-TALK
-            if de_rxn is not None:
-                h_ea = consensus_h_ts.detach() if detach_ea_features else consensus_h_ts
-                ef = energy_feats.float() if energy_feats is not None else None
-
-                # Energy router sees the reaction representation (pooled f) plus
-                # the explicit reaction energetics: the 28-d energy_feats and the
-                # signed reaction energy de_rxn.
-                ef_for_router = ef if ef is not None else pooled_f.new_zeros(B, ENERGY_FEAT_DIM)
-                energy_router_in = torch.cat([
-                    pooled_f,
-                    ef_for_router.to(pooled_f.dtype),
-                    de_rxn.view(B, 1).to(pooled_f.dtype),
-                ], dim=-1)
-                energy_logits = self.energy_router(energy_router_in)
-                energy_weights, energy_indices = torch.topk(torch.softmax(energy_logits, dim=-1), self.top_k, dim=-1)
-                energy_weights = energy_weights / energy_weights.sum(dim=-1, keepdim=True)
-                
-                # Cross-talk requires pooling h_ea to [B, H] to form expert representations
-                pooled_h_ea = (h_ea * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True)
-                gathered_feats = pooled_h_ea.new_zeros(B, self.top_k, self.egnn_hidden)
-                
-                # VECTORIZED ADAPTER ROUTING
-                for expert_idx in range(self.num_experts):
-                    expert_mask = (energy_indices == expert_idx)
-                    batch_idx, k_idx = torch.where(expert_mask)
-                    if len(batch_idx) == 0:
-                        continue
-                    base = pooled_h_ea[batch_idx]
-                    gathered_feats[batch_idx, k_idx, :] = base + self.energy_expert_adapters[expert_idx](base)
-                consensus_feats, cross_talk_attn = self.cross_talk(gathered_feats)
-                
-                # Expand consensus feats back to sequence length for EaHead attention pooling
-                # We simply add the consensus shift back to the original h_ea sequence
-                final_ea_pred = torch.zeros(B, self.ea_out_dim, device=x_init.device)
-                
-                # VECTORIZED ENERGY EXPERT ROUTING
-                for expert_idx in range(self.num_experts):
-                    expert_mask = (energy_indices == expert_idx)
-                    batch_idx, k_idx = torch.where(expert_mask)
-                    if len(batch_idx) == 0:
-                        continue
-                    
-                    w_sub = energy_weights[batch_idx, k_idx].unsqueeze(-1)
-                    shift_sub = consensus_feats[batch_idx, k_idx] - pooled_h_ea[batch_idx]
-                    expert_h_ea_sub = h_ea[batch_idx] + shift_sub.unsqueeze(1)
-                    
-                    m_sub = mask[batch_idx]
-                    de_rxn_sub = de_rxn[batch_idx].float()
-                    ef_sub = ef[batch_idx] if ef is not None else None
-                    
-                    ea_pred_k = self.ea_swarm[expert_idx](expert_h_ea_sub, m_sub, de_rxn_sub, ef_sub)
-                    if ea_pred_k.dim() == 1:
-                        ea_pred_k = ea_pred_k.unsqueeze(-1)
-                    final_ea_pred[batch_idx] += ea_pred_k * w_sub
-                        
-                ea_pred_norm = final_ea_pred.squeeze(-1) if self.ea_out_dim == 1 else final_ea_pred
-                
-                aux_outputs = {
-                    "geom_logits": geom_logits,
-                    "energy_logits": energy_logits,
-                    "geom_indices": geom_indices.detach(),
-                    "energy_indices": energy_indices.detach(),
-                    "geom_weights": geom_weights.detach(),
-                    "energy_weights": energy_weights.detach(),
-                    "cross_talk_attn": cross_talk_attn.detach(),
-                }
-        else:
-            D_TS_pred = D_TS_coarse
-            
-        return D_TS_pred, D_TS_coarse, ea_pred_norm, aux_outputs
-
-class PlateauWarmupScheduler:
-    def __init__(self, optimizer, warmup_epochs, factor=0.5, patience=20, min_lr=1e-6):
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.min_lr = min_lr
-        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
-        self.last_epoch = 0
-        self.plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=factor, patience=patience, min_lr=min_lr
-        )
-        
-    def step(self, metric):
-        self.last_epoch += 1
-        if self.last_epoch <= self.warmup_epochs:
-            scale = self.last_epoch / max(1, self.warmup_epochs)
-            for i, group in enumerate(self.optimizer.param_groups):
-                group['lr'] = self.base_lrs[i] * scale
-        else:
-            self.plateau.step(metric)
-            
-    def state_dict(self):
-        return {'last_epoch': self.last_epoch, 'plateau': self.plateau.state_dict(), 'base_lrs': self.base_lrs}
-        
-    def load_state_dict(self, state_dict):
-        self.last_epoch = state_dict['last_epoch']
-        self.base_lrs = state_dict['base_lrs']
-        self.plateau.load_state_dict(state_dict['plateau'])
+        node_feats = torch.cat([atom_emb, atom_phys, f], dim=-1)
+        x_init = c_seed.to(torch.float32) * mask.unsqueeze(-1)
+        h_ts, x_ts = self.egnn(node_feats, x_init, mask)
+        D_pred = self.coords_to_distance(x_ts, mask)
+        # Clamped before it reaches exp(-logvar): unbounded negative log-variance
+        # overflows fp16 (exp(7) ~ 1096 is safe, exp(20) is not).
+        logvar = self.geom_logvar_head(h_ts).squeeze(-1)
+        logvar = logvar.clamp(-LOGVAR_CLAMP, LOGVAR_CLAMP).masked_fill(mask <= 0, 0.0)
+        rc_mask = rc_atom.to(torch.bool) & (mask > 0)
+        ea = self.ea_head(h_ts.detach(), mask, de_rxn, energy_feats, rc_mask,
+                          self.geom_trust(x_init, x_ts, logvar, mask, rc_mask))
+        return D_pred, x_ts, logvar, ea
 
 
-def build_optimizer(model, config):
-    """Use a faster, lighter-decayed optimizer group for the Ea head swarm."""
-    ea_params = list(model.ea_swarm.parameters()) if hasattr(model, "ea_swarm") else []
-    if not ea_params:
-        return torch.optim.AdamW(
-            model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
-        )
+# =============================================================================
+# Losses
+# =============================================================================
+def kabsch_align_torch(X, Y, mask):
+    """Batched rigid superposition of X onto Y over real atoms only.
 
-    ea_param_ids = {id(p) for p in ea_params}
-    base_params = [
-        p for p in model.parameters()
-        if p.requires_grad and id(p) not in ea_param_ids
-    ]
-    return torch.optim.AdamW(
-        [
-            {"params": base_params, "lr": config["lr"], "weight_decay": config["weight_decay"]},
-            {
-                "params": ea_params,
-                "lr": config["ea_head_lr"],
-                "weight_decay": config["ea_head_weight_decay"],
-            },
-        ]
-    )
+    Without this the coordinate loss would punish a perfect structure for being
+    rotated: the prediction lives in the seed's frame, c_TS in the DFT frame.
 
+    The rotation is DETACHED. It is itself a function of X, and backpropagating
+    through SVD reintroduces exactly the degenerate-spectrum instability that
+    coordinate-native geometry exists to avoid (the 3x3 cross-covariance goes
+    degenerate for linear or near-planar fragments). Treating R as constant is the
+    standard registration-loss choice: the gradient still points at the shape error.
 
-def ea_tail_sample_weights(Ea, config):
-    """Piecewise sample weights for rare high-barrier Ea targets."""
-    weights = torch.ones_like(Ea, dtype=torch.float32)
-    if not config.get("ea_tail_weighting_enabled", False):
-        return weights
-
-    mode = config.get("ea_tail_weight_mode", "piecewise")
-    if mode != "piecewise":
-        raise ValueError(f"Unsupported ea_tail_weight_mode '{mode}'. Use 'piecewise'.")
-
-    bins = list(config.get("ea_tail_weight_bins", [80.0, 100.0, 120.0]))
-    values = list(config.get("ea_tail_weight_values", [1.0, 1.5, 2.0, 2.5]))
-    if len(values) != len(bins) + 1:
-        raise ValueError(
-            "ea_tail_weight_values must have exactly one more entry than "
-            "ea_tail_weight_bins."
-        )
-
-    for threshold, value in zip(bins, values[1:]):
-        weights = torch.where(Ea >= float(threshold), weights.new_tensor(float(value)), weights)
-    return weights.clamp(max=float(config.get("ea_tail_weight_max", max(values))))
-
-
-def weighted_mean(values, weights):
-    return (values * weights).sum() / weights.sum().clamp(min=1.0)
-
-
-def split_ea_prediction(ea_pred, config):
-    """Return normalized Ea mean and optional clamped log-variance."""
-    if ea_pred is None:
-        return None, None
-    if ea_pred.dim() == 1:
-        return ea_pred, None
-    if ea_pred.size(-1) == 1:
-        return ea_pred.squeeze(-1), None
-    ea_mean_norm = ea_pred[..., 0]
-    ea_log_var = ea_pred[..., 1].clamp(
-        min=float(config.get("ea_log_var_min", -5.0)),
-        max=float(config.get("ea_log_var_max", 4.0)),
-    )
-    return ea_mean_norm, ea_log_var
-
-
-def gaussian_ea_nll(ea_mean_norm, ea_log_var, ea_target_norm):
-    """Gaussian NLL in normalized Ea units, without the constant term."""
-    residual2 = (ea_mean_norm.float() - ea_target_norm.float()).pow(2)
-    log_var = ea_log_var.float()
-    return 0.5 * (torch.exp(-log_var) * residual2 + log_var)
-
-
-def infer_ea_head_output_dim(state_dict):
-    weight = state_dict.get("ea_head.net.6.weight")
-    if isinstance(weight, torch.Tensor) and weight.dim() >= 1:
-        return int(weight.shape[0])
-    return None
-
-
-def adapt_ea_head_state_dict(state_dict, target_state, config):
-    """Copy a legacy scalar Ea head into the mean row of the uncertainty head."""
-    adapted = dict(state_dict)
-    migrated = False
-    w_key, b_key = "ea_head.net.6.weight", "ea_head.net.6.bias"
-    if w_key not in adapted or w_key not in target_state:
-        return adapted, migrated
-
-    old_w, new_w = adapted[w_key], target_state[w_key]
-    if tuple(old_w.shape) == tuple(new_w.shape):
-        return adapted, migrated
-
-    can_migrate_scalar_to_uncertainty = (
-        old_w.dim() == 2
-        and new_w.dim() == 2
-        and old_w.shape[0] == 1
-        and new_w.shape[0] == 2
-        and old_w.shape[1] == new_w.shape[1]
-        and config.get("ea_uncertainty_enabled", True)
-    )
-    if not can_migrate_scalar_to_uncertainty:
-        return adapted, migrated
-
-    merged_w = new_w.detach().clone()
-    merged_w[0].copy_(old_w[0].to(device=merged_w.device, dtype=merged_w.dtype))
-    adapted[w_key] = merged_w
-    if b_key in adapted and b_key in target_state:
-        old_b, new_b = adapted[b_key], target_state[b_key]
-        if old_b.numel() == 1 and new_b.numel() == 2:
-            merged_b = new_b.detach().clone()
-            merged_b[0].copy_(old_b[0].to(device=merged_b.device, dtype=merged_b.dtype))
-            merged_b[1].fill_(float(config.get("ea_log_var_init", 0.0)))
-            adapted[b_key] = merged_b
-    return adapted, True
-
-
-def load_checkpoint_model_state(model, checkpoint_state, config):
-    target_state = model.state_dict()
-    adapted_state, migrated = adapt_ea_head_state_dict(checkpoint_state, target_state, config)
-    try:
-        model.load_state_dict(adapted_state)
-        return {"exact": True, "migrated": migrated, "skipped": []}
-    except RuntimeError as exc:
-        compatible = {}
-        skipped = []
-        for key, value in adapted_state.items():
-            if key in target_state and tuple(value.shape) == tuple(target_state[key].shape):
-                compatible[key] = value
-            else:
-                skipped.append(key)
-        model.load_state_dict(compatible, strict=False)
-        return {
-            "exact": False,
-            "migrated": migrated,
-            "skipped": skipped,
-            "error": "\n".join(str(exc).splitlines()[:4]),
-        }
-
-
-def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True):
-    """Joint geometry + Ea training loop.
-
-    Geometry is the backbone objective. The learned Ea head trains from
-    `ea_loss_start_epoch`; before `ea_warmup_epochs` it can use detached EGNN
-    features so the starting Ea prediction improves without letting noisy early
-    Ea gradients reshape the geometry backbone.
+    Forced to fp32 — cuSOLVER has no fp16 batched SVD, and orthogonalising a 3x3
+    in fp16 would be badly conditioned even where it is supported.
     """
-    if is_train:
-        model.train()
-    else:
-        model.eval()
-    total_loss, total_geom, total_triangle = 0.0, 0.0, 0.0
-    total_ea_mae, total_ea_norm, total_ea_weighted_norm = 0.0, 0.0, 0.0
-    total_ea_nll, total_ea_weighted_nll = 0.0, 0.0
-    total_ea_tail_weight, total_ea_log_var, total_ea_sigma_norm, n_batches = 0.0, 0.0, 0.0, 0
-    ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
-    ea_started = epoch >= config.get("ea_loss_start_epoch", config["ea_warmup_epochs"] + 1)
-    ea_joint = epoch > config["ea_warmup_epochs"]
-    detach_ea_features = (
-        config.get("ea_detach_during_warmup", False)
-        and ea_started
-        and not ea_joint
-    )
-    if ea_joint:
-        ea_w = config["ea_loss_weight"]
-    elif ea_started:
-        ea_w = config.get("ea_warmup_loss_weight", 1.0)
-    else:
-        ea_w = 0.0
-    context = torch.enable_grad() if is_train else torch.no_grad()
+    with torch.amp.autocast(device_type=X.device.type, enabled=False):
+        X, Y = X.float(), Y.float()
+        m = mask.unsqueeze(-1).float()
+        cnt = m.sum(1, keepdim=True).clamp(min=1.0)
+        Xc = (X - (X * m).sum(1, keepdim=True) / cnt) * m
+        Yc = (Y - (Y * m).sum(1, keepdim=True) / cnt) * m
+        U, _, Vt = torch.linalg.svd(Xc.detach().transpose(1, 2) @ Yc)
+        d = torch.sign(torch.det(Vt.transpose(1, 2) @ U.transpose(1, 2)))
+        # sign() is 0 for an exactly singular cross-covariance (collinear atoms),
+        # which would zero the third row of R; send it to the non-reflecting branch.
+        d = torch.where(d == 0, torch.ones_like(d), d)
+        diag = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], -1))
+        # Proper rotations only: a reflection would let an enantiomer score as a
+        # perfect match, and chirality is the whole point of predicting coordinates.
+        R = (Vt.transpose(1, 2) @ diag @ U.transpose(1, 2)).detach()
+        # The unrestricted best-orthogonal fit, from the SAME decomposition, so
+        # measuring chirality costs no extra SVD. It is allowed to reflect; where
+        # it beats the proper rotation, the prediction is the mirror image.
+        R_reflect = (Vt.transpose(1, 2) @ U.transpose(1, 2)).detach()
+        return (Xc @ R.transpose(1, 2)) * m, Yc, (Xc @ R_reflect.transpose(1, 2)) * m
+
+
+def per_atom_rmsd(x, y, mask):
+    sq = ((x - y) ** 2).sum(-1) * mask.to(x.dtype)
+    return torch.sqrt((sq.sum(1) / mask.sum(1).clamp(min=1.0)).clamp(min=1e-12))
+
+
+def coordinate_loss(x_pred, c_true, mask):
+    """(huber, rmsd_A, flip_rate).
+
+    The Huber term trains. rmsd_A is the interpretable number comparable to
+    React-OT / OA-ReactDiff, which report coordinate RMSD rather than a
+    distance-matrix MAE.
+
+    flip_rate is the fraction of structures whose MIRROR IMAGE fits the truth
+    materially better than any proper rotation does. It is the only signal in the
+    whole pipeline that can see a chirality error: distance matrices are
+    chirality-blind, so a model that learned every enantiomer would score a
+    perfect distance MAE. Getting handedness right is a large part of why this
+    pipeline predicts coordinates at all, so the rate is measured every epoch
+    rather than assumed to be zero.
+    """
+    x, y, x_reflect = kabsch_align_torch(x_pred, c_true, mask)
+    m = mask.unsqueeze(-1).to(x.dtype)
+    l = (F.huber_loss(x, y, reduction="none", delta=GEOM_HUBER_DELTA) * m).sum() \
+        / (m.sum().clamp(min=1.0) * 3.0)
+    proper = per_atom_rmsd(x, y, mask)
+    reflected = per_atom_rmsd(x_reflect, y, mask)
+    # The min-RMSD guard keeps near-perfect structures out: for those the two fits
+    # are numerically indistinguishable and the ratio test is meaningless noise.
+    flipped = (reflected < CHIRALITY_FLIP_RATIO * proper) & (proper > CHIRALITY_MIN_RMSD)
+    return l, proper.mean(), flipped.float().mean()
+
+
+def geometry_pair_weights(D_R, D_P, D_TS, mask, rc_atom):
+    """Per-pair weight for the distance loss.
+
+    Inverse-distance weighting alone is near-blind to the long-range
+    active<->spectator cross distances that encode global fragment orientation, so
+    those are boosted and the static spectator backbone is damped. On top of that,
+    pairs that MOVE a lot from R to P are lifted regardless of role: in a
+    unimolecular rearrangement most moving pairs sit between two non-reaction-centre
+    atoms and would otherwise be damped to 0.25x and under-trained, which is what
+    made the model hedge toward the R/P midpoint.
+    """
+    B, N, _ = D_R.shape
+    valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+    eye = torch.eye(N, device=mask.device, dtype=mask.dtype).unsqueeze(0)
+    m2d = valid * (1.0 - eye)
+    w = 1.0 / (D_TS * m2d + 1.0)
+    a = rc_atom.to(w.dtype)
+    ai, aj = a.unsqueeze(2), a.unsqueeze(1)
+    role = (GEOM_HINGE_CROSS_WEIGHT * (ai + aj - 2.0 * ai * aj)
+            + GEOM_ACTIVE_PAIR_WEIGHT * (ai * aj)
+            + GEOM_SPECTATOR_SPECTATOR_WEIGHT * ((1.0 - ai) * (1.0 - aj)))
+    move = (torch.abs(D_R - D_P) * m2d).to(w.dtype)
+    move = move / move.amax(dim=(1, 2), keepdim=True).clamp(min=1e-6)
+    return m2d, w * torch.maximum(role, GEOM_MOVE_WEIGHT * move)
+
+
+def compute_loss(batch, out, ea_mean, ea_std):
+    """Total loss plus the metrics worth logging."""
+    D_TS, mask = batch["D_TS"], batch["mask"]
+    D_pred, x_ts, logvar, ea_pred = out
+    m2d, weights = geometry_pair_weights(
+        batch["D_R"], batch["D_P"], D_TS, mask, batch["rc_atom"])
+    wm = m2d * weights
+    denom = wm.sum().clamp(min=1)
+
+    # Kendall-Gal heteroscedastic attenuation: precision-weight each pair's error
+    # and pay a log-variance penalty, so the model can declare a pair hard instead
+    # of hedging every prediction toward the midpoint.
+    per_pair = F.huber_loss(D_pred, D_TS, reduction="none", delta=GEOM_HUBER_DELTA)
+    lv_pair = 0.5 * (logvar.unsqueeze(2) + logvar.unsqueeze(1))
+    l_geom = ((torch.exp(-lv_pair) * per_pair + 0.5 * lv_pair) * wm).sum() / denom
+
+    l_coord, rmsd, flip = coordinate_loss(x_ts, batch["c_TS"], mask)
+
+    # Spectator pairs pulled toward the R/P midpoint. The xTB bonded-in-both rule
+    # is what makes this legitimate: measured |D_TS - D_I| is 0.0143 A on the pairs
+    # it selects, against 0.1218 A for the distance rule, whose 0.041 A systematic
+    # bias sat on the same axis as the under-shoot failure.
+    spec = batch["spectator_pair"].to(D_pred.dtype) * m2d
+    l_spec = F.mse_loss(D_pred * spec, batch["D_I"] * spec, reduction="sum") \
+        / spec.sum().clamp(min=1.0)
+    # Steric floor, so clashes are trained against rather than clamped post hoc.
+    radii = COVALENT_RADII_T.to(batch["atom_ids"].device)[batch["atom_ids"]]
+    floor = STERIC_FLOOR_FRAC * (radii.unsqueeze(2) + radii.unsqueeze(1))
+    l_steric = (F.relu(floor.to(D_pred.dtype) - D_pred) * m2d).sum() / m2d.sum().clamp(min=1.0)
+
+    loss = (l_geom + COORD_LOSS_WEIGHT * l_coord
+            + PINN_WEIGHT * (l_spec + STERIC_LOSS_WEIGHT * l_steric))
+
+    # Up-weight the reactions the error analysis flagged as hard.
+    risk_scale = (1.0 + RISK_WEIGHT_ALPHA * batch["risk_penalty"].float()).clamp(max=RISK_WEIGHT_MAX)
+    risk_pair = batch["risk_pair_mask"] * m2d * risk_scale.view(-1, 1, 1)
+    loss = loss + RISK_GEOM_LOSS_WEIGHT * (
+        F.huber_loss(D_pred, D_TS, reduction="none", delta=0.5) * risk_pair
+    ).sum() / risk_pair.sum().clamp(min=1.0)
+
+    ea_target = (batch["Ea"] - ea_mean) / ea_std
+    ea_per = F.smooth_l1_loss(ea_pred, ea_target, reduction="none")
+    risk_w = risk_scale * (batch["risk_penalty"] > 0.0).float()
+    loss = loss + EA_LOSS_WEIGHT * ea_per.mean() + RISK_EA_LOSS_WEIGHT * (
+        (ea_per * risk_w).sum() / risk_w.sum().clamp(min=1.0))
+
+    # Unweighted physical readouts, independent of the training weighting.
+    geom_mae = (torch.abs(D_pred - D_TS) * m2d).sum() / m2d.sum().clamp(min=1.0)
+    ea_mae = (ea_pred - ea_target).abs().mean() * ea_std
+    return loss, {"loss": loss.detach(), "geom_mae_A": geom_mae.detach(),
+                  "rmsd_A": rmsd.detach(), "ea_mae": ea_mae.detach(),
+                  "coord": l_coord.detach(), "chirality_flip": flip.detach()}
+
+
+COVALENT_RADII_T = torch.tensor(
+    [0.0] + [COVALENT_RADII.get(a, 0.76) for a in sorted(ATOMIC_NUMBER)],
+    dtype=torch.float32)
+
+
+# =============================================================================
+# Schedule
+# =============================================================================
+class WarmupCosine:
+    """Linear warmup then cosine to min_lr over SWA_START epochs.
+
+    The horizon is the SWA start, not the run length: past that point SWALR takes
+    over at a constant rate and weight averaging supplies the remaining gain.
+    """
+
+    def __init__(self, optimizer, min_lr=1e-6):
+        self.opt = optimizer
+        self.min_lr = min_lr
+        self.base = [g["lr"] for g in optimizer.param_groups]
+        self.epoch = 0
+
+    def step(self):
+        self.epoch += 1
+        if self.epoch <= WARMUP_EPOCHS:
+            scale = self.epoch / WARMUP_EPOCHS
+            for g, b in zip(self.opt.param_groups, self.base):
+                g["lr"] = b * scale
+            return
+        p = min((self.epoch - WARMUP_EPOCHS) / max(1, SWA_START - WARMUP_EPOCHS), 1.0)
+        cos = 0.5 * (1.0 + math.cos(math.pi * p))
+        for g, b in zip(self.opt.param_groups, self.base):
+            g["lr"] = self.min_lr + (b - self.min_lr) * cos
+
+    def state_dict(self):
+        return {"epoch": self.epoch}
+
+    def load_state_dict(self, sd):
+        self.epoch = sd["epoch"]
+
+
+# =============================================================================
+# Distributed helpers
+# =============================================================================
+def all_reduce_sum(t):
+    """In-place SUM across ranks, or a no-op on a single GPU. There is no process
+    group when world_size == 1 (P100), so calling dist.all_reduce would raise;
+    with one rank the local tensor already IS the sum."""
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return t
+
+
+def reduce_metrics(sums, count, device):
+    """Sum per-rank metric totals and counts, then divide. Exact means across ranks."""
+    keys = sorted(sums)
+    t = torch.tensor([sums[k] for k in keys] + [count], dtype=torch.float64, device=device)
+    all_reduce_sum(t)
+    n = t[-1].clamp(min=1.0)
+    return {k: (t[i] / n).item() for i, k in enumerate(keys)}
+
+
+def logvar_summary(hist):
+    """Percentiles and clamp-saturation fractions from the accumulated histogram.
+
+    `pinned_lo` is the diagnostic that matters: the fraction of atoms sitting in
+    the lowest bin, i.e. pressed against the log-variance floor. The Kendall-Gal
+    objective can be reduced either by predicting better OR by shrinking sigma,
+    and a pinned_lo that climbs without plateauing means it is doing the second.
+    Every such atom also carries the full exp(LOGVAR_CLAMP) ~ 1097x gradient
+    amplification, so this is a stability signal as well as an honesty one.
+    """
+    total = hist.sum().clamp(min=1.0)
+    cdf = (hist.cumsum(0) / total)
+    width = (LOGVAR_HIST_MAX - LOGVAR_HIST_MIN) / LOGVAR_HIST_BINS
+    centers = LOGVAR_HIST_MIN + (torch.arange(
+        LOGVAR_HIST_BINS, device=hist.device, dtype=hist.dtype) + 0.5) * width
+    pick = lambda p: centers[int((cdf >= p).nonzero()[0, 0])].item()
+    return {"p1": pick(0.01), "p50": pick(0.50), "p99": pick(0.99),
+            "pinned_lo": (hist[0] / total).item(),
+            "pinned_hi": (hist[-1] / total).item()}
+
+
+def percentiles(values):
+    """p50/p99/max of the per-step gradient norms."""
+    t = torch.tensor(values, dtype=torch.float64)
+    return {"p50": t.quantile(0.50).item(), "p99": t.quantile(0.99).item(),
+            "max": t.max().item()}
+
+
+def run_epoch(model, loader, optimizer, scaler, device, ea_mean, ea_std, train):
+    model.train(train)
+    sums, count = {}, 0
+    grad_skips, clipped, grad_norms = 0, 0, []
+    logvar_hist = torch.zeros(LOGVAR_HIST_BINS, device=device, dtype=torch.float64)
+    context = torch.enable_grad() if train else torch.no_grad()
     with context:
         for batch in loader:
-            (
-                DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, Ea,
-                de_rxn, energy_feats, risk_pair_mask,
-                risk_score, risk_penalty, complexity_flag, risky_chem_flag,
-            ) = move_batch_to_device(batch, device)
-            if is_train:
+            batch = to_device(batch, device)
+            if train:
                 optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_DTS_coarse, ea_pred_norm, aux_outputs = model(
-                    DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats,
-                    detach_ea_features=detach_ea_features,
-                )
-                N = DR.shape[1]
-                valid_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
-                eye = torch.eye(N, device=mask.device, dtype=mask.dtype).unsqueeze(0)
-                m2d = valid_mask * (1.0 - eye)
-                
-                # Inverse Distance Weighting: 1.0 / (DTS + 1.0)
-                # This ensures small chemical bonds receive gradients equal in magnitude
-                # to large inter-fragment distances, preventing fragment "melting".
-                dist_weights = 1.0 / (DTS * m2d + 1.0)
-                
-                # --- Fix 1 & 2: Active-atom masking + Hinge cross-distance boost ---
-                # Identify which atom-pairs involve actively changing distances.
-                # "active_pair" = any (i,j) where |D_R - D_P| > threshold.
-                if config.get("active_masking_enabled", False) or config.get("hinge_boost_enabled", False):
-                    active_change = (torch.abs(DR - DP) > config["spectator_threshold"]).float() * m2d
-                    # active_atom_mask: atom i is active if ANY of its pairs changed
-                    active_atom = (active_change.sum(dim=-1) > 0).float()  # (B, N)
-                    # Build pair-level classification:
-                    # active-active, active-spectator (hinge), spectator-spectator
-                    aa_i = active_atom.unsqueeze(-1)  # (B, N, 1)
-                    aa_j = active_atom.unsqueeze(-2)  # (B, 1, N)
-                    active_active_mask = aa_i * aa_j            # both atoms active
-                    spectator_spectator_mask = (1 - aa_i) * (1 - aa_j)  # both spectator
-                    hinge_mask = 1.0 - active_active_mask - spectator_spectator_mask  # cross
-                    
-                    # Build the attention-weight map:
-                    # Active-active pairs:         1.0x (full gradient, as normal)
-                    # Spectator-spectator pairs:   0.1x (muted -- gradient pollution fix)
-                    # Hinge (active-spectator):    3.0x (boosted -- global rotation fix)
-                    attn_map = torch.ones_like(m2d)
-                    if config.get("active_masking_enabled", False):
-                        ss_w = config.get("spectator_spectator_weight", 0.1)
-                        attn_map = attn_map * (1.0 - spectator_spectator_mask) + ss_w * spectator_spectator_mask
-                    if config.get("hinge_boost_enabled", False):
-                        hinge_w = config.get("hinge_cross_weight", 3.0)
-                        attn_map = attn_map * (1.0 - hinge_mask) + hinge_w * hinge_mask
-                    
-                    m2d_weighted = m2d * dist_weights * attn_map
-                else:
-                    m2d_weighted = m2d * dist_weights
-                    
-                denom_weighted = m2d_weighted.sum().clamp(min=1)
-                
-                # Main geometry loss on the EGNN-refined distances.
-                l_geom = F.huber_loss(p_DTS * m2d_weighted, DTS * m2d_weighted, reduction='sum', delta=0.5) / denom_weighted
-                # Auxiliary loss on the coarse (pre-EGNN) distances trains the
-                # geometry head directly, giving the EGNN a stable MDS seed.
-                l_geom_coarse = F.huber_loss(p_DTS_coarse * m2d_weighted, DTS * m2d_weighted, reduction='sum', delta=0.5) / denom_weighted
-
-                # --- PINN Matrix-wise Cross Check ---
-                # Physics constraint 1: Spectator bonds (abs(DR - DP) < threshold) shouldn't change wildly.
-                # Target them towards the true DTS using strict MSE to prevent the EGNN Ripple Effect.
-                spectator_mask = (torch.abs(DR - DP) < config["spectator_threshold"]).float() * m2d
-                spectator_denom = spectator_mask.sum().clamp(min=1.0)
-                l_pinn_spectator = (
-                    F.mse_loss(p_DTS * spectator_mask, DTS * spectator_mask, reduction='sum')
-                    / spectator_denom
-                )
-
-                l_pinn = l_pinn_spectator
-
-                l_triangle_refined = triangle_inequality_loss(
-                    p_DTS,
-                    mask,
-                    geom_mask,
-                    tol=config["triangle_tolerance"],
-                    triplet_samples=config["triangle_triplet_samples"],
-                    stochastic=is_train,
-                )
-                l_triangle_coarse = triangle_inequality_loss(
-                    p_DTS_coarse,
-                    mask,
-                    geom_mask,
-                    tol=config["triangle_tolerance"],
-                    triplet_samples=config["triangle_triplet_samples"],
-                    stochastic=is_train,
-                )
-                l_triangle = (
-                    config["triangle_refined_weight"] * l_triangle_refined
-                    + config["triangle_coarse_weight"] * l_triangle_coarse
-                )
-
-                loss = (
-                    l_geom
-                    + config["geom_coarse_weight"] * l_geom_coarse
-                    + 0.2 * l_pinn
-                    + config["triangle_loss_weight"] * l_triangle
-                )
-                
-                # --- Load Balancing Loss (MoE) ---
-                if aux_outputs is not None:
-                    # Encourage the router to distribute probability equally across all experts
-                    geom_probs = torch.softmax(aux_outputs["geom_logits"], dim=-1).mean(dim=0)
-                    energy_probs = torch.softmax(aux_outputs["energy_logits"], dim=-1).mean(dim=0)
-                    num_experts = geom_probs.shape[0]
-                    # Perfect balance means each expert gets exactly 1/num_experts probability
-                    l_balance_geom = (geom_probs * geom_probs).sum() * num_experts
-                    l_balance_energy = (energy_probs * energy_probs).sum() * num_experts
-                    # Add to total loss with a small weight to prevent collapsing without overriding physics
-                    loss = loss + 0.1 * (l_balance_geom + l_balance_energy)
-
-                risk_scale = (
-                    1.0 + config["risk_weight_alpha"] * risk_penalty.float()
-                ).clamp(max=config["risk_weight_max"])
-                risk_sample = (risk_penalty > 0.0).float()
-                risk_pair = risk_pair_mask * m2d
-                risk_pair_weight = risk_pair * risk_scale.view(-1, 1, 1)
-                risk_pair_denom = risk_pair_weight.sum().clamp(min=1.0)
-                if risk_pair.sum() > 0:
-                    risk_geom_abs = F.huber_loss(p_DTS, DTS, reduction='none', delta=0.5)
-                    l_risk_geom = (risk_geom_abs * risk_pair_weight).sum() / risk_pair_denom
-                    loss = loss + config["risk_geom_loss_weight"] * l_risk_geom
-
-                # Learned Ea loss on the normalized target. With uncertainty
-                # enabled, Gaussian NLL lets high-residual samples reduce their
-                # precision instead of sending large gradients into the EGNN.
-                if ea_pred_norm is not None:
-                    ea_mean_norm, ea_log_var = split_ea_prediction(ea_pred_norm, config)
-                    ea_target_norm = (Ea - ea_mean) / ea_std
-                    ea_abs = F.smooth_l1_loss(ea_mean_norm, ea_target_norm, reduction='none')
-                    if ea_log_var is not None:
-                        ea_objective = gaussian_ea_nll(ea_mean_norm, ea_log_var, ea_target_norm)
-                    else:
-                        ea_objective = ea_abs
-                    ea_tail_weight = ea_tail_sample_weights(Ea.float(), config)
-                    l_ea = ea_abs.mean()
-                    l_ea_weighted = weighted_mean(ea_abs, ea_tail_weight)
-                    l_ea_nll = ea_objective.mean()
-                    l_ea_weighted_nll = weighted_mean(ea_objective, ea_tail_weight)
-                    if ea_w > 0.0:
-                        loss = loss + ea_w * l_ea_weighted_nll
-                        if ea_joint and risk_sample.sum() > 0:
-                            risk_weight = risk_scale * risk_sample
-                            l_risk_ea = (ea_objective * risk_weight).sum() / risk_weight.sum().clamp(min=1.0)
-                            loss = loss + config["risk_ea_loss_weight"] * l_risk_ea
-                else:
-                    l_ea = l_ea_weighted = l_ea_nll = l_ea_weighted_nll = ea_tail_weight = None
-                    ea_mean_norm = ea_log_var = ea_target_norm = None
-            if is_train:
-                # Guard against a non-finite batch corrupting the weights: skip
-                # the step entirely rather than relying solely on GradScaler.
-                if not torch.isfinite(loss):
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                out = model(batch["D_R"], batch["D_I"], batch["D_P"], batch["mask"],
+                            batch["atom_ids"], batch["atom_phys"], batch["de_rxn"],
+                            batch["energy_feats"], batch["c_I"], batch["rc_atom"])
+                loss, metrics = compute_loss(batch, out, ea_mean, ea_std)
+            # Real atoms only: logvar is masked_fill(0) on padding, which would
+            # otherwise pile a spurious spike in the middle of the distribution.
+            lv = out[2].detach()[batch["mask"] > 0].float()
+            logvar_hist += torch.histc(lv, bins=LOGVAR_HIST_BINS,
+                                       min=LOGVAR_HIST_MIN, max=LOGVAR_HIST_MAX).double()
+            if train:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
-                scaler.step(optimizer)
+                # DDP has already all-reduced the gradients, so every rank computes
+                # the same norm here and no further reduction is needed.
+                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                # Skip the step outright rather than trusting GradScaler alone to
+                # notice: a non-finite gradient that lands in the weights is
+                # unrecoverable, and the count makes instability visible.
+                if torch.isfinite(gnorm):
+                    scaler.step(optimizer)
+                    grad_norms.append(gnorm.item())
+                    clipped += int(gnorm.item() > GRAD_CLIP)
+                else:
+                    grad_skips += 1
                 scaler.update()
-            total_loss += loss.item()
-            total_geom += l_geom.item()
-            total_triangle += l_triangle.item()
-            if l_ea is not None:
-                total_ea_norm += l_ea.item()
-                total_ea_weighted_norm += l_ea_weighted.item()
-                total_ea_nll += l_ea_nll.item()
-                total_ea_weighted_nll += l_ea_weighted_nll.item()
-                total_ea_tail_weight += ea_tail_weight.mean().item()
-                if ea_log_var is not None:
-                    total_ea_log_var += ea_log_var.detach().mean().item()
-                    total_ea_sigma_norm += torch.exp(0.5 * ea_log_var.detach()).mean().item()
-                # Denormalized Ea MAE (kcal/mol) for human-readable tracking.
-                total_ea_mae += (ea_mean_norm.detach() - ea_target_norm).abs().mean().item() * ea_std
-            n_batches += 1
-    nb = max(n_batches, 1)
-    return {
-        "loss": total_loss / nb,
-        "geom": total_geom / nb,
-        "triangle": total_triangle / nb,
-        "ea_mae": total_ea_mae / nb,
-        "ea_norm": total_ea_norm / nb,
-        "ea_weighted_norm": total_ea_weighted_norm / nb,
-        "ea_nll": total_ea_nll / nb,
-        "ea_weighted_nll": total_ea_weighted_nll / nb,
-        "ea_tail_weight": total_ea_tail_weight / nb,
-        "ea_log_var": total_ea_log_var / nb,
-        "ea_sigma_norm": total_ea_sigma_norm / nb,
-        "ea_sigma_kcal": (total_ea_sigma_norm / nb) * ea_std,
-    }
+            bs = batch["mask"].shape[0]
+            count += bs
+            for k, v in metrics.items():
+                sums[k] = sums.get(k, 0.0) + v.item() * bs
+    all_reduce_sum(logvar_hist)
+    reduced = reduce_metrics(sums, count, device)
+    reduced["logvar"] = logvar_summary(logvar_hist)
+    reduced["grad_skips"] = grad_skips
+    # clip_rate pinned at 1.00 means the clip, not the schedule, is setting every
+    # step size. Measured and dismissed as a lever on the legacy pipeline (a
+    # 1/5/15 sweep moved val MAE by 0.0024 A, under the 0.0141 A noise floor),
+    # but it is cheap to keep watching.
+    reduced["grad_norm"] = ({"clip_rate": clipped / max(len(grad_norms), 1),
+                             **percentiles(grad_norms)} if grad_norms else None)
+    return reduced
 
-def train_pipeline(config):
-    device = resolve_device(config)
-    configure_torch_runtime(device)
-    os.makedirs(config["save_dir"], exist_ok=True)
-    print("="*70); print(" PSI FULL PIPELINE (v2) "); print("="*70)
-    extract_raw_data(config)
-    samples, atom_vocab, atom_types_map = build_reaction_samples(config)
-    if len(samples) == 0:
-        print("Error: No complete reaction triplets found.")
-        return
-    n_total = len(samples)
-    train_indices, val_indices, split_report = make_train_val_split(samples, config)
-    stats = compute_normalization(samples, train_indices)
-    train_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, is_train=True)
-    eval_dataset = ReactionDataset(config, samples, atom_vocab, atom_types_map, stats, is_train=False)
-    train_subset = Subset(train_dataset, train_indices)
-    val_subset = Subset(eval_dataset, val_indices)
-    loader_kwargs = {
-        "batch_size": config["batch_size"],
-        "num_workers": config["num_workers"],
-        "pin_memory": config["pin_memory"] and device.type == "cuda",
-    }
-    if config["num_workers"] > 0:
-        loader_kwargs["persistent_workers"] = True
-    # --- Fix 3: Error-tail oversampling via WeightedRandomSampler ---
-    # Instead of piecewise loss multipliers (which cause gradient shocks),
-    # we physically oversample high-barrier reactions so the EGNN sees them
-    # more often per epoch, forcing geometric exposure.
-    if config.get("tail_oversampling_enabled", False):
-        from torch.utils.data import WeightedRandomSampler
-        sample_weights = []
-        tail_thresh = config.get("tail_oversample_threshold", 100.0)
-        mid_thresh = config.get("tail_mid_threshold", 80.0)
-        tail_factor = config.get("tail_oversample_factor", 5.0)
-        mid_factor = config.get("tail_mid_factor", 2.0)
-        for idx in train_indices:
-            ea = samples[idx]["Ea_raw"]
-            if ea >= tail_thresh:
-                sample_weights.append(tail_factor)
-            elif ea >= mid_thresh:
-                sample_weights.append(mid_factor)
-            else:
-                sample_weights.append(1.0)
-        sampler = WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(train_indices),  # same epoch size
-            replacement=True,
-        )
-        n_tail = sum(1 for w in sample_weights if w >= tail_factor)
-        n_mid = sum(1 for w in sample_weights if mid_factor <= w < tail_factor)
-        print(f"  Tail oversampling: {n_tail} extreme (>={tail_thresh}, {tail_factor}x), "
-              f"{n_mid} mid ({mid_thresh}-{tail_thresh}, {mid_factor}x), "
-              f"{len(sample_weights) - n_tail - n_mid} base (1x)")
-        train_loader = DataLoader(train_subset, sampler=sampler, **loader_kwargs)
-    else:
-        train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_subset, shuffle=False, **loader_kwargs)
-    eval_loader = DataLoader(Subset(eval_dataset, list(range(n_total))), shuffle=False, **loader_kwargs)
-    num_atom_types = len(atom_vocab)
-    model = PSI(config, num_atom_types).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {n_params:,}")
-    optimizer = build_optimizer(model, config)
-    if hasattr(model, "ea_head"):
-        print(f"Learning rates: base={config['lr']:.2e}, ea_head={config['ea_head_lr']:.2e}")
-    scheduler = PlateauWarmupScheduler(
-        optimizer, warmup_epochs=config["warmup_epochs"], factor=0.5, patience=15, min_lr=1e-6
-    )
-    use_amp = config["amp"] and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    metadata = {
-        "atom_vocab": atom_vocab,
-        "aphys_mean": stats["aphys_mean"].tolist(),
-        "aphys_std": stats["aphys_std"].tolist(),
-        "ea_mean": stats["ea_mean"],
-        "ea_std": stats["ea_std"],
-        "ea_uncertainty_enabled": bool(config.get("ea_uncertainty_enabled", True)),
-        "ea_head_output_dim": 2 if config.get("ea_uncertainty_enabled", True) else 1,
-        "ea_log_var_min": float(config.get("ea_log_var_min", -5.0)),
-        "ea_log_var_max": float(config.get("ea_log_var_max", 4.0)),
-        "de_rxn_mean": stats["de_rxn_mean"],
-        "de_rxn_std": stats["de_rxn_std"],
-        "efeat_mean": stats["efeat_mean"].tolist(),
-        "efeat_std": stats["efeat_std"].tolist(),
-        "split_summary": split_report,
-        "config_snapshot": {
-            k: v for k, v in config.items()
-            if isinstance(v, (int, float, str, bool, list, tuple))
-        },
-    }
-    print(f"\nTraining for up to {config['epochs']} epochs (patience={config['patience']})...")
-    detach_status = "detached features" if config.get("ea_detach_during_warmup", False) else "fully attached features"
-    print(
-        f"  Ea head starts at epoch {config['ea_loss_start_epoch']} on {detach_status}; "
-        f"full joint Ea starts after epoch {config['ea_warmup_epochs']}."
-    )
-    if config.get("ea_uncertainty_enabled", True):
-        print(
-            f"  Ea uncertainty: Gaussian NLL with log_var clamp "
-            f"[{config['ea_log_var_min']}, {config['ea_log_var_max']}]."
-        )
-    if config.get("ea_tail_weighting_enabled", False):
-        print(
-            f"  Phase 2 high-Ea weighting: {config['ea_tail_weight_mode']} "
-            f"bins={config['ea_tail_weight_bins']} values={config['ea_tail_weight_values']} "
-            f"max={config['ea_tail_weight_max']}."
-        )
-    print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>11} | {'T.Geom':>8} | {'V.Geom':>8} | {'T.EaMAE':>8} | {'V.EaMAE':>8} | {'LR':>10}")
-    print("-" * 95)
-    best_val_loss = float('inf')
-    patience_counter = 0
-    history = []
-    best_model_path = os.path.join(config["save_dir"], "psi_best.pt")
-    latest_model_path = os.path.join(config["save_dir"], "psi_latest.pt")
-    start_epoch = 1
-    resumed_training_state = False
-    ckpt = None
 
-    if False: # os.path.exists(latest_model_path):
-        print(f"Resuming from checkpoint {latest_model_path}...")
-        ckpt = torch.load(latest_model_path, map_location=device, weights_only=False)
-        load_info = load_checkpoint_model_state(model, ckpt["model_state_dict"], config)
-        old_ea_dim = infer_ea_head_output_dim(ckpt["model_state_dict"])
-        if load_info["migrated"]:
-            print(
-                "Loaded previous scalar Ea head into the new uncertainty head "
-                f"(old output dim={old_ea_dim}); optimizer/scheduler reset."
-            )
-        elif not load_info["exact"]:
-            print("Loaded compatible checkpoint weights, but reset optimizer/scheduler due to shape changes.")
-            if load_info.get("error"):
-                print(load_info["error"])
-            if load_info["skipped"]:
-                print(f"Skipped {len(load_info['skipped'])} incompatible tensors.")
-        else:
-            start_epoch = ckpt["epoch"] + 1
-            best_val_loss = ckpt["best_val_loss"]
-            patience_counter = ckpt["patience_counter"]
-            history = ckpt.get("history", [])
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                resumed_training_state = True
-                print(f"Resumed at epoch {start_epoch} (best val_select: {best_val_loss:.4f})")
-            except (KeyError, ValueError) as exc:
-                start_epoch = 1
-                best_val_loss = float('inf')
-                patience_counter = 0
-                history = []
-                print(f"Checkpoint model loaded, but optimizer/scheduler state was reset: {exc}")
+# =============================================================================
+# Training
+# =============================================================================
+def prepare_data(verbose):
+    """Samples, split and normalisation. Deterministic, so every rank agrees.
 
-    from torch.optim.swa_utils import AveragedModel, SWALR
-    swa_enabled = config.get("swa_enabled", False)
-    swa_start = config.get("swa_start", config.get("epochs", 800))
-    swa_model = AveragedModel(model) if swa_enabled else None
-    swa_scheduler = SWALR(optimizer, swa_lr=config.get("lr", 1.5e-4) * 0.5) if swa_enabled else None
-    if swa_enabled and resumed_training_state:
-        if "swa_model_state_dict" in ckpt:
-            swa_model.load_state_dict(ckpt["swa_model_state_dict"])
-        if "swa_scheduler_state_dict" in ckpt and swa_scheduler is not None:
-            swa_scheduler.load_state_dict(ckpt["swa_scheduler_state_dict"])
+    Called INSIDE each worker rather than passed through mp.spawn: spawn pickles
+    its arguments to every child, and 40k samples carrying several [30, 30]
+    float32 arrays each is well over a gigabyte per rank, paid twice (once to
+    serialise in the parent, once to materialise in the child) before training
+    starts. Loading from the on-disk cache in each worker skips both copies.
+    """
+    samples, atom_vocab = build_samples()
+    samples, dropped = filter_to_bond_orders(samples, load_bond_orders())
+    train_idx, val_idx = make_split(samples)
+    stats = compute_normalization(samples, train_idx)
+    if verbose:
+        # The dropped ids are recorded because make_split is POSITIONAL: it bins by
+        # list index and shuffles each bin, so removing any reaction re-deals every
+        # assignment rather than just its own. A run that dropped these does not
+        # share a validation set with one that did not, and without the ids there
+        # is no way to compare the two on their intersection afterwards.
+        with open(SPLIT_PATH, "w") as fh:
+            json.dump({"seed": SPLIT_SEED, "val_split": VAL_SPLIT,
+                       "n_total": len(samples), "n_train": len(train_idx),
+                       "n_val": len(val_idx), "dropped_rxn_ids": dropped,
+                       "ea_mean": stats["ea_mean"], "ea_std": stats["ea_std"],
+                       "val_rxn_ids": [samples[i]["rxn_id"] for i in val_idx]}, fh)
+        print(f"[split] recorded to {SPLIT_PATH} ({len(dropped)} dropped)")
+    return samples, atom_vocab, train_idx, val_idx, stats
 
-    for epoch in range(start_epoch, config["epochs"] + 1):
-        train_metrics = run_epoch(model, train_loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True)
-        if swa_enabled and epoch >= swa_start:
+
+def train_worker(rank, world_size):
+    # Distributed ONLY when there is more than one GPU. A single P100 session has
+    # no peer to reduce with, and initialising an NCCL group of size 1 is a real
+    # failure/hang point in a Kaggle notebook -- so it is skipped entirely rather
+    # than made a no-op. Every collective downstream is already guarded
+    # (all_reduce_sum), so the training code below is byte-identical either way.
+    distributed = world_size > 1
+    if distributed:
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    is_main = rank == 0
+
+    # Silence the duplicate diagnostics from every non-zero rank; the work itself
+    # is identical and deterministic on all of them.
+    stdout = sys.stdout
+    sys.stdout = stdout if is_main else open(os.devnull, "w")
+    samples, atom_vocab, train_idx, val_idx, stats = prepare_data(is_main)
+    orders = load_bond_orders()
+    sys.stdout = stdout
+
+    # Kaggle GPU setup. TF32 and cudnn autotuning cost nothing on Turing and pay
+    # off immediately if the session lands on a newer accelerator.
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    dataset = ReactionDataset(samples, stats, orders)
+    # With one GPU there is nothing to sample across: use plain shuffling. The
+    # DistributedSampler path is only taken when it has real shards to build.
+    train_sampler = (DistributedSampler(train_idx, num_replicas=world_size, rank=rank,
+                                        shuffle=True, drop_last=True)
+                     if distributed else None)
+    train_loader = DataLoader(
+        Subset(dataset, train_idx), batch_size=BATCH_SIZE,
+        sampler=train_sampler, shuffle=train_sampler is None,
+        num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True,
+        prefetch_factor=PREFETCH_FACTOR, drop_last=True)
+    # Validation is sharded by slicing, not by DistributedSampler: the sampler pads
+    # the last shard with duplicates to equalise rank sizes, which would silently
+    # double-count a few reactions in the metric this run is selected on.
+    val_loader = DataLoader(
+        Subset(dataset, val_idx[rank::world_size]), batch_size=BATCH_SIZE,
+        shuffle=False, num_workers=NUM_WORKERS, pin_memory=True,
+        persistent_workers=True, prefetch_factor=PREFETCH_FACTOR)
+
+    model = PSI(len(atom_vocab)).to(device)
+    if is_main:
+        print(f"[model] {sum(p.numel() for p in model.parameters()):,} parameters")
+    # DDP only wraps a real multi-GPU group -- with one GPU it would just add a
+    # gradient-sync hook that reduces against nobody. The train loop calls the
+    # model through `net` either way.
+    net = DDP(model, device_ids=[rank]) if distributed else model
+    # torch.compile lowers through Triton, which supports compute capability 7.0
+    # and up. Kaggle's P100 is Pascal (6.0), where inductor fails outright at the
+    # first kernel; T4 is Turing (7.5) and compiles fine. Checked rather than
+    # attempted-and-caught: this is a capability fact, not an error condition.
+    capability = torch.cuda.get_device_capability(rank)
+    compiled = torch.compile(net) if capability >= (7, 0) else net
+    if is_main:
+        print(f"[gpu] {torch.cuda.get_device_name(rank)} sm_{capability[0]}{capability[1]} "
+              f"| torch.compile {'on' if capability >= (7, 0) else 'OFF (needs sm_70+)'} "
+              f"| fp16 AMP | TF32 {'on' if capability >= (8, 0) else 'n/a'}")
+
+    # The Ea head gets its own group: it reads detached features, so it is a
+    # separate regression problem that tolerates a faster rate.
+    ea_params = list(model.ea_head.parameters())
+    ea_ids = {id(p) for p in ea_params}
+    base_params = [p for p in model.parameters() if id(p) not in ea_ids]
+    optimizer = torch.optim.AdamW([
+        {"params": base_params, "lr": LR, "weight_decay": WEIGHT_DECAY},
+        {"params": ea_params, "lr": EA_HEAD_LR, "weight_decay": EA_HEAD_WEIGHT_DECAY},
+    ], fused=True)
+    scheduler = WarmupCosine(optimizer)
+    scaler = torch.amp.GradScaler()
+    swa_model = torch.optim.swa_utils.AveragedModel(model)
+    swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=LR * 0.5)
+
+    start_epoch, best, patience, history = 1, float("inf"), 0, []
+    if os.path.exists(LATEST_CKPT):
+        ck = torch.load(LATEST_CKPT, map_location=device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        optimizer.load_state_dict(ck["optimizer"])
+        scheduler.load_state_dict(ck["scheduler"])
+        scaler.load_state_dict(ck["scaler"])
+        swa_model.load_state_dict(ck["swa_model"])
+        swa_scheduler.load_state_dict(ck["swa_scheduler"])
+        start_epoch, best = ck["epoch"] + 1, ck["best"]
+        patience, history = ck["patience"], ck["history"]
+        if is_main:
+            print(f"[resume] epoch {start_epoch}, best val_select {best:.4f}")
+
+    ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
+    for epoch in range(start_epoch, EPOCHS + 1):
+        t0 = time.time()
+        # Only a DistributedSampler needs its epoch set (it seeds the per-rank
+        # shuffle). Plain shuffling on one GPU reshuffles itself each epoch.
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        tr = run_epoch(compiled, train_loader, optimizer, scaler, device,
+                       ea_mean, ea_std, True)
+        # The averaged weights MUST be updated before they are validated. Reading
+        # swa_model.module first would, on the very first SWA epoch, evaluate the
+        # copy AveragedModel took at construction time -- i.e. the untrained
+        # initialisation -- and record it as this epoch's score.
+        if epoch >= SWA_START:
             swa_model.update_parameters(model)
-            val_metrics = run_epoch(swa_model.module, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
-        else:
-            val_metrics = run_epoch(model, val_loader, None, scaler, device, config, use_amp, epoch, stats, is_train=False)
-        
-        ea_active = epoch > config["ea_warmup_epochs"]
-        if config["ea_warmup_epochs"] > 0 and epoch == config["ea_warmup_epochs"] + 1:
-            best_val_loss = float('inf')
-            patience_counter = 0
-            # val_select gains the ea_norm term here, so its scale shifts up.
-            # Reset the plateau scheduler's internal best too, or it keeps
-            # comparing against the (lower) geometry-only best and never sees
-            # an "improvement" again. (No-op when ea_warmup_epochs=0, since Ea
-            # is in val_select from epoch 1 and there's no metric discontinuity.)
-            scheduler.plateau.best = float('inf')
-            print("\n--- Ea joint warmup ended. Resetting early stopping tracking ---")
-
-        val_select = val_metrics["geom"]
-        if ea_active:
-            val_select = val_select + config["ea_select_weight"] * val_metrics["ea_norm"]
-
-        if swa_enabled and epoch >= swa_start:
             swa_scheduler.step()
         else:
-            scheduler.step(val_select)
-        current_lr = optimizer.param_groups[0]['lr']
-        current_ea_lr = optimizer.param_groups[-1]['lr']
+            scheduler.step()
+        # Past SWA_START the averaged weights are what gets selected and saved, so
+        # they are what must be measured.
+        eval_model = swa_model.module if epoch >= SWA_START else compiled
+        va = run_epoch(eval_model, val_loader, None, scaler, device, ea_mean, ea_std, False)
 
-        history.append({
-            "epoch": epoch,
-            "train_loss": train_metrics["loss"],
-            "val_loss": val_metrics["loss"],
-            "val_select": val_select,
-            "train_geom": train_metrics["geom"],
-            "val_geom": val_metrics["geom"],
-            "train_triangle": train_metrics["triangle"],
-            "val_triangle": val_metrics["triangle"],
-            "train_ea_mae": train_metrics["ea_mae"],
-            "train_ea_norm": train_metrics["ea_norm"],
-            "train_ea_weighted_norm": train_metrics["ea_weighted_norm"],
-            "train_ea_nll": train_metrics["ea_nll"],
-            "train_ea_weighted_nll": train_metrics["ea_weighted_nll"],
-            "train_ea_tail_weight": train_metrics["ea_tail_weight"],
-            "train_ea_log_var": train_metrics["ea_log_var"],
-            "train_ea_sigma_kcal": train_metrics["ea_sigma_kcal"],
-            "val_ea_mae": val_metrics["ea_mae"],
-            "val_ea_norm": val_metrics["ea_norm"],
-            "val_ea_weighted_norm": val_metrics["ea_weighted_norm"],
-            "val_ea_nll": val_metrics["ea_nll"],
-            "val_ea_weighted_nll": val_metrics["ea_weighted_nll"],
-            "val_ea_tail_weight": val_metrics["ea_tail_weight"],
-            "val_ea_log_var": val_metrics["ea_log_var"],
-            "val_ea_sigma_kcal": val_metrics["ea_sigma_kcal"],
-            "lr": current_lr,
-            "ea_lr": current_ea_lr,
-        })
-        improved = val_select < best_val_loss
-        if improved:
-            best_val_loss = val_select
-            best_state_dict = swa_model.module.state_dict() if (swa_enabled and epoch >= swa_start) else model.state_dict()
-            torch.save({"model_state_dict": best_state_dict, "metadata": metadata}, best_model_path)
-        patience_counter = 0 if improved else patience_counter + 1
+        # Selected on raw distance MAE, never on the loss: with the uncertainty head
+        # the loss is an NLL whose precision term grows without bound as the model
+        # gets confident, so it rises on validation even while accuracy improves.
+        val_select = va["geom_mae_A"] + EA_SELECT_WEIGHT * va["ea_mae"] / ea_std
+        improved = val_select < best
+        best = min(best, val_select)
+        patience = 0 if improved else patience + 1
 
-        save_dict = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "epoch": epoch,
-            "best_val_loss": best_val_loss,
-            "patience_counter": patience_counter,
-            "metadata": metadata,
-            "history": history
-        }
-        if swa_enabled and swa_model is not None:
-            save_dict["swa_model_state_dict"] = swa_model.state_dict()
-            if swa_scheduler is not None:
-                save_dict["swa_scheduler_state_dict"] = swa_scheduler.state_dict()
-        torch.save(save_dict, latest_model_path)
-
-        if epoch % config["print_every"] == 0 or epoch == 1 or improved:
-            marker = " *" if improved else ""
-            print(f"{epoch:6d} | {train_metrics['loss']:11.4f} | {val_metrics['loss']:11.4f} | "
-                  f"{train_metrics['geom']:8.5f} | {val_metrics['geom']:8.5f} | "
-                  f"{train_metrics['ea_mae']:8.3f} | {val_metrics['ea_mae']:8.3f} | "
-                  f"{current_lr:10.2e}{marker}")
-        if patience_counter >= config["patience"]:
-            print(f"\nEarly stopping at epoch {epoch} (no improvement for {config['patience']} epochs)")
+        if is_main:
+            history.append({"epoch": epoch, "lr": optimizer.param_groups[0]["lr"],
+                            "val_select": val_select,
+                            **{f"train_{k}": v for k, v in tr.items()},
+                            **{f"val_{k}": v for k, v in va.items()}})
+            print(f"{epoch:5d} | trGeom {tr['geom_mae_A']:.4f} | vaGeom {va['geom_mae_A']:.4f} "
+                  f"| gap {va['geom_mae_A']-tr['geom_mae_A']:.4f} "
+                  f"| vaRMSD {va['rmsd_A']:.3f}A | flip {va['chirality_flip']*100:4.1f}% "
+                  f"| trEa {tr['ea_mae']:6.3f} | vaEa {va['ea_mae']:6.3f} "
+                  f"| lvFloor {tr['logvar']['pinned_lo']*100:4.1f}% "
+                  f"| clip {tr['grad_norm']['clip_rate']*100:3.0f}% "
+                  f"| lr {optimizer.param_groups[0]['lr']:.2e} "
+                  f"| {time.time()-t0:5.1f}s{' *' if improved else ''}", flush=True)
+            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
+                        "swa_model": swa_model.state_dict(),
+                        # Without this, resuming inside the SWA phase restarts
+                        # SWALR's anneal from scratch and re-raises the LR that
+                        # weight averaging is supposed to be holding steady.
+                        "swa_scheduler": swa_scheduler.state_dict(), "epoch": epoch,
+                        "best": best, "patience": patience, "history": history,
+                        "stats": stats, "atom_vocab": atom_vocab}, LATEST_CKPT)
+            if improved:
+                torch.save({"model": (swa_model.module if epoch >= SWA_START else model).state_dict(),
+                            "stats": stats, "atom_vocab": atom_vocab, "epoch": epoch,
+                            "val_select": val_select}, BEST_CKPT)
+            with open(HISTORY_PATH, "w") as fh:
+                json.dump(history, fh, indent=2)
+        if patience >= PATIENCE:
             break
-    history_path = os.path.join(config["save_dir"], "training_history.json")
-    with open(history_path, "w") as f:
-        json.dump(history, f, indent=2)
-    print(f"\nTraining history saved to {history_path}")
-    print(f"\nLoading best model (best val_select={best_val_loss:.4f})...")
-    checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    # =========================================================================
-    # Post-training: predict TS geometries, then compute Ea via physics
-    # =========================================================================
-    print("\n" + "="*70); print(" EVALUATION (geometry + learned Ea + physics baseline) "); print("="*70)
+
+    if is_main:
+        print(f"[done] best val_select {best:.4f}; checkpoints in {WORK_DIR}")
+        print("[done] Save this notebook's output as a Dataset and re-run to "
+              "continue from psi_latest.pt.")
+    if distributed:
+        dist.destroy_process_group()
+
+
+def stage_train():
+    world_size = torch.cuda.device_count()
+    if world_size == 0:
+        raise RuntimeError(
+            "No CUDA device. Set the Kaggle accelerator to GPU P100 or GPU T4 x2.")
+    # Build the sample cache and prepare the bond orders HERE, in the parent, so
+    # anything missing surfaces once with a readable message instead of as a spawn
+    # traceback from two ranks at once. The parent then drops its copy; each worker
+    # reloads from the on-disk cache.
+    samples, _ = build_samples()
+    n_samples = len(samples)
+    del samples
+    # Build the xTB reaction-centre cache on first use rather than making the user
+    # run a separate stage, save a dataset, and re-attach it. This is a one-time
+    # ~1.5-2 h CPU precompute; it lands in WORK_DIR and every resume reuses it, so
+    # subsequent sessions skip straight to training. NOT a fallback -- it produces
+    # the same GFN2-xTB cache the `bond-orders` stage would, never a substitute.
+    if find_bond_order_cache() is None:
+        print("[train] no bond-order cache found -> building it now (one-time, "
+              "~1.5-2 h on CPU; save this notebook's output as a Dataset so later "
+              "sessions skip it).", flush=True)
+        stage_bond_orders()
+    load_bond_orders()
+    name = torch.cuda.get_device_name(0)
+    print(f"[train] {n_samples} samples | {world_size}x {name} | "
+          f"global batch {BATCH_SIZE * world_size}")
+    # Single GPU runs IN-PROCESS. mp.spawn would have to pickle train_worker out
+    # of __main__, which does not exist as an importable module inside a notebook
+    # cell -- so on a one-GPU Kaggle session (P100) spawning fails outright, and
+    # even where it works it buys nothing. The worker body is identical either
+    # way: a world_size=1 process group makes every all_reduce a no-op, so there
+    # is one training code path, not two.
+    launch = (lambda: train_worker(0, 1)) if world_size == 1 else (
+        lambda: mp.spawn(train_worker, args=(world_size,), nprocs=world_size, join=True))
+    launch()
+
+
+def stage_eval():
+    """Score the best checkpoint per reaction and write RESULTS_PATH.
+
+    Kept as its own stage rather than tacked onto the end of training: on Kaggle a
+    session is cut long before the epoch budget runs out, so an evaluation that
+    only fires after the final epoch would essentially never run.
+
+    Reports the MEDIAN alongside the mean for every geometry metric. On the last
+    converged legacy run those were 0.0983 A and 0.1241 A -- a 26% spread that
+    says a structurally hard minority carries the error. Reporting only the mean
+    hides that; reporting only the median (as the literature comparison invites)
+    flatters it.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ck = torch.load(BEST_CKPT, map_location=device, weights_only=False)
+    samples, atom_vocab, train_idx, val_idx, stats = prepare_data(True)
+    orders = load_bond_orders()
+    model = PSI(len(atom_vocab)).to(device)
+    model.load_state_dict(ck["model"])
     model.eval()
-    # Step 1: collect predicted TS distance matrices + learned Ea for all reactions.
-    pred_dists_map = {}   # rxn_id -> (n, n) numpy pred dist
-    ea_neural_map = {}    # rxn_id -> learned Ea (kcal/mol, denormalized)
-    ea_sigma_map = {}     # rxn_id -> learned predictive sigma (kcal/mol)
+    print(f"[eval] checkpoint from epoch {ck['epoch']} "
+          f"(val_select {ck['val_select']:.4f})")
+
+    val_set = set(val_idx)
+    loader = DataLoader(ReactionDataset(samples, stats, orders), batch_size=BATCH_SIZE,
+                        shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
-    geom_results = []
-    val_rxn_ids = {samples[vi]["rxn_id"] for vi in val_indices}
+    records, index = [], 0
     with torch.no_grad():
-        for batch in eval_loader:
-            (
-                DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, _Ea,
-                de_rxn, energy_feats, _risk_pair_mask,
-                _risk_score, _risk_penalty, _complexity_flag, _risky_chem_flag,
-            ) = move_batch_to_device(batch, device)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, _, ea_pred_norm, _ = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats)
-            ea_pred_kcal = None
-            ea_sigma_kcal = None
-            if ea_pred_norm is not None:
-                ea_mean_norm, ea_log_var = split_ea_prediction(ea_pred_norm, config)
-                ea_pred_kcal = (ea_mean_norm.float().cpu().numpy() * ea_std + ea_mean)
-                if ea_log_var is not None:
-                    ea_sigma_kcal = torch.exp(0.5 * ea_log_var.float()).cpu().numpy() * ea_std
-            for i in range(len(batch["rxn_id"])):
-                rxn_id = batch["rxn_id"][i]
-                n = int(mask[i].sum().item())
-                di = DI[i, :n, :n].cpu().numpy()
-                dp = p_DTS[i, :n, :n].cpu().numpy()
-                dt = DTS[i, :n, :n].cpu().numpy()
-                gm = geom_mask[i, :n, :n].cpu().numpy()
-                d_abs = np.abs(dp - dt)
-                d_mae = (d_abs * gm).sum().item() / max(float(gm.sum()), 1.0)
-                d_mae_all = d_abs.mean().item()
-                split = "val" if rxn_id in val_rxn_ids else "train"
-                pred_dists_map[rxn_id] = dp
-                if ea_pred_kcal is not None:
-                    ea_neural_map[rxn_id] = float(ea_pred_kcal[i])
-                if ea_sigma_kcal is not None:
-                    ea_sigma_map[rxn_id] = float(ea_sigma_kcal[i])
-                geom_results.append({
-                    "rxn_id": rxn_id, "split": split, "n_atoms": n,
-                    "dist_MAE": d_mae, "dist_MAE_all": d_mae_all,
-                    "D_I": di.tolist(), "D_pred": dp.tolist(), "D_true": dt.tolist(),
-                    "geom_mask": gm.tolist(),
-                    "atom_types": atom_types_map[rxn_id],
+        for batch in loader:
+            batch = to_device(batch, device)
+            with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
+                D_pred, x_ts, logvar, ea = model(
+                    batch["D_R"], batch["D_I"], batch["D_P"], batch["mask"],
+                    batch["atom_ids"], batch["atom_phys"], batch["de_rxn"],
+                    batch["energy_feats"], batch["c_I"], batch["rc_atom"])
+            mask = batch["mask"]
+            N = mask.shape[1]
+            eye = torch.eye(N, device=device).unsqueeze(0)
+            m2d = mask.unsqueeze(-1) * mask.unsqueeze(-2) * (1.0 - eye)
+            # Per-REACTION, not batch-averaged: the distribution is the point.
+            mae = ((D_pred.float() - batch["D_TS"]).abs() * m2d).sum((1, 2)) \
+                / m2d.sum((1, 2)).clamp(min=1.0)
+            x, y, x_ref = kabsch_align_torch(x_ts.float(), batch["c_TS"], mask)
+            proper = per_atom_rmsd(x, y, mask)
+            reflected = per_atom_rmsd(x_ref, y, mask)
+            flip = (reflected < CHIRALITY_FLIP_RATIO * proper) & (proper > CHIRALITY_MIN_RMSD)
+            ea_kcal = ea.float() * ea_std + ea_mean
+            lv = (logvar.float() * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+            for i in range(mask.shape[0]):
+                records.append({
+                    "rxn_id": batch["rxn_id"][i],
+                    "split": "val" if index in val_set else "train",
+                    "n_atoms": int(mask[i].sum().item()),
+                    "dist_MAE": mae[i].item(), "rmsd": proper[i].item(),
+                    "rmsd_reflected": reflected[i].item(),
+                    "chirality_flip": bool(flip[i].item()),
+                    "mean_logvar": lv[i].item(),
+                    "Ea_true": batch["Ea"][i].item(), "Ea_pred": ea_kcal[i].item(),
+                    "Ea_error": abs(ea_kcal[i].item() - batch["Ea"][i].item()),
                 })
-    # Step 2: recover 3D coords from predicted distance matrices and compute
-    # physics-based Ea using Marcus theory + Hammond postulate.
-    print("\n[PhysicsEa] Recovering 3D coordinates from predicted distance matrices...")
-    ea_calculator = PhysicsEaCalculator(
-        bond_scale=config["fragment_bond_scale"],
-        spectator_threshold=config["spectator_threshold"],
-    )
-    # Build per-sample predicted TS coords + physics features (ordered by sample index)
-    train_X, train_y = [], []
-    all_coords_ts = {}  # rxn_id -> predicted TS coords (n, 3)
-    for idx in range(n_total):
-        s = samples[idx]
-        rxn_id = s["rxn_id"]
-        n = s["n_atoms"]
-        pred_dist = pred_dists_map[rxn_id]
-        atom_types = s["atom_types"]
-        # Post-process the predicted distance matrix
-        pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
-        np.fill_diagonal(pred_dist, 0.0)
-        pred_dist = clamp_steric_collisions(pred_dist, atom_types)
-        # Recover 3D coordinates from the full distance matrix so inter-fragment
-        # predictions are preserved.
-        c_R = np.asarray(s["c_R"][:n], dtype=np.float64)
-        c_P = np.asarray(s["c_P"][:n], dtype=np.float64)
-        c_I = (kabsch_align_reactant_fragments(c_R, c_P, atom_types, n, config["fragment_bond_scale"])[:n] + c_P[:n]) / 2.0
-        pred_coords = mds_aligned(pred_dist, reference_coords=c_I)
-        all_coords_ts[rxn_id] = pred_coords
-    # Compute physics features for train split, fit OLS
-    train_samples_ordered = [samples[i] for i in train_indices]
-    train_coords_ordered = [all_coords_ts[samples[i]["rxn_id"]] for i in train_indices]
-    train_X, train_y = ea_calculator.compute_features_batch(train_samples_ordered, train_coords_ordered, config)
-    ea_calculator.fit(train_X, train_y)
-    # Step 3: assemble results. Primary Ea is the learned neural head; the
-    # physics calculator (Marcus/Hammond/OLS) is reported alongside as a baseline.
-    samples_by_id = {s["rxn_id"]: s for s in samples}
-    results = []
-    for gr in geom_results:
-        rxn_id = gr["rxn_id"]
-        s = samples_by_id[rxn_id]
-        n = s["n_atoms"]
-        c_R = np.asarray(s["c_R"][:n], dtype=np.float64)
-        c_P = np.asarray(s["c_P"][:n], dtype=np.float64)
-        c_TS_pred = all_coords_ts[rxn_id]
-        de_rxn = float(s["energy_feats_raw"][1])
-        ea_true = s["Ea_raw"]
-        # Physics baseline.
-        ea_physics = ea_calculator.predict_single(c_R, c_TS_pred, c_P, s["atom_types"], n, de_rxn)
-        # Learned head (falls back to physics if EGNN/head disabled).
-        ea_pred = ea_neural_map.get(rxn_id, ea_physics)
-        ea_sigma = ea_sigma_map.get(rxn_id)
-        results.append({
-            **gr,
-            "Ea_true": ea_true, "Ea_pred": ea_pred,
-            "Ea_error": abs(ea_pred - ea_true),
-            "Ea_sigma_kcal": ea_sigma,
-            "Ea_pred_physics": ea_physics,
-            "Ea_error_physics": abs(ea_physics - ea_true),
-        })
-    # Save PhysicsEa coefficients into metadata for inference
-    metadata["physics_ea_coeffs"] = ea_calculator.coeffs.tolist()
-    train_results = [r for r in results if r["split"] == "train"]
-    val_results = [r for r in results if r["split"] == "val"]
-    def print_stats(name, res_list):
-        if not res_list: return
-        d_maes = [r["dist_MAE"] for r in res_list]
-        ea_trues = [r["Ea_true"] for r in res_list]
-        ea_preds = [r["Ea_pred"] for r in res_list]
-        ea_phys = [r["Ea_pred_physics"] for r in res_list]
-        corr = np.corrcoef(ea_trues, ea_preds)[0, 1] if len(ea_trues) > 1 else 0.0
-        r2 = _r2(ea_trues, ea_preds)
-        mae_neural = float(np.mean([r["Ea_error"] for r in res_list]))
-        r2_phys = _r2(ea_trues, ea_phys)
-        mae_phys = float(np.mean([r["Ea_error_physics"] for r in res_list]))
-        sigmas = [r.get("Ea_sigma_kcal") for r in res_list if r.get("Ea_sigma_kcal") is not None]
-        print(f"\n{name} ({len(res_list)} reactions):")
-        print(f"  Ea MAE (neural):   {mae_neural:8.2f} kcal/mol   |  R²: {r2:7.4f}   r: {corr:7.4f}")
-        if sigmas:
-            print(f"  Ea sigma (mean):   {float(np.mean(sigmas)):8.2f} kcal/mol   |  learned uncertainty")
-        print(f"  Ea MAE (physics):  {mae_phys:8.2f} kcal/mol   |  R²: {r2_phys:7.4f}   (baseline)")
-        print(f"  Dist MAE:          {np.mean(d_maes):8.4f} Å      |  std: {np.std(d_maes):.4f} Å")
-    print_stats("TRAIN SET", train_results)
-    print_stats("VALIDATION SET", val_results)
-    print_stats("ALL DATA", results)
-    print(f"\n{'Reaction':<15} {'Split':<6} {'Ea True':>10} {'Ea Pred':>10} {'Ea Err':>10} {'Dist MAE':>10}")
-    for r in sorted(results, key=lambda x: x["rxn_id"]):
-        print(f"{r['rxn_id']:<15} {r['split']:<6} {r['Ea_true']:10.2f} {r['Ea_pred']:10.2f} {r['Ea_error']:10.2f} {r['dist_MAE']:10.4f}")
-    output_path = os.path.join(config["save_dir"], "detailed_analysis.json")
-    with open(output_path, "w") as f:
-        json.dump(results, f, indent=2)
-    final_path = os.path.join(config["save_dir"], "psi_final.pt")
-    torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, final_path)
-    torch.save({"model_state_dict": model.state_dict(), "metadata": metadata}, best_model_path)
-    print(f"\nModel saved to {final_path}")
-    print(f"Predictions saved to {output_path}")
-    create_dashboard(output_path, config["save_dir"])
+                index += 1
 
-def predict_transition_state(config, reactant_path, product_path, model_path, output_path, xyz_path=None):
-    device = resolve_device(config)
-    configure_torch_runtime(device)
-    reactant = load_log_file(reactant_path)
-    product = load_log_file(product_path)
-    r_atoms = reactant["atoms"]
-    p_atoms = product["atoms"]
-    if len(r_atoms) != len(p_atoms):
-        raise ValueError("Reactant and product must have the same number of atoms in the same order.")
-    if len(r_atoms) > config["max_atoms"]:
-        raise ValueError(f"Prediction has {len(r_atoms)} atoms, but max_atoms is {config['max_atoms']}.")
-    r_types = [a["atom"] for a in r_atoms]
-    p_types = [a["atom"] for a in p_atoms]
-    if r_types != p_types:
-        raise ValueError("Reactant and product atom ordering/types differ. Align atom order before prediction.")
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    state_dict = checkpoint["model_state_dict"]
-    meta = checkpoint["metadata"]
-    atom_vocab = meta["atom_vocab"]
-    num_atom_types = max(atom_vocab.values())
-    aphys_mean = np.array(meta["aphys_mean"], dtype=np.float32)
-    aphys_std = np.array(meta["aphys_std"], dtype=np.float32)
-    # Ea / de_rxn normalization stats for the learned head (older checkpoints
-    # without a learned head won't have these -> neural Ea is then skipped).
-    ea_mean = meta.get("ea_mean")
-    ea_std = meta.get("ea_std")
-    de_rxn_mean = meta.get("de_rxn_mean", 0.0)
-    de_rxn_std = meta.get("de_rxn_std", 1.0)
-    efeat_mean = np.array(meta.get("efeat_mean", np.zeros(ENERGY_FEAT_DIM)), dtype=np.float32)
-    efeat_std = np.array(meta.get("efeat_std", np.ones(ENERGY_FEAT_DIM)), dtype=np.float32)
-    n = len(r_atoms)
-    c_R = padded_coords(r_atoms, config["max_atoms"])
-    c_P = padded_coords(p_atoms, config["max_atoms"])
+    def summarise(rows):
+        d = np.array([r["dist_MAE"] for r in rows])
+        rm = np.array([r["rmsd"] for r in rows])
+        e = np.array([r["Ea_error"] for r in rows])
+        return {"n": len(rows),
+                "dist_MAE_mean": float(d.mean()), "dist_MAE_median": float(np.median(d)),
+                "dist_MAE_p90": float(np.percentile(d, 90)),
+                "rmsd_mean": float(rm.mean()), "rmsd_median": float(np.median(rm)),
+                "Ea_MAE": float(e.mean()), "Ea_median": float(np.median(e)),
+                "Ea_RMSE": float(np.sqrt((e ** 2).mean())),
+                "chirality_flip_rate": float(np.mean([r["chirality_flip"] for r in rows]))}
 
-    c_R_aligned = kabsch_align_reactant_fragments(
-        c_R, c_P, r_types, n, config["fragment_bond_scale"]
-    )
-    c_I = np.zeros_like(c_R)
-    c_I[:n] = (c_R_aligned[:n] + c_P[:n]) / 2.0
+    summary = {"epoch": ck["epoch"],
+               "train": summarise([r for r in records if r["split"] == "train"]),
+               "val": summarise([r for r in records if r["split"] == "val"])}
+    with open(RESULTS_PATH, "w") as fh:
+        json.dump({"summary": summary, "records": records}, fh)
 
-    D_R = compute_distance_matrix(c_R)
-    D_P = compute_distance_matrix(c_P)
-    D_I = (D_R + D_P) / 2.0
-    align_fragments = choose_alignment_fragments(
-        c_R, c_P, r_types, n, config["fragment_bond_scale"]
-    )
-    geom_mask = geometry_pair_mask_from_fragments(align_fragments, config["max_atoms"])
-
-    mask = np.zeros(config["max_atoms"], dtype=np.float32)
-    mask[:n] = 1.0
-    atom_ids = np.zeros(config["max_atoms"], dtype=np.int64)
-    for i, atom_type in enumerate(r_types):
-        if atom_type not in atom_vocab:
-            raise KeyError(f"Atom type '{atom_type}' not in training vocab {sorted(atom_vocab)}.")
-        atom_ids[i] = atom_vocab[atom_type]
-    atom_phys = build_atom_physical_features(r_types, n, config["max_atoms"])
-    atom_phys_norm = (atom_phys - aphys_mean) / aphys_std
-    # Signed reaction energy (kcal/mol) -> z-scored input to the learned Ea head.
-    e_r = reactant["energy"] * config["hartree_to_kcal"]
-    e_p = product["energy"] * config["hartree_to_kcal"]
-    de_rxn = e_p - e_r
-    de_rxn_norm = (de_rxn - de_rxn_mean) / de_rxn_std
-    # 28D energy descriptor (composition, bond-angle stats, RC angles) for the Ea head.
-    energy_feats = build_energy_features(
-        r_types, n, c_R_aligned, c_P, e_r, e_p, config["fragment_bond_scale"]
-    )
-    energy_feats_norm = (energy_feats - efeat_mean) / efeat_std
-    model_config = dict(config)
-    checkpoint_ea_dim = infer_ea_head_output_dim(state_dict)
-    if checkpoint_ea_dim is not None:
-        model_config["ea_uncertainty_enabled"] = checkpoint_ea_dim == 2
-    model = PSI(model_config, num_atom_types).to(device)
-    model.load_state_dict(state_dict)
-    model.eval()
-    with torch.no_grad():
-        t_DR = torch.from_numpy(D_R).unsqueeze(0).to(device)
-        t_DI = torch.from_numpy(D_I).unsqueeze(0).to(device)
-        t_DP = torch.from_numpy(D_P).unsqueeze(0).to(device)
-        t_mask = torch.from_numpy(mask).unsqueeze(0).to(device)
-        t_atom_ids = torch.from_numpy(atom_ids).unsqueeze(0).to(device)
-        t_aphys = torch.from_numpy(atom_phys_norm).unsqueeze(0).to(device)
-        t_de_rxn = torch.tensor([de_rxn_norm], dtype=torch.float32, device=device)
-        t_efeats = torch.from_numpy(energy_feats_norm.astype(np.float32)).unsqueeze(0).to(device)
-        p_DTS, _, ea_pred_norm, _ = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_aphys, t_de_rxn, t_efeats)
-    # Learned Ea (denormalized); None if the checkpoint predates the head.
-    ea_neural = None
-    ea_sigma_kcal = None
-    if ea_pred_norm is not None and ea_mean is not None and ea_std is not None:
-        ea_mean_norm, ea_log_var = split_ea_prediction(ea_pred_norm, model_config)
-        ea_neural = float(ea_mean_norm.float().cpu().item() * ea_std + ea_mean)
-        if ea_log_var is not None:
-            ea_sigma_kcal = float(torch.exp(0.5 * ea_log_var.float()).cpu().item() * ea_std)
-    pred_dist = p_DTS[0, :n, :n].cpu().numpy()
-    pred_dist = np.maximum((pred_dist + pred_dist.T) / 2.0, 0.0)
-    np.fill_diagonal(pred_dist, 0.0)
-    c_I_real = c_I[:n]
-    pred_dist = clamp_steric_collisions(pred_dist, r_types[:n])
-    pred_dist = apply_spectator_constraints(
-        pred_dist,
-        D_R[:n, :n], D_P[:n, :n], n,
-        threshold=config["spectator_threshold"],
-        tol=config["spectator_tol"],
-        pair_mask=geom_mask[:n, :n],
-    )
-    pred_dist = enforce_triangle_inequality(pred_dist)
-    validate_ts_geometry(pred_dist, r_types[:n], n)
-    pred_coords = mds_aligned(pred_dist, reference_coords=c_I_real)
-    # Physics-based Ea baseline from the predicted 3D TS coordinates.
-    ea_physics = None
-    if "physics_ea_coeffs" in meta:
-        ea_calculator = PhysicsEaCalculator(
-            bond_scale=config["fragment_bond_scale"],
-            spectator_threshold=config["spectator_threshold"],
-        )
-        ea_calculator.coeffs = np.array(meta["physics_ea_coeffs"], dtype=np.float64)
-        ea_calculator.fitted = True
-        ea_physics = ea_calculator.predict_single(
-            c_R[:n], pred_coords, c_P[:n], r_types[:n], n, de_rxn
-        )
-    # Primary Ea is the learned head; fall back to physics for legacy checkpoints.
-    energy_pred = ea_neural if ea_neural is not None else ea_physics
-    if energy_pred is None:
-        raise ValueError(
-            "Checkpoint does not contain learned Ea normalization stats or fitted physics_ea_coeffs; "
-            "run training/evaluation once to produce a complete psi_final.pt."
-        )
-    ea_source = "neural" if ea_neural is not None else "physics (no learned head in checkpoint)"
-    result = {
-        "reactant_path": reactant_path,
-        "product_path": product_path,
-        "model_path": model_path,
-        "n_atoms": n,
-        "atom_types": r_types,
-        "Ea_pred": energy_pred,
-        "Ea_pred_physics": ea_physics,
-        "Ea_sigma_kcal": ea_sigma_kcal,
-        "Ea_source": ea_source,
-        "D_I": D_I[:n, :n].tolist(),
-        "D_pred": pred_dist.tolist(),
-        "geom_mask": geom_mask[:n, :n].tolist(),
-        "coords_pred": pred_coords.tolist(),
-    }
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
-    if xyz_path:
-        os.makedirs(os.path.dirname(xyz_path) or ".", exist_ok=True)
-        write_xyz(xyz_path, r_types, pred_coords, f"PSI predicted TS, Ea={energy_pred:.4f} kcal/mol")
-    print("\n" + "="*70)
-    print(" PREDICTION RESULT ")
-    print("="*70)
-    print(f"Atoms: {n}")
-    print(f"Predicted activation energy ({ea_source}): {energy_pred:.4f} kcal/mol")
-    if ea_sigma_kcal is not None:
-        print(f"  Learned Ea sigma: {ea_sigma_kcal:.4f} kcal/mol")
-    if ea_physics is not None:
-        print(f"  Physics baseline: {ea_physics:.4f} kcal/mol")
-    else:
-        print("  Physics baseline: unavailable in this checkpoint")
-    print(f"Prediction JSON saved to: {output_path}")
-    if xyz_path:
-        print(f"Predicted TS XYZ saved to: {xyz_path}")
-
-# =============================================================================
-# Results dashboard (formerly psi_visualize.py)
-# =============================================================================
-
-def _r2(true, pred):
-    """Coefficient of determination R^2 = 1 - SS_res / SS_tot."""
-    true = np.asarray(true, dtype=np.float64)
-    pred = np.asarray(pred, dtype=np.float64)
-    if len(true) < 2:
-        return 0.0
-    ss_res = float(np.sum((true - pred) ** 2))
-    ss_tot = float(np.sum((true - true.mean()) ** 2))
-    if ss_tot < 1e-12:
-        return 0.0
-    return 1.0 - ss_res / ss_tot
+    for split in ("train", "val"):
+        s = summary[split]
+        print(f"[eval] {split:>5}  n={s['n']:<6} "
+              f"D-MAE mean {s['dist_MAE_mean']:.4f} median {s['dist_MAE_median']:.4f} "
+              f"p90 {s['dist_MAE_p90']:.4f} A | RMSD median {s['rmsd_median']:.3f} A "
+              f"| Ea MAE {s['Ea_MAE']:.3f} RMSE {s['Ea_RMSE']:.3f} kcal/mol "
+              f"| chirality flips {s['chirality_flip_rate']*100:.2f}%")
+    gap = summary["val"]["dist_MAE_mean"] / max(summary["train"]["dist_MAE_mean"], 1e-9)
+    print(f"[eval] overfitting gap {gap:.2f}x    -> {RESULTS_PATH}")
 
 
-def energy_metrics(records, pred_key="Ea_pred"):
-    """Regression metrics for an activation-energy prediction over `records`.
+STAGES = {"bond-orders": stage_bond_orders, "train": stage_train, "eval": stage_eval}
+DEFAULT_STAGE = "train"
 
-    `pred_key` selects which prediction column to score (the learned head's
-    "Ea_pred" by default, or "Ea_pred_physics" for the baseline).
+
+def resolve_stage(argv):
+    """Pick the stage, tolerating the argv a notebook kernel injects.
+
+    Run from a Jupyter/Kaggle cell -- `%run psi_cloud_pipeline.py`, or the file
+    pasted straight in -- sys.argv belongs to IPython, not to us: it looks like
+    ['.../ipykernel_launcher.py', '-f', '/root/.../kernel-abc.json']. Reading
+    argv[1] positionally then reports `Unknown stage '-f'` and exits.
+
+    So: honour a recognised stage name wherever it appears, ignore IPython's flag
+    and its kernel .json, and fall back to DEFAULT_STAGE when nothing was asked
+    for. A genuine typo still raises -- silently training for nine hours because
+    'trian' was misspelt is exactly the kind of quiet wrong turn this pipeline
+    refuses everywhere else.
     """
-    if not records or pred_key not in records[0]:
-        return {"n": 0, "MAE": 0.0, "RMSE": 0.0, "R2": 0.0, "Pearson": 0.0, "MAPE": 0.0}
-    true = np.array([r["Ea_true"] for r in records], dtype=np.float64)
-    pred = np.array([r[pred_key] for r in records], dtype=np.float64)
-    err = pred - true
-    mae = float(np.mean(np.abs(err)))
-    rmse = float(np.sqrt(np.mean(err ** 2)))
-    pearson = float(np.corrcoef(true, pred)[0, 1]) if len(true) > 1 else 0.0
-    denom = np.where(np.abs(true) < 1e-6, np.nan, np.abs(true))
-    mape = float(np.nanmean(np.abs(err) / denom) * 100.0)
-    return {"n": len(records), "MAE": mae, "RMSE": rmse, "R2": _r2(true, pred),
-            "Pearson": pearson, "MAPE": mape}
+    named = [a for a in argv if a in STAGES]
+    if named:
+        return named[0]
+    typo = [a for a in argv
+            if not a.startswith("-") and not a.endswith((".json", ".py"))]
+    if typo:
+        raise SystemExit(
+            f"Unknown stage {typo[0]!r}. Choose one of: {', '.join(STAGES)}")
+    return DEFAULT_STAGE
 
-
-def geometry_metrics(records):
-    """Distance-prediction metrics, aggregated over all masked atom pairs.
-
-    Compares AI-predicted distances (D_pred) against the true TS distances on
-    the geometry-mask pairs, and reports the percentage improvement over the
-    plain reactant/product interpolation guess (D_I).
-    """
-    if not records:
-        return {"n": 0, "MAE": 0.0, "RMSE": 0.0, "R2": 0.0,
-                "guess_MAE": 0.0, "improve_pct": 0.0}
-    true_all, pred_all, guess_all = [], [], []
-    for r in records:
-        dt = np.array(r["D_true"], dtype=np.float64)
-        dp = np.array(r["D_pred"], dtype=np.float64)
-        di = np.array(r["D_I"], dtype=np.float64)
-        mask = np.array(r.get("geom_mask"), dtype=np.float64) if r.get("geom_mask") is not None else np.ones_like(dt)
-        # upper triangle of masked pairs only (matrices are symmetric)
-        iu = np.triu_indices_from(dt, k=1)
-        sel = mask[iu] > 0
-        true_all.append(dt[iu][sel])
-        pred_all.append(dp[iu][sel])
-        guess_all.append(di[iu][sel])
-    true = np.concatenate(true_all)
-    pred = np.concatenate(pred_all)
-    guess = np.concatenate(guess_all)
-    mae = float(np.mean(np.abs(pred - true)))
-    rmse = float(np.sqrt(np.mean((pred - true) ** 2)))
-    guess_mae = float(np.mean(np.abs(guess - true)))
-    improve = (1.0 - mae / guess_mae) * 100.0 if guess_mae > 1e-9 else 0.0
-    return {"n": int(true.size), "MAE": mae, "RMSE": rmse, "R2": _r2(true, pred),
-            "guess_MAE": guess_mae, "improve_pct": improve}
-
-
-def create_dashboard(data_path, save_dir):
-    if not os.path.exists(data_path):
-        print(f"Error: {data_path} not found.")
-        return
-
-    with open(data_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    if not data:
-        raise ValueError(f"{data_path} does not contain any reaction records.")
-    os.makedirs(save_dir, exist_ok=True)
-
-    data = sorted(data, key=lambda x: x["rxn_id"])
-
-    ea_trues = np.array([r["Ea_true"] for r in data])
-    ea_preds = np.array([r["Ea_pred"] for r in data])
-    ea_errors = np.abs(ea_preds - ea_trues)
-    dist_maes = np.array([r["dist_MAE"] for r in data])
-
-    guess_maes = []
-    for r in data:
-        di = np.array(r["D_I"])
-        dt = np.array(r["D_true"])
-        guess_maes.append(masked_mae(di, dt, r.get("geom_mask")))
-    guess_maes = np.array(guess_maes)
-
-    ea_corr = np.corrcoef(ea_trues, ea_preds)[0, 1] if len(ea_trues) > 1 else 0.0
-
-    train_data = [r for r in data if r["split"] == "train"]
-    val_data = [r for r in data if r["split"] == "val"]
-
-    # Full regression metric breakdown (Train / Val / All).
-    ea_metrics = {"Train": energy_metrics(train_data), "Val": energy_metrics(val_data), "All": energy_metrics(data)}
-    # Physics baseline (only present if the results carry "Ea_pred_physics").
-    ea_phys_metrics = {
-        "Train": energy_metrics(train_data, "Ea_pred_physics"),
-        "Val": energy_metrics(val_data, "Ea_pred_physics"),
-        "All": energy_metrics(data, "Ea_pred_physics"),
-    }
-    has_physics = "Ea_pred_physics" in data[0] if data else False
-    geom_metrics = {"Train": geometry_metrics(train_data), "Val": geometry_metrics(val_data), "All": geometry_metrics(data)}
-
-    def _metric_rows(metric_map, fields):
-        # fields: list of (label, key, formatter)
-        rows = ""
-        for label, key, fmt in fields:
-            cells = "".join(f"<td>{fmt(metric_map[s][key])}</td>" for s in ("Train", "Val", "All"))
-            rows += f"<tr><td style='color:#94a3b8;'>{label}</td>{cells}</tr>"
-        return rows
-
-    f2 = lambda v: f"{v:.2f}"
-    f3 = lambda v: f"{v:.3f}"
-    f4 = lambda v: f"{v:.4f}"
-    fpct = lambda v: f"{v:.1f}%"
-
-    energy_metric_rows = _metric_rows(ea_metrics, [
-        ("R² (neural)", "R2", f3),
-        ("Pearson R (neural)", "Pearson", f3),
-        ("MAE (kcal/mol)", "MAE", f2),
-        ("RMSE (kcal/mol)", "RMSE", f2),
-        ("MAPE", "MAPE", fpct),
-        ("Count", "n", lambda v: str(int(v))),
-    ])
-    # Append the physics baseline (R²/MAE) so neural vs physics is visible inline.
-    if has_physics:
-        energy_metric_rows += _metric_rows(ea_phys_metrics, [
-            ("R² (physics baseline)", "R2", f3),
-            ("MAE physics (kcal/mol)", "MAE", f2),
-        ])
-    geometry_metric_rows = _metric_rows(geom_metrics, [
-        ("R²", "R2", f3),
-        ("MAE (Å)", "MAE", f4),
-        ("RMSE (Å)", "RMSE", f4),
-        ("Guess MAE (Å)", "guess_MAE", f4),
-        ("Improvement vs Guess", "improve_pct", fpct),
-        ("Pairs", "n", lambda v: str(int(v))),
-    ])
-
-    sorted_by_geom = sorted(data, key=lambda x: x["dist_MAE"])
-    n_rxns = len(sorted_by_geom)
-
-    best_5 = sorted_by_geom[:5]
-    median_5 = sorted_by_geom[n_rxns//2 - 2 : n_rxns//2 + 3]
-    worst_5 = sorted_by_geom[-5:]
-
-    representative_list = best_5 + median_5 + worst_5
-    representative_data = {}
-
-    for r in representative_list:
-        rid = r["rxn_id"]
-        dt = np.array(r["D_true"])
-        dp = np.array(r["D_pred"])
-        di = np.array(r["D_I"])
-        atoms = r["atom_types"]
-        fragments = fragments_from_mask(r["geom_mask"]) if "geom_mask" in r else find_fragments_from_distances(dt, atoms)
-
-        X_true = mds(dt)
-        X_pred = mds_aligned(dp, reference_coords=X_true)
-        X_guess = mds_aligned(di, reference_coords=X_true)
-
-        representative_data[rid] = {
-            "rxn_id": rid,
-            "atom_types": atoms,
-            "coords_true": X_true.tolist(),
-            "coords_pred": X_pred.tolist(),
-            "coords_guess": X_guess.tolist(),
-            "bonds_true": get_bonds_from_distances(dt, atoms, fragments=fragments),
-            "bonds_pred": get_bonds_from_distances(dp, atoms, fragments=fragments),
-            "bonds_guess": get_bonds_from_distances(di, atoms, fragments=fragments),
-            "dist_MAE": r["dist_MAE"],
-            "Ea_true": r["Ea_true"],
-            "Ea_pred": r["Ea_pred"],
-            "Ea_error": r["Ea_error"],
-            "tier": "Best" if r in best_5 else "Median" if r in median_5 else "Worst"
-        }
-
-    summary_list = []
-    for r in data:
-        summary_list.append({
-            "rxn_id": r["rxn_id"],
-            "split": r["split"],
-            "Ea_true": round(r["Ea_true"], 2),
-            "Ea_pred": round(r["Ea_pred"], 2),
-            "Ea_error": round(r["Ea_error"], 2),
-            "dist_MAE": round(r["dist_MAE"], 4),
-            "guess_MAE": round(masked_mae(r["D_I"], r["D_true"], r.get("geom_mask")), 4),
-            "n_atoms": r["n_atoms"]
-        })
-
-    worst_10_geom = sorted(summary_list, key=lambda x: x["dist_MAE"], reverse=True)[:10]
-
-    html_template = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>PSI Transition State Prediction Dashboard</title>
-  <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/3dmol@2.4.2/build/3Dmol-min.js"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
-  <style>
-    body {{
-      background-color: #080c14;
-      color: #cbd5e1;
-      font-family: 'Outfit', sans-serif;
-      margin: 0;
-      padding: 0;
-    }}
-    .container {{
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 2rem;
-    }}
-    header {{
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 2rem;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-      padding-bottom: 1.5rem;
-    }}
-    .header-left h1 {{
-      font-size: 2.2rem;
-      font-weight: 700;
-      margin: 0;
-      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }}
-    .header-left p {{
-      margin: 0.25rem 0 0 0;
-      color: #64748b;
-      font-size: 0.95rem;
-    }}
-    .badge-top {{
-      background: rgba(59, 130, 246, 0.1);
-      border: 1px solid rgba(59, 130, 246, 0.2);
-      color: #60a5fa;
-      padding: 0.35rem 0.75rem;
-      border-radius: 9999px;
-      font-weight: 600;
-      font-size: 0.85rem;
-    }}
-    .stats-grid {{
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 1.5rem;
-      margin-bottom: 2rem;
-    }}
-    .card {{
-      background: rgba(17, 24, 39, 0.7);
-      backdrop-filter: blur(12px);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-      border-radius: 12px;
-      padding: 1.5rem;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
-    }}
-    .stat-card {{
-      position: relative;
-      overflow: hidden;
-    }}
-    .stat-card::before {{
-      content: '';
-      position: absolute;
-      top: 0; left: 0; width: 4px; height: 100%;
-      background: #3b82f6;
-    }}
-    .stat-card.energy::before {{ background: #8b5cf6; }}
-    .stat-card.geom::before {{ background: #10b981; }}
-    .stat-card.corr::before {{ background: #f59e0b; }}
-
-    .stat-val {{
-      font-size: 2.2rem;
-      font-weight: 700;
-      color: #ffffff;
-      margin-top: 0.5rem;
-    }}
-    .stat-label {{
-      font-size: 0.85rem;
-      color: #94a3b8;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      font-weight: 600;
-    }}
-    .charts-grid {{
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 1.5rem;
-      margin-bottom: 2rem;
-    }}
-    .chart-title {{
-      font-size: 1.15rem;
-      font-weight: 600;
-      color: #ffffff;
-      margin-top: 0;
-      margin-bottom: 1rem;
-    }}
-    .viewer-header {{
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 1rem;
-    }}
-    .dropdown-container {{
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-    }}
-    label {{
-      font-size: 0.9rem;
-      color: #94a3b8;
-    }}
-    select {{
-      background: #1e293b;
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      color: #e2e8f0;
-      padding: 0.5rem 1rem;
-      border-radius: 6px;
-      outline: none;
-      cursor: pointer;
-      font-family: inherit;
-      font-weight: 600;
-    }}
-    .viewer-layout {{
-      display: grid;
-      grid-template-columns: 2fr 1fr;
-      gap: 1.5rem;
-    }}
-    .viewer-info-card {{
-      background: rgba(255, 255, 255, 0.02);
-      border-radius: 8px;
-      padding: 1.25rem;
-      border: 1px solid rgba(255, 255, 255, 0.04);
-    }}
-    .info-row {{
-      display: flex;
-      justify-content: space-between;
-      margin-bottom: 0.75rem;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.03);
-      padding-bottom: 0.5rem;
-    }}
-    .info-row:last-child {{
-      border-bottom: none;
-      margin-bottom: 0;
-      padding-bottom: 0;
-    }}
-    .info-label {{
-      color: #94a3b8;
-      font-size: 0.9rem;
-    }}
-    .info-val {{
-      font-weight: 600;
-      color: #ffffff;
-    }}
-    .legend-container {{
-      margin-top: 1.5rem;
-      display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
-    }}
-    .legend-item {{
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-    }}
-    .legend-dot {{
-      width: 12px;
-      height: 12px;
-      border-radius: 50%;
-    }}
-    .legend-line {{
-      flex-grow: 1;
-      border-bottom: 1px dashed rgba(255, 255, 255, 0.1);
-    }}
-    .table-container {{
-      overflow-x: auto;
-      margin-top: 1rem;
-    }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      text-align: left;
-    }}
-    th, td {{
-      padding: 0.75rem 1rem;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-      font-size: 0.9rem;
-    }}
-    th {{
-      color: #94a3b8;
-      font-weight: 600;
-      text-transform: uppercase;
-      font-size: 0.8rem;
-      letter-spacing: 0.05em;
-    }}
-    tr:hover {{
-      background: rgba(255, 255, 255, 0.02);
-    }}
-    .badge {{
-      padding: 0.2rem 0.5rem;
-      border-radius: 4px;
-      font-size: 0.75rem;
-      font-weight: 600;
-    }}
-    .badge-train {{ background: rgba(59, 130, 246, 0.15); color: #60a5fa; }}
-    .badge-val {{ background: rgba(139, 92, 246, 0.15); color: #a78bfa; }}
-    .badge-tier {{
-      padding: 0.15rem 0.4rem;
-      font-size: 0.75rem;
-      font-weight: 700;
-      border-radius: 4px;
-    }}
-    .badge-tier.Best {{ background: rgba(16, 185, 129, 0.15); color: #34d399; }}
-    .badge-tier.Median {{ background: rgba(245, 158, 11, 0.15); color: #fbbf24; }}
-    .badge-tier.Worst {{ background: rgba(239, 68, 68, 0.15); color: #f87171; }}
-    .metrics-grid {{
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 1.5rem;
-      margin-bottom: 2rem;
-    }}
-    table.metrics-table {{ width: 100%; border-collapse: collapse; }}
-    table.metrics-table th, table.metrics-table td {{
-      padding: 0.55rem 0.85rem;
-      text-align: right;
-      font-size: 0.9rem;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    }}
-    table.metrics-table th:first-child, table.metrics-table td:first-child {{ text-align: left; }}
-    table.metrics-table thead th {{
-      color: #94a3b8; text-transform: uppercase; font-size: 0.78rem; letter-spacing: 0.05em;
-    }}
-    table.metrics-table td {{ color: #ffffff; font-weight: 600; }}
-    table.metrics-table th.col-val {{ color: #a78bfa; }}
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <div class="header-left">
-        <h1>PSI Results Dashboard</h1>
-        <p>Transition State prediction & activation energy regression analysis</p>
-      </div>
-      <div>
-        <span class="badge-top">Dataset Size: {len(data)} Reactions</span>
-      </div>
-    </header>
-
-    <div class="stats-grid">
-      <div class="card stat-card">
-        <div class="stat-label">Total Triplets</div>
-        <div class="stat-val">{len(data)}</div>
-      </div>
-      <div class="card stat-card energy">
-        <div class="stat-label">Ea MAE</div>
-        <div class="stat-val">{np.mean(ea_errors):.2f} <span style="font-size: 1rem; font-weight: normal; color: #94a3b8;">kcal/mol</span></div>
-      </div>
-      <div class="card stat-card corr">
-        <div class="stat-label">Ea Correlation (R)</div>
-        <div class="stat-val">{ea_corr:.4f}</div>
-      </div>
-      <div class="card stat-card geom">
-        <div class="stat-label">Avg Distance MAE</div>
-        <div class="stat-val">{np.mean(dist_maes):.4f} <span style="font-size: 1rem; font-weight: normal; color: #94a3b8;">Å</span></div>
-      </div>
-    </div>
-
-    <div class="metrics-grid">
-      <div class="card">
-        <div class="chart-title">Energy (Ea) Regression Metrics</div>
-        <table class="metrics-table">
-          <thead>
-            <tr><th>Metric</th><th>Train</th><th class="col-val">Val</th><th>All</th></tr>
-          </thead>
-          <tbody>
-            {energy_metric_rows}
-          </tbody>
-        </table>
-      </div>
-      <div class="card">
-        <div class="chart-title">Geometry (Distance) Metrics</div>
-        <table class="metrics-table">
-          <thead>
-            <tr><th>Metric</th><th>Train</th><th class="col-val">Val</th><th>All</th></tr>
-          </thead>
-          <tbody>
-            {geometry_metric_rows}
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="charts-grid">
-      <div class="card">
-        <div class="chart-title">Ea: Actual vs. Predicted</div>
-        <div id="ea-scatter" style="height: 400px;"></div>
-      </div>
-      <div class="card">
-        <div class="chart-title">Geometry: Distance MAE Improvement</div>
-        <div id="geom-histogram" style="height: 400px;"></div>
-      </div>
-    </div>
-
-    <div class="card molecular-viewer-card">
-      <div class="viewer-header">
-        <div class="chart-title" style="margin-bottom: 0;">Interactive 3D Transition State Alignment</div>
-        <div class="dropdown-container">
-          <label for="rxn-select">Select Reaction Case Study:</label>
-          <select id="rxn-select" onchange="updateViewer()">
-          </select>
-        </div>
-      </div>
-      <div class="viewer-layout">
-        <div id="mol-viewer" style="height: 500px; background: #0c101b; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.03);"></div>
-        <div class="viewer-info-card">
-          <div class="chart-title" style="font-size: 1rem; border-bottom: 1px solid rgba(255, 255, 255, 0.06); padding-bottom: 0.5rem; margin-bottom: 0.75rem;">Case Study Details</div>
-
-          <div class="info-row">
-            <span class="info-label">Reaction ID</span>
-            <span class="info-val" id="case-id">-</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Performance Tier</span>
-            <span id="case-tier">-</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Atom Count</span>
-            <span class="info-val" id="case-atoms">-</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Distance MAE (AI)</span>
-            <span class="info-val" id="case-dist-mae">-</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Ea True</span>
-            <span class="info-val" id="case-ea-true">-</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Ea Predicted</span>
-            <span class="info-val" id="case-ea-pred" style="color: #60a5fa;">-</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">Ea Error</span>
-            <span class="info-val" id="case-ea-error">-</span>
-          </div>
-
-          <div class="legend-container">
-            <div class="legend-item">
-              <div class="legend-dot" style="background: #10b981;"></div>
-              <span class="info-label">Ground Truth TS</span>
-            </div>
-            <div class="legend-item">
-              <div class="legend-dot" style="background: #3b82f6;"></div>
-              <span class="info-label">AI Predicted TS</span>
-            </div>
-            <div class="legend-item">
-              <div class="legend-dot" style="background: rgba(239, 68, 68, 0.4); border: 1px dashed #ef4444;"></div>
-              <span class="info-label">Interpolated Guess</span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="chart-title">Worst 10 Geometry Predictions (Diagnostics)</div>
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Reaction ID</th>
-              <th>Split</th>
-              <th>Atoms</th>
-              <th>Guess MAE (Å)</th>
-              <th>AI Predicted MAE (Å)</th>
-              <th>Ea True (kcal)</th>
-              <th>Ea Pred (kcal)</th>
-              <th>Ea Error (kcal)</th>
-            </tr>
-          </thead>
-          <tbody id="worst-table-body">
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    const reactions = {json.dumps(summary_list)};
-    const repData = {json.dumps(representative_data)};
-    const worst10 = {json.dumps(worst_10_geom)};
-
-    const trainScatter = {{
-      x: [], y: [], text: [], mode: 'markers',
-      name: 'Train Set',
-      marker: {{ color: '#3b82f6', opacity: 0.6, size: 7 }}
-    }};
-    const valScatter = {{
-      x: [], y: [], text: [], mode: 'markers',
-      name: 'Val Set',
-      marker: {{ color: '#8b5cf6', opacity: 0.8, size: 8 }}
-    }};
-
-    for (let r of reactions) {{
-      let t = `ID: ${{r.rxn_id}}<br>True: ${{r.Ea_true}} kcal<br>Pred: ${{r.Ea_pred}} kcal<br>Error: ${{r.Ea_error}} kcal`;
-      if (r.split === 'train') {{
-        trainScatter.x.push(r.Ea_true);
-        trainScatter.y.push(r.Ea_pred);
-        trainScatter.text.push(t);
-      }} else {{
-        valScatter.x.push(r.Ea_true);
-        valScatter.y.push(r.Ea_pred);
-        valScatter.text.push(t);
-      }}
-    }}
-
-    const minEa = Math.min(...reactions.map(r => r.Ea_true));
-    const maxEa = Math.max(...reactions.map(r => r.Ea_true));
-    const refLine = {{
-      x: [minEa, maxEa], y: [minEa, maxEa],
-      mode: 'lines', name: 'y=x Ref',
-      line: {{ color: 'rgba(255,255,255,0.2)', dash: 'dash', width: 1.5 }}
-    }};
-
-    const scatterLayout = {{
-      plot_bgcolor: 'transparent',
-      paper_bgcolor: 'transparent',
-      margin: {{ l: 50, r: 20, t: 20, b: 50 }},
-      xaxis: {{ title: 'True Ea (kcal/mol)', gridcolor: 'rgba(255,255,255,0.05)', tickcolor: '#94a3b8' }},
-      yaxis: {{ title: 'Predicted Ea (kcal/mol)', gridcolor: 'rgba(255,255,255,0.05)', tickcolor: '#94a3b8' }},
-      legend: {{ font: {{ color: '#cbd5e1' }} }},
-      hovermode: 'closest'
-    }};
-    Plotly.newPlot('ea-scatter', [trainScatter, valScatter, refLine], scatterLayout);
-
-    const guessHist = {{
-      x: reactions.map(r => r.guess_MAE),
-      type: 'histogram', name: 'Initial Guess MAE',
-      opacity: 0.5, marker: {{ color: '#ef4444' }},
-      xbins: {{ size: 0.02 }}
-    }};
-    const aiHist = {{
-      x: reactions.map(r => r.dist_MAE),
-      type: 'histogram', name: 'AI Predicted MAE',
-      opacity: 0.6, marker: {{ color: '#10b981' }},
-      xbins: {{ size: 0.02 }}
-    }};
-
-    const histLayout = {{
-      plot_bgcolor: 'transparent',
-      paper_bgcolor: 'transparent',
-      margin: {{ l: 50, r: 20, t: 20, b: 50 }},
-      xaxis: {{ title: 'Distance MAE (Å)', gridcolor: 'rgba(255,255,255,0.05)', tickcolor: '#94a3b8' }},
-      yaxis: {{ title: 'Count', gridcolor: 'rgba(255,255,255,0.05)', tickcolor: '#94a3b8' }},
-      barmode: 'overlay',
-      legend: {{ font: {{ color: '#cbd5e1' }} }}
-    }};
-    Plotly.newPlot('geom-histogram', [guessHist, aiHist], histLayout);
-
-    const select = document.getElementById('rxn-select');
-    for (let rid in repData) {{
-      let opt = document.createElement('option');
-      opt.value = rid;
-      opt.text = `${{rid}} [${{repData[rid].tier}} tier: MAE=${{repData[rid].dist_MAE.toFixed(4)}}Å]`;
-      select.appendChild(opt);
-    }}
-
-    // Initialize 3Dmol viewer (guard against the CDN failing to load)
-    let viewer = null;
-    if (typeof $3Dmol === 'undefined') {{
-      document.getElementById('mol-viewer').innerHTML =
-        '<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#f87171;text-align:center;padding:1rem;">' +
-        '3Dmol.js failed to load (check network / CDN). 3D structures cannot be displayed.</div>';
-    }} else {{
-      viewer = $3Dmol.createViewer("mol-viewer", {{ backgroundColor: "#0c101b" }});
-    }}
-    
-    function updateViewer() {{
-      const rid = select.value;
-      const r = repData[rid];
-
-      document.getElementById('case-id').innerText = r.rxn_id;
-      document.getElementById('case-atoms').innerText = r.atom_types.length;
-      document.getElementById('case-dist-mae').innerText = r.dist_MAE.toFixed(4) + ' Å';
-      document.getElementById('case-ea-true').innerText = r.Ea_true.toFixed(2) + ' kcal/mol';
-      document.getElementById('case-ea-pred').innerText = r.Ea_pred.toFixed(2) + ' kcal/mol';
-      document.getElementById('case-ea-error').innerText = r.Ea_error.toFixed(2) + ' kcal/mol';
-
-      const tierBadge = document.getElementById('case-tier');
-      tierBadge.className = `badge badge-tier ${{r.tier}}`;
-      tierBadge.innerText = r.tier;
-
-      if (!viewer) return;
-      viewer.clear();
-
-      function makeXYZString(atomTypes, coords) {{
-        let lines = [atomTypes.length, "PSI TS Prediction"];
-        for (let i = 0; i < atomTypes.length; i++) {{
-          lines.push(`${{atomTypes[i]}} ${{coords[i][0]}} ${{coords[i][1]}} ${{coords[i][2]}}`);
-        }}
-        return lines.join("\\n");
-      }}
-
-      const mTrue = viewer.addModel(makeXYZString(r.atom_types, r.coords_true), "xyz");
-      viewer.setStyle({{model: mTrue.getID()}}, {{
-        stick: {{color: '#10b981', radius: 0.12}},
-        sphere: {{color: '#10b981', radius: 0.3}}
-      }});
-
-      const mPred = viewer.addModel(makeXYZString(r.atom_types, r.coords_pred), "xyz");
-      viewer.setStyle({{model: mPred.getID()}}, {{
-        stick: {{color: '#3b82f6', radius: 0.08}},
-        sphere: {{color: '#3b82f6', radius: 0.22}}
-      }});
-
-      const mGuess = viewer.addModel(makeXYZString(r.atom_types, r.coords_guess), "xyz");
-      viewer.setStyle({{model: mGuess.getID()}}, {{
-        stick: {{color: '#f87171', radius: 0.05, opacity: 0.4}},
-        sphere: {{color: '#f87171', radius: 0.15, opacity: 0.4}}
-      }});
-
-      r.atom_types.forEach((type, idx) => {{
-        viewer.addLabel(`${{type}}${{idx}}`, {{
-          position: {{x: r.coords_true[idx][0], y: r.coords_true[idx][1], z: r.coords_true[idx][2]}},
-          backgroundColor: 'rgba(12,16,27,0.8)',
-          fontColor: '#cbd5e1',
-          fontSize: 10,
-          backgroundOpacity: 0.8,
-          borderThickness: 0,
-          alignment: 'center'
-        }});
-      }});
-
-      viewer.zoomTo();
-      viewer.render();
-    }}
-
-
-    if (select.options.length > 0) {{
-      updateViewer();
-    }}
-
-    const tableBody = document.getElementById('worst-table-body');
-    for (let r of worst10) {{
-      let tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td style="font-weight: 600; color: #ffffff;">${{r.rxn_id}}</td>
-        <td><span class="badge badge-${{r.split}}">${{r.split.toUpperCase()}}</span></td>
-        <td>${{r.n_atoms}}</td>
-        <td>${{r.guess_MAE.toFixed(4)}}</td>
-        <td style="color: #f87171; font-weight: 600;">${{r.dist_MAE.toFixed(4)}}</td>
-        <td>${{r.Ea_true.toFixed(2)}}</td>
-        <td>${{r.Ea_pred.toFixed(2)}}</td>
-        <td style="font-weight: 600;">${{r.Ea_error.toFixed(2)}}</td>
-      `;
-      tableBody.appendChild(tr);
-    }}
-  </script>
-</body>
-</html>
-"""
-
-    output_html = os.path.join(save_dir, 'psi_results_dashboard.html')
-    with open(output_html, 'w', encoding='utf-8') as f:
-        f.write(html_template)
-
-    print(f"Interactive dashboard generated successfully: {output_html}")
-
-# =============================================================================
-# Command-line interface
-# =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PSI transition-state training, prediction, and visualization (v2)")
-    subparsers = parser.add_subparsers(dest="command")
-    train_parser = subparsers.add_parser("train", help="Train the PSI model and evaluate known triplets")
-    train_parser.add_argument("--dataset", choices=["b97d3", "wb97xd3"], default=CONFIG.get("dataset", "b97d3"), help="Dataset version to train on")
-    train_parser.add_argument("--extract-limit", type=int, default=CONFIG["extraction_limit"], help="Number of log files to parse from the tarball")
-    train_parser.add_argument("--target-reactions", type=int, default=CONFIG["target_reactions"], help="Maximum complete reaction triplets to train/evaluate")
-    train_parser.add_argument("--force-extract", action="store_true", help="Rebuild extracted_dataset.json instead of reusing it")
-    train_parser.add_argument("--epochs", type=int, default=CONFIG["epochs"], help="Training epochs")
-    train_parser.add_argument("--batch-size", type=int, default=CONFIG["batch_size"], help="Training batch size")
-    train_parser.add_argument("--num-workers", type=int, default=CONFIG["num_workers"], help="DataLoader worker processes")
-    train_parser.add_argument("--val-split", type=float, default=CONFIG["val_split"], help="Validation fraction; 0.1 keeps 90%% of data for training")
-    train_parser.add_argument("--split-seed", type=int, default=CONFIG["split_seed"], help="Random seed for train/validation splitting")
-    train_parser.add_argument("--split-strategy", choices=["random", "stratified"], default=CONFIG["split_strategy"], help="Train/validation split strategy")
-    train_parser.add_argument("--split-bins", type=int, default=CONFIG["split_bins"], help="Ea quantile bins for stratified splitting")
-    train_parser.add_argument("--risk-penalty-mode", choices=["binary", "margin", "sigmoid"], default=CONFIG["risk_penalty_mode"], help="Sample-level risk weighting function")
-    train_parser.add_argument("--risk-weight-alpha", type=float, default=CONFIG["risk_weight_alpha"], help="Scale applied to continuous risk penalty weights")
-    train_parser.add_argument("--risk-weight-max", type=float, default=CONFIG["risk_weight_max"], help="Maximum continuous risk loss multiplier")
-    train_parser.add_argument("--triangle-loss-weight", type=float, default=CONFIG["triangle_loss_weight"], help="Weight for triangle-inequality PINN loss")
-    train_parser.add_argument("--triangle-triplet-samples", type=int, default=CONFIG["triangle_triplet_samples"], help="Triplets sampled per batch for triangle loss; 0 uses all")
-    train_parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default=CONFIG["device"], help="Training device")
-    train_parser.add_argument("--require-cuda", action="store_true", help="Fail instead of falling back to CPU")
-    train_parser.add_argument("--no-amp", action="store_true", help="Disable CUDA mixed precision")
-    train_parser.add_argument("--patience", type=int, default=CONFIG["patience"], help="Early stopping patience")
-    train_parser.add_argument("--lr", type=float, default=CONFIG["lr"], help="Learning rate")
-    train_parser.add_argument("--ea-head-lr", type=float, default=CONFIG["ea_head_lr"], help="Learning rate for the Ea head")
-    train_parser.add_argument("--ea-loss-weight", type=float, default=CONFIG["ea_loss_weight"], help="Full joint Ea objective weight")
-    train_parser.add_argument("--ea-warmup-loss-weight", type=float, default=CONFIG["ea_warmup_loss_weight"], help="Detached-feature Ea loss weight before joint warmup ends")
-    train_parser.add_argument("--ea-loss-start-epoch", type=int, default=CONFIG["ea_loss_start_epoch"], help="First epoch that trains the Ea head")
-    train_parser.add_argument("--ea-warmup-epochs", type=int, default=CONFIG["ea_warmup_epochs"], help="Epochs before Ea gradients can reach EGNN/backbone")
-    train_parser.add_argument("--ea-select-weight", type=float, default=CONFIG["ea_select_weight"], help="Ea contribution to validation checkpoint selection")
-    train_parser.add_argument("--ea-head-dropout", type=float, default=CONFIG["ea_head_dropout"], help="Dropout inside the Ea head MLP")
-    train_parser.add_argument("--no-ea-uncertainty", action="store_true", help="Use legacy scalar SmoothL1 Ea regression instead of Gaussian NLL uncertainty")
-    train_parser.add_argument("--ea-log-var-min", type=float, default=CONFIG["ea_log_var_min"], help="Minimum clamped Ea log-variance for Gaussian NLL")
-    train_parser.add_argument("--ea-log-var-max", type=float, default=CONFIG["ea_log_var_max"], help="Maximum clamped Ea log-variance for Gaussian NLL")
-    train_parser.add_argument("--ea-tail-weighting", action="store_true", help="Re-enable legacy high-Ea sample weighting on the Ea objective")
-    train_parser.add_argument("--no-ea-detach-warmup", action="store_true", help="(default) Allow Ea warmup gradients to reach EGNN/backbone")
-    train_parser.add_argument("--ea-detach-warmup", action="store_true", help="Rip-cord: detach Ea warmup gradients from EGNN/backbone (use if the swarm destabilizes during warmup)")
-    train_parser.add_argument("--swa-start", type=int, default=CONFIG["swa_start"], help="Epoch to start SWA")
-    train_parser.add_argument("--no-swa", action="store_true", help="Disable SWA")
-    train_parser.add_argument("--save-dir", default=CONFIG["save_dir"], help="Directory to save checkpoints (e.g. runs/phase1_warm_start)")
-    train_parser.add_argument("--data-dir", default=CONFIG.get("data_dir"), help="Directory holding RGD1_CHNO.h5 + DFT_reaction_info.csv (e.g. a Kaggle input mount). If unset, files are auto-located under /kaggle/input or streamed from Figshare.")
-    train_parser.add_argument("--data-cache-dir", default=CONFIG.get("data_cache_dir"), help="Where to cache RGD1 files downloaded from Figshare (default: /kaggle/working/RGD1_Dataset).")
-    predict_parser = subparsers.add_parser("predict", help="Predict a transition state from reactant/product logs")
-    predict_parser.add_argument("--reactant", "-r", required=True, help="Path to reactant .log file")
-    predict_parser.add_argument("--product", "-p", required=True, help="Path to product .log file")
-    predict_parser.add_argument("--model", default=os.path.join(CONFIG["save_dir"], "psi_final.pt"), help="Path to psi_final.pt")
-    predict_parser.add_argument("--output", "-o", default=os.path.join(CONFIG["save_dir"], "psi_prediction.json"), help="Output JSON path")
-    predict_parser.add_argument("--xyz", default=os.path.join(CONFIG["save_dir"], "psi_predicted_ts.xyz"), help="Output XYZ path")
-    predict_parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default=CONFIG["device"], help="Prediction device")
-    predict_parser.add_argument("--require-cuda", action="store_true", help="Fail instead of falling back to CPU")
-    dash_parser = subparsers.add_parser("dashboard", help="Generate the results dashboard from a detailed_analysis.json")
-    dash_parser.add_argument("--data", default="detailed_analysis.json", help="Path to detailed_analysis.json")
-    dash_parser.add_argument("--save-dir", default=".", help="Directory to save the HTML dashboard")
-    import sys
-    def _in_notebook():
-        try:
-            from IPython import get_ipython
-            return get_ipython() is not None
-        except Exception:
-            return False
-
-    valid_cmds = {"train", "predict", "dashboard"}
-    argv = sys.argv[1:]
-    if argv and argv[0] in valid_cmds:
-        # Explicit subcommand (e.g. `!python psi_cloud_pipeline.py train ...`).
-        args = parser.parse_args()
-    elif not argv or _in_notebook():
-        # Bare run, or a Jupyter/Colab kernel that injected `-f kernel.json`
-        # into argv. Ignore those injected args and default to training.
-        args = parser.parse_args(["train"])
-    else:
-        # Real CLI with unknown/`-h` args: let argparse show help/errors.
-        args = parser.parse_args()
-    if args.command == "predict":
-        CONFIG["device"] = args.device
-        if args.require_cuda:
-            CONFIG["require_cuda"] = True
-        predict_transition_state(CONFIG, args.reactant, args.product, args.model, args.output, args.xyz)
-    elif args.command == "dashboard":
-        create_dashboard(args.data, args.save_dir)
-    else:
-        if args.command == "train":
-            CONFIG["dataset"] = args.dataset
-            CONFIG["tar_path"] = f"{args.dataset}.tar.gz"
-            CONFIG["dataset_json"] = f"extracted_{args.dataset}.json"
-            CONFIG["extraction_limit"] = args.extract_limit
-            CONFIG["target_reactions"] = args.target_reactions
-            if args.force_extract:
-                CONFIG["force_extract"] = True
-            CONFIG["epochs"] = args.epochs
-            CONFIG["batch_size"] = args.batch_size
-            CONFIG["num_workers"] = args.num_workers
-            CONFIG["val_split"] = args.val_split
-            CONFIG["split_seed"] = args.split_seed
-            CONFIG["split_strategy"] = args.split_strategy
-            CONFIG["split_bins"] = args.split_bins
-            CONFIG["risk_penalty_mode"] = args.risk_penalty_mode
-            CONFIG["risk_weight_alpha"] = args.risk_weight_alpha
-            CONFIG["risk_weight_max"] = args.risk_weight_max
-            CONFIG["triangle_loss_weight"] = args.triangle_loss_weight
-            CONFIG["triangle_triplet_samples"] = args.triangle_triplet_samples
-            CONFIG["device"] = args.device
-            if args.require_cuda:
-                CONFIG["require_cuda"] = True
-            if args.no_amp:
-                CONFIG["amp"] = False
-            CONFIG["patience"] = args.patience
-            CONFIG["lr"] = args.lr
-            CONFIG["ea_head_lr"] = args.ea_head_lr
-            CONFIG["ea_loss_weight"] = args.ea_loss_weight
-            CONFIG["ea_warmup_loss_weight"] = args.ea_warmup_loss_weight
-            CONFIG["ea_loss_start_epoch"] = args.ea_loss_start_epoch
-            CONFIG["ea_warmup_epochs"] = args.ea_warmup_epochs
-            CONFIG["ea_select_weight"] = args.ea_select_weight
-            CONFIG["ea_head_dropout"] = args.ea_head_dropout
-            if args.no_ea_uncertainty:
-                CONFIG["ea_uncertainty_enabled"] = False
-            CONFIG["ea_log_var_min"] = args.ea_log_var_min
-            CONFIG["ea_log_var_max"] = args.ea_log_var_max
-            if args.ea_tail_weighting:
-                CONFIG["ea_tail_weighting_enabled"] = True
-            if args.ea_detach_warmup:
-                CONFIG["ea_detach_during_warmup"] = True
-            elif args.no_ea_detach_warmup:
-                CONFIG["ea_detach_during_warmup"] = False
-            CONFIG["swa_start"] = args.swa_start
-            if args.no_swa:
-                CONFIG["swa_enabled"] = False
-            CONFIG["save_dir"] = args.save_dir
-            if getattr(args, "data_dir", None):
-                CONFIG["data_dir"] = args.data_dir
-            if getattr(args, "data_cache_dir", None):
-                CONFIG["data_cache_dir"] = args.data_cache_dir
-        train_pipeline(CONFIG)
+    stage = resolve_stage(sys.argv[1:])
+    print(f"[stage] {stage}")
+    STAGES[stage]()

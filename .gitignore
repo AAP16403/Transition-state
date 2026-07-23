@@ -44,6 +44,7 @@ irc_validation/
 validation_run_*/
 fast_gpu_irc_results/
 xtb_qm_results/
+geom_diagnostics/
 
 # Keep specific tracked files if needed
 !/extracted_b97d3.json

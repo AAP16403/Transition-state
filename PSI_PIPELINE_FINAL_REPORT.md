@@ -4186,3 +4186,60 @@ function run_epoch(..., epoch, is_train):
             clip gradients to 1.0
             optimizer.step()
 ```
+
+\newpage
+
+# Addendum (2026-07-20): geometry/Ea failure-mode fixes
+
+This addendum records changes made after the body of this report was written.
+They are implemented in `psi_full_pipeline.py` only (not yet mirrored to
+`psi_cloud_pipeline.py` / `psi_swarm_pipeline.py`), verified by static compile +
+isolated unit tests, and **not yet trained**. The full analysis lives in
+`PSI_FAILURE_ANALYSIS_REPORT.md`; this is a pointer-level summary so the final
+report stays consistent with the code.
+
+## Geometry (mode A — under-shoot / saturation)
+
+- **Soft δ-clamp** (`delta = dc·tanh(delta/dc)`, `delta_clamp` 3.0→5.0): the hard
+  clamp zeroed the gradient past the bound; tanh keeps gradient flowing.
+- **Movement-aware pair weighting** (`geom_move_weight`=2.0) and **Huber δ**
+  0.5→1.0: stop the loss from rewarding hedging toward the R/P midpoint.
+- **Cosine LR schedule** (`warmup_epochs`=5, replaces `PlateauWarmupScheduler`):
+  5-epoch warmup + cosine anneal to `1e-6` until `swa_start`.
+- **Per-molecule unpadded differentiable MDS** (`mds_differentiable`=True):
+  `torch_mds_coords` now slices each molecule to its real `[n,n]` block before
+  `eigh`, restoring a stable end-to-end gradient geom-loss → EGNN → MDS →
+  GeometryHead (the old padded path was a silent no-op). A `+1e-8` floor before
+  `sqrt(λ)` keeps the backward finite. Caveats: throughput (per-molecule loop)
+  and residual near-zero-eigenvalue degeneracy — both discussed in the analysis.
+
+## Energy (mode B — fat tail)
+
+- **Ea geometry-trust inputs** (`ea_use_geom_trust`=True): the Ea head (which reads
+  detached TS features) now also receives **detached** geometry-trust descriptors
+  — EGNN refinement displacement `|x_ts − x_init|` (mean/max/RC) and geometry
+  log-variance (mean/RC) — folded into its physics stream (so they drive both the
+  FiLM modulation and the final MLP). **Ea remains on `SmoothL1`; this is an input
+  feature, not an NLL switch.** All terms detached, so the Ea gradient still never
+  reshapes geometry.
+
+## Training-loop robustness
+
+- **Loud non-finite loss/grad guard** in `run_epoch`: detects NaN/inf in the loss
+  *or* gradients (a finite loss can still yield NaN grads via the differentiable
+  MDS `eigh` backward), skips the step, logs it, and reports per-epoch skip
+  counts. Replaces the silent in-graph `nan_to_num` mask, which never caught
+  backward NaNs. A few skips in epoch 1 can be benign fp16 GradScaler calibration;
+  persistent skips mean the MDS path is unstable.
+
+## Known drawbacks (see report → *Drawbacks & pitfalls*)
+
+- **Overconfidence:** an uncalibrated network can report low variance on a wrong
+  geometry. Mitigated here by using uncertainty as an Ea *input feature* rather
+  than a published confidence; must be calibrated (coverage/ECE) before it is
+  ever surfaced to a user.
+- **NLL instability:** applies to the geometry `geom_uncertainty` head (Kendall-Gal,
+  on from epoch 0), *not* to the Ea head (kept on SmoothL1). Recommended but
+  unimplemented: NLL warmup or β-NLL, plus monitoring mean predicted variance.
+- **Trust ≠ better chemistry:** uncertainty is diagnostic, not curative; chirality
+  and MDS degeneracy are architectural and need the coordinate-native rewrite.

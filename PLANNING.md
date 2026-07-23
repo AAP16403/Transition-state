@@ -46,6 +46,27 @@ All Phase 1 and Phase 2 infrastructure is implemented and ready to run.
   zero bias. Prevents the head from producing large random predictions at the
   start of training.
 
+#### EaHead: geometry-trust inputs (added 2026-07-20, `psi_full_pipeline.py` only)
+
+- ✅ `ea_use_geom_trust` (default `True`): feed **detached** geometry-trust
+  descriptors into the Ea head's physics stream — targets the mode-B fat tail
+  (see `PSI_FAILURE_ANALYSIS_REPORT.md`). The Ea head reads detached TS features
+  and was otherwise blind to whether that geometry is trustworthy.
+  - Features: EGNN refinement displacement `|x_ts − x_init|` (mean / max /
+    reaction-center mean — an asynchronicity proxy) + geometry log-variance
+    (mean / RC) when `geom_uncertainty` is on. Width 3, or 5 with UQ.
+  - **Ea stays on `SmoothL1`** — trust is an input feature, *not* an NLL switch,
+    so it adds no heteroscedastic-loss instability (see report §P2).
+  - All terms detached: informs the Ea head, never reshapes geometry.
+  - Gated so it can be ablated against the no-trust baseline.
+- ✅ Loud non-finite loss/grad guard in `run_epoch`: skips + logs steps whose
+  loss or gradients go NaN/inf (replaces the silent in-graph `nan_to_num`),
+  with per-epoch skip counts. Relevant now that the differentiable-MDS `eigh`
+  backward can emit non-finite grads.
+- ⚠️ Pitfalls (calibration / overconfidence, NLL cheating on the geometry UQ
+  head, "trust ≠ better chemistry") are catalogued in
+  `PSI_FAILURE_ANALYSIS_REPORT.md` → *Drawbacks & pitfalls*.
+
 #### PSI.forward
 
 - ✅ `detach_ea_features` argument added. When `True`, `h_ts.detach()` is passed

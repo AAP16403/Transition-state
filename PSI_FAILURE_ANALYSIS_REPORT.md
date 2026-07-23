@@ -236,6 +236,8 @@ clamp is not the main cause — the **loss rewards hedging toward the midpoint**
 | Uncertainty head + Kendall-Gal attenuation | Per-atom log-variance from EGNN features; `exp(−s)·huber + 0.5·s` lets the model express uncertainty instead of hedging every pair, and revives the dead UQ | `geom_uncertainty`=True | ✅ verified |
 | Cosine LR schedule | Replace `PlateauWarmupScheduler` (40-epoch warmup, then sat at peak LR 100+ epochs before its first plateau decay) with a 5-epoch linear warmup + cosine anneal to `1e-6` over the epochs until `swa_start`. Continuous decay lets the model settle into sharper minima instead of overshooting. | `warmup_epochs`=5 | ✅ verified |
 | Per-molecule unpadded differentiable MDS | Restore end-to-end gradient through the 3D reconstruction — see resolution below | `mds_differentiable`=True | ✅ verified |
+| Loud non-finite loss/grad guard | Detect NaN/inf loss *or* gradients (a finite loss can still yield NaN grads from the differentiable-MDS `eigh` backward), skip the step, log it, and report per-epoch skip counts — instead of the silent `nan_to_num` forward mask (which never caught backward NaNs anyway). Removes the in-graph MDS `nan_to_num`. | (always on) | ✅ verified |
+| **Ea head: geometry-trust inputs (mode B)** | Feed **detached** geometry-trust signals into the Ea head: EGNN refinement displacement \|x_ts − x_init\| (mean/max/RC-region — an asynchronicity proxy) + geometry log-variance (mean/RC) when `geom_uncertainty` is on. The Ea head reads detached TS features and was otherwise blind to whether that geometry is trustworthy; this gives it that signal without the Ea gradient reshaping geometry. **Ea stays on `SmoothL1` (no NLL switch)** — trust is an input feature, not a reported confidence. Fed through a **dedicated, per-channel running-normalized, zero-init encoder** added as a residual to the physics embedding (NOT concatenated into the shared `phys_enc`) — see note. | `ea_use_geom_trust`=True | ✅ verified |
 
 **Resolved (formerly a "proven dead end"):** `mds_differentiable` — letting the geometry head learn
 *through* the 3D reconstruction by backpropagating through the MDS `eigh`. The **original padded** path was a
@@ -252,15 +254,79 @@ MDS must **not** be detached when the flag is on (it now isn't); (2) `sqrt(λ)` 
 
 **Caveats on the MDS fix.** (a) *Throughput* — the per-molecule loop replaces one batched `eigh` with a
 Python loop of `.item()` syncs + tiny per-molecule `eigh` calls; benchmark before a long run. (b) *Residual
-degeneracy* — the `+eps`/sqrt fix removes the `sqrt(0)` NaN, but `eigh`'s backward still contains
-`1/(λ_i − λ_j)` terms; when the dim-th eigenvalue collides with the near-zero cluster (predicted distances
-not yet a valid 3-D Euclidean matrix) the backward can still spike. A loud non-finite-grad guard
-(detect → skip step → log) is preferable to silently zeroing. (c) *Redundancy* — the coordinate-native
+degeneracy* — **fixed at the source (2026-07-20).** The `+eps`/sqrt fix removed the `sqrt(0)` NaN, but
+`eigh`'s *backward* still carried `1/(λ_i − λ_j)` eigenvector-coupling terms that blow up to inf/NaN when the
+dim-th eigenvalue collides with the near-zero cluster (predicted distances not yet a valid 3-D Euclidean
+matrix). The `+1e-6` diagonal jitter breaks the forward degeneracy but leaves the backward gap ~1e-6, so the
+gradient reaches ~1e6–1e11 and overflows fp16 after GradScaler. This is now solved by `_StableEigh`, a custom
+autograd `eigh` whose backward replaces `1/(λ_i − λ_j)` with the Lorentzian-broadened
+`(λ_i − λ_j)/((λ_i − λ_j)² + ε)` (`ε = 1e-4`, `_MDS_EIGH_BACKWARD_EPS`) — finite everywhere, capped at
+`1/(2√ε) ≈ 50`, and numerically identical to the true gradient away from degeneracy (verified against
+autograd `eigh` to ~1e-9). On a forced tight tie at the dim boundary the plain-`eigh` backward gives a
+gradient of ~1.7e11; `_StableEigh` gives ~3.8. The loud non-finite loss/grad guard remains as a backstop, but
+the eigh backward should no longer be the source of skips. (c) *Redundancy* — the coordinate-native
 rewrite in the Appendix deletes MDS entirely and makes this bridge obsolete; if that migration is committed,
 this fix is temporary.
 
+**Geometry-trust encoder note (regression fix).** The first 6-epoch run with a *naive* concat of the raw
+trust features into the shared `phys_enc` **regressed Ea by ~1.5–2 kcal/mol vs the previous run at the same
+epochs** (geometry was unaffected / slightly better). Cause: the raw displacement channel (0–several Å, and
+largest/noisiest exactly when geometry is bad early) swamped the z-scored energy descriptors and the dominant
+`de_rxn`/BEP signal. Fix (implemented): a **dedicated trust encoder** with (i) per-channel running
+normalization (BatchNorm-style buffers, robust to a size-1 tail batch) so no channel dominates by scale, and
+(ii) a **zero-init final layer** so the trust stream contributes exactly 0 at init — the Ea head starts
+byte-identical to the no-trust baseline (unit-tested) and self-gates the feature in only as gradients confirm
+it helps. This should remove the early regression while preserving any late-training benefit.
+
 **Success metric after retrain:** `pred_dev / true_dev` slope should move from **0.81 → ~1.0**; unimolecular
-(1-fragment) median `dist_MAE` should drop from 0.117 toward the multi-fragment 0.05–0.08 range.
+(1-fragment) median `dist_MAE` should drop from 0.117 toward the multi-fragment 0.05–0.08 range. For the Ea
+geometry-trust change (mode B): the Ea fat tail should shrink (val RMSE 7.87 toward MAE 4.67) **concentrated
+on high-displacement / high-uncertainty reactions** — if the tail shrinks uniformly instead, the trust
+features aren't the mechanism.
+
+---
+
+## Drawbacks & pitfalls of the uncertainty / trust approach
+
+The uncertainty head (`geom_uncertainty`) and the Ea geometry-trust inputs (`ea_use_geom_trust`) are genuine
+improvements, but they carry well-known failure modes. Recording them here so they are not mistaken for a
+cure.
+
+### P1 — Neural networks are overconfident; a "trust" score can be a lie
+Uncalibrated networks routinely assign high confidence to wrong outputs — the model can emit an invalid
+geometry and still report a low variance for it. **Scope for us:** this bites hardest only if `geom_logvar`
+is ever *reported* as a user-facing confidence (the report notes we revived a previously dead UQ estimate).
+In the current design the log-variance and displacement enter the Ea head as **input features**, not as a
+published confidence, so even a miscalibrated variance can still be a *useful predictor* the head learns to
+read — #4 is deliberately robust to this. The moment the estimate is surfaced to a user or used to gate
+decisions, it must be calibrated: check **coverage** (do the ±σ bars actually contain the true distances at
+the stated rate?), report **ECE**, and apply temperature scaling. Current mitigations are weak — zero-init
+log-var head (starts neutral, variance 1) + clamp `[-7, 7]` (prevents runaway) — and are *not* calibration.
+
+### P2 — NLL/attenuation training instability ("cheating" the loss)
+Switching a regression from MSE/Huber to a heteroscedastic NLL lets the model reduce the loss by predicting
+**large uncertainty everywhere** instead of learning the target — often destabilizing the first ~50 epochs.
+**Scope for us:** the Ea head was **deliberately kept on `SmoothL1`** — #4 adds trust as inputs and does *not*
+switch Ea to NLL, so it introduces no NLL instability. The risk lives entirely in the **geometry**
+`geom_uncertainty` head, whose Kendall-Gal attenuation `exp(−s)·huber + 0.5·s` is currently active **from
+epoch 0**. Worse than generic instability: if the geometry head inflates `s` to dodge the `0.5·s` penalty, it
+"gives up" on hard pairs by declaring them uncertain — **re-introducing the exact under-shoot the other four
+fixes exist to remove.** Recommended mitigations (not yet implemented): (a) **NLL warmup** — pure Huber for
+the first K epochs, then ramp in the attenuation; (b) **β-NLL** (Seitzer et al. 2022) — scale the NLL by a
+*detached* `var^β` (β≈0.5) so variance cannot suppress the fitting gradient; (c) **monitor** mean predicted
+variance per epoch — a monotone climb while train error stalls is the cheating signature.
+
+### P3 — A trust score does not fix bad chemistry
+Uncertainty is **diagnostic, not curative**. If the model fundamentally cannot represent a phenomenon, a
+confidence estimate does not repair it — it only labels it. Two concrete cases in this pipeline:
+**chirality** (distance matrices are chirality-blind by construction — see the Appendix) and residual **MDS
+degeneracy**. Both are *architectural* and are addressed by architectural fixes (unpadded MDS for degeneracy;
+the coordinate-native rewrite for chirality and the interpolation prior) — never by a trust score. One nuance
+in #4's favour: the **displacement** feature measures *asynchronicity*, a real physical property and a proxy
+for reaction class, so it is somewhat more chemistry-aware than a pure variance — but it still makes the model
+*self-aware*, not *more accurate*. The trust/uncertainty work is **complementary** to the structural fixes
+(useful for triage, active-learning sample selection, and letting the Ea head route around untrustworthy
+geometry), and must not be treated as a substitute for them.
 
 ---
 

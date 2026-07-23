@@ -8,8 +8,11 @@ PSI_FAILURE_ANALYSIS_REPORT.md (unimolecular / N-rich / far-from-midpoint).
 Sectors instrumented
   0 reaction-type   : n_atoms, #fragments, #N, TS-vs-midpoint deviation
   1 geometry head   : coarse D-MAE, non-interpolative "envelope escape", clamp saturation
-  2 MDS seed        : embedding stress |dist(x_init) - D_coarse|, degeneracy (NaN)
-  3 EGNN refiner    : atom displacement ||x_ts - x_init||, gain over the coarse matrix
+                      (INAPPLICABLE under geometry_mode='coords' -- reported as n/a)
+  2 seed quality    : seed D-MAE vs true TS; MDS embedding stress |dist(x_init) -
+                      D_coarse| (distance mode only), degeneracy (NaN)
+  3 EGNN refiner    : atom displacement ||x_ts - x_init||, gain over whatever the
+                      EGNN was seeded with (coarse matrix, or the R/P midpoint)
   4 final geometry  : D-MAE vs DFT TS, under-shoot ratio, intra- vs cross-fragment error
   5 chirality       : Kabsch RMSD proper-rotation vs reflection-allowed (enantiomer flip)
   6 uncertainty     : predicted sigma vs actual per-atom error (calibration)
@@ -32,6 +35,7 @@ sys.path.insert(0, BASE_DIR)
 from psi_full_pipeline import (
     CONFIG, extract_raw_data, build_reaction_samples, make_train_val_split,
     compute_normalization, ReactionDataset, PSI, move_batch_to_device,
+    coords_from_batch,
 )
 
 # thresholds (Angstrom) tuned to the val distribution (median dist_MAE ~0.10)
@@ -78,9 +82,14 @@ def diagnose_reaction(rxn_id, n, atom_types, DR, DP, DI, DTRUE, dbg, c_TS, geom_
                       delta_clamp):
     """Compute every sector's diagnostic for one reaction. Returns a flat dict."""
     off = _off(n)
-    Dc = dbg["D_coarse"]; Dp = dbg["D_pred"]
+    # D_coarse is absent in coordinate-native mode (geometry_mode='coords'): there
+    # is no geometry head, so sectors 1 and 2 measure a stage that does not exist.
+    # They are reported as None (inapplicable) rather than 0.0, which would read as
+    # "this stage was perfect" and silently distort the sector histogram.
+    Dc = dbg.get("D_coarse"); Dp = dbg["D_pred"]
+    coords_mode = Dc is None
     xi = dbg["x_init"]; xt = dbg["x_ts"]
-    r = {"rxn_id": rxn_id, "n_atoms": n}
+    r = {"rxn_id": rxn_id, "n_atoms": n, "coords_mode": coords_mode}
 
     # --- sector 0: reaction type -----------------------------------------
     r["n_frag"] = _n_fragments(geom_mask, n)
@@ -90,22 +99,36 @@ def diagnose_reaction(rxn_id, n, atom_types, DR, DP, DI, DTRUE, dbg, c_TS, geom_
     r["bimolecular"] = r["n_frag"] >= 2
 
     # --- sector 1: geometry head (coarse interpolation) ------------------
-    r["coarse_mae"] = float(np.abs(Dc - DTRUE)[off].mean())
-    lo = np.minimum(DR, DP); hi = np.maximum(DR, DP)
-    escape = (np.maximum(0.0, Dc - hi) + np.maximum(0.0, lo - Dc))[off]
-    r["envelope_escape_mean"] = float(escape.mean())
-    r["envelope_escape_max"] = float(escape.max())
-    r["clamp_sat_frac"] = float((escape > HI_ESCAPE_FRAC * delta_clamp).mean())
+    if coords_mode:
+        r["coarse_mae"] = None
+        r["envelope_escape_mean"] = r["envelope_escape_max"] = None
+        r["clamp_sat_frac"] = None
+    else:
+        r["coarse_mae"] = float(np.abs(Dc - DTRUE)[off].mean())
+        lo = np.minimum(DR, DP); hi = np.maximum(DR, DP)
+        escape = (np.maximum(0.0, Dc - hi) + np.maximum(0.0, lo - Dc))[off]
+        r["envelope_escape_mean"] = float(escape.mean())
+        r["envelope_escape_max"] = float(escape.max())
+        r["clamp_sat_frac"] = float((escape > HI_ESCAPE_FRAC * delta_clamp).mean())
 
-    # --- sector 2: MDS seed embedding fidelity ---------------------------
+    # --- sector 2: seed quality ------------------------------------------
+    # seed_mae is the seed's own error against the true TS and is defined in BOTH
+    # modes (MDS embedding, or the Kabsch-aligned R/P midpoint) -- it is the
+    # baseline the EGNN has to beat. mds_stress is embedding fidelity |dist(x_init)
+    # - D_coarse|, which only exists when there is a coarse matrix to embed.
     Dseed = np.sqrt(((xi[:, None, :] - xi[None, :, :]) ** 2).sum(-1))
-    r["mds_stress"] = float(np.abs(Dseed - Dc)[off].mean())
+    r["seed_mae"] = float(np.abs(Dseed - DTRUE)[off].mean())
+    r["mds_stress"] = None if coords_mode else float(np.abs(Dseed - Dc)[off].mean())
     r["seed_nan"] = bool(np.isnan(xi).any())
 
     # --- sector 3: EGNN refiner ------------------------------------------
     r["egnn_disp"] = float(np.sqrt(((xt - xi) ** 2).sum(-1)).mean())
     r["refined_mae"] = float(np.abs(Dp - DTRUE)[off].mean())
-    r["egnn_gain"] = r["coarse_mae"] - r["refined_mae"]   # >0 => EGNN helped
+    # >0 => EGNN helped. Measured against whatever the EGNN was actually handed:
+    # the coarse matrix in distance mode, the midpoint seed in coords mode.
+    base_mae = r["seed_mae"] if coords_mode else r["coarse_mae"]
+    r["egnn_gain"] = base_mae - r["refined_mae"]
+    r["egnn_gain_frac"] = r["egnn_gain"] / base_mae if base_mae > 1e-6 else 0.0
 
     # --- sector 4: final geometry ----------------------------------------
     r["dist_mae"] = r["refined_mae"]
@@ -156,17 +179,26 @@ def _attribute(r):
     if r["cross_mae"] > CROSS_RATIO * max(r["intra_mae"], 1e-6) and r["cross_mae"] > FAIL_MAE:
         return "cross_fragment_orientation"
     # geometry head: high coarse error. Distinguish "stayed interpolative"
-    # (low envelope escape) from "tried but hit the clamp".
-    if r["coarse_mae"] > FAIL_MAE:
+    # (low envelope escape) from "tried but hit the clamp". Both sectors are
+    # inapplicable in coordinate-native mode, where there is no geometry head.
+    if r["coarse_mae"] is not None and r["coarse_mae"] > FAIL_MAE:
         if r["clamp_sat_frac"] > 0.02:
             return "delta_clamp_saturated"
         if r["envelope_escape_mean"] < 0.05:
             return "geom_head_interpolation_bound"
         return "geom_head_error"
-    if r["mds_stress"] > 0.1:
+    if r["mds_stress"] is not None and r["mds_stress"] > 0.1:
         return "mds_lossy"
     if r["egnn_gain"] < 0:
         return "egnn_hurt"
+    # Coordinate-native analogue of the geom_head sectors above: with the
+    # interpolation prior gone, a surviving failure means the EGNN improved on the
+    # R/P midpoint seed but did not move far enough off it. Checked AFTER
+    # egnn_hurt, which is the more specific diagnosis for a negative gain. Without
+    # this branch every coords-mode failure would fall through to
+    # "diffuse_small_errors" and the atlas would say nothing.
+    if r["coarse_mae"] is None and r.get("egnn_gain_frac", 0.0) < 0.5:
+        return "egnn_underpowered"
     if r["undershoot_ratio"] == r["undershoot_ratio"] and r["undershoot_ratio"] < 0.7:
         return "residual_undershoot"
     return "diffuse_small_errors"
@@ -201,6 +233,10 @@ def run(split="val", limit=-1, ckpt=None):
         print(f"[warn] state_dict mismatch: {len(missing)} missing, {len(unexpected)} unexpected")
     model.eval()
 
+    coords_mode = run_config.get("geometry_mode") == "coords"
+    rc_xtb = run_config.get("rc_source", "distance") == "xtb"
+    print(f"  geometry_mode={run_config.get('geometry_mode')}  "
+          f"rc_source={run_config.get('rc_source')}")
     ds = ReactionDataset(run_config, samples, atom_vocab, atom_types_map, stats, is_train=False)
     indices = list(val_idx if split == "val" else train_idx)
     if limit != -1:
@@ -219,10 +255,17 @@ def run(split="val", limit=-1, ckpt=None):
         batch = torch.utils.data.default_collate([item])
         (DR, DI, DP, DTS, mask, geom_mask, atom_ids, atom_phys, Ea,
          de_rxn, energy_feats, *_rest) = move_batch_to_device(batch, device)
+        # Coordinate-native forward refuses to run without the R/P midpoint seed
+        # (it will not silently fall back to an MDS seed), and rc_source='xtb'
+        # expects the cached Wiberg reactive-atom mask. Both come off the batch the
+        # dataset already built for this config.
+        c_seed = coords_from_batch(batch, device)[0] if coords_mode else None
+        rc_atom = (batch["rc_atom_xtb"].to(device) if rc_xtb else None)
         with torch.no_grad():
             _, _, _, _, dbg = model(
                 DR, DI, DP, mask, atom_ids, atom_phys,
                 de_rxn=None, energy_feats=energy_feats, return_debug=True,
+                c_seed=c_seed, rc_atom=rc_atom,
             )
         n = int(mask.sum().item())
         s = samples[idx]
@@ -298,12 +341,17 @@ def _write(records, out_dir, split):
             f.write(f"**{b}** (n={sum(cnt.values())} failing): "
                     + ", ".join(f"`{s}` {c}" for s, c in cnt.most_common()) + "\n\n")
         f.write("## Worst 20 reactions (by final D-MAE)\n\n")
-        f.write("| Reaction | atoms | frag | N | maxdev | D-MAE | coarse | esc | mds_str | egnn_disp | undershoot | chir | sector |\n")
-        f.write("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+        # coarse / esc / mds_str are None in coordinate-native mode (no geometry
+        # head, no MDS); "n/a" keeps the column honest instead of printing a zero.
+        def _f(v, p):
+            return "n/a" if v is None else f"{v:.{p}f}"
+        f.write("| Reaction | atoms | frag | N | maxdev | D-MAE | seed | coarse | esc | mds_str | egnn_disp | undershoot | chir | sector |\n")
+        f.write("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
         for r in sorted(records, key=lambda r: -r["dist_mae"])[:20]:
             f.write(f"| `{r['rxn_id']}` | {r['n_atoms']} | {r['n_frag']} | {r['n_N']} | "
-                    f"{r['maxdev']:.2f} | {r['dist_mae']:.3f} | {r['coarse_mae']:.3f} | "
-                    f"{r['envelope_escape_mean']:.2f} | {r['mds_stress']:.3f} | {r['egnn_disp']:.2f} | "
+                    f"{r['maxdev']:.2f} | {r['dist_mae']:.3f} | {_f(r.get('seed_mae'), 3)} | "
+                    f"{_f(r['coarse_mae'], 3)} | "
+                    f"{_f(r['envelope_escape_mean'], 2)} | {_f(r['mds_stress'], 3)} | {r['egnn_disp']:.2f} | "
                     f"{r['undershoot_ratio']:.2f} | {'Y' if r['chirality_flip'] else '-'} | "
                     f"`{r['primary_sector']}` |\n")
     print(f"Wrote {md}")

@@ -465,6 +465,47 @@ def kabsch_align_reactant_fragments(c_R, c_P, atom_types, n, bond_scale=1.45):
             c_R_aligned[idx] = c_P[idx]
     return c_R_aligned
 
+def global_kabsch_align(c_R, c_P, n):
+    """Superimpose the WHOLE reactant onto the product with ONE rigid transform.
+
+    Deliberately not `kabsch_align_reactant_fragments`. That function aligns each
+    fragment independently, and since `kabsch` translates onto the target's
+    centroid, every reactant fragment lands on its PRODUCT fragment's centroid --
+    which overwrites the reactant's inter-fragment arrangement (separation,
+    relative orientation, approach direction) with the product's.
+
+    For the distance pipeline that is harmless: D_R is computed from the raw c_R,
+    so true inter-fragment distances survive, and the aligned copy only feeds
+    build_energy_features. For coordinate-native geometry it is fatal: the seed
+    would carry zero reactant information about how the fragments approach each
+    other, and `cross_fragment_orientation` is 31.9% of the failing val reactions.
+
+    One global transform fits each individual fragment worse, but it PRESERVES the
+    degree of freedom the model has to predict instead of deleting it. Refining a
+    coarse seed is the EGNN's job; recovering discarded information is not.
+    """
+    c_R_aligned = c_R.copy()
+    if n >= 2:
+        c_R_aligned[:n] = kabsch(c_R[:n], c_P[:n])
+    else:
+        c_R_aligned[:n] = c_P[:n]
+    return c_R_aligned
+
+
+def coordinate_seed(c_R, c_P, n):
+    """Midpoint seed for coordinate-native geometry, in the product frame.
+
+    Returns (c_I, c_R_aligned): the R/P midpoint the EGNN starts from, and the
+    globally-aligned reactant that produced it. Both endpoints contribute their
+    inter-fragment placement, so the seed sits physically between them rather
+    than on top of the product.
+    """
+    c_R_aligned = global_kabsch_align(c_R, c_P, n)
+    c_I = np.zeros_like(c_P)
+    c_I[:n] = 0.5 * (c_R_aligned[:n] + c_P[:n])
+    return c_I, c_R_aligned
+
+
 def mds_aligned(D, reference_coords=None, dim=3):
     """Recover one global coordinate set from a full distance matrix.
 
@@ -845,13 +886,24 @@ CONFIG = {
     # baseline.
     "ea_loss_weight": 0.5,          # de-emphasized: Ea head already converged (~5 kcal); free gradient budget for TS geometry
     "ea_loss_start_epoch": 1,       # train Ea head from the first epoch
-    "ea_select_weight": 0.5,        # Ea contribution to checkpoint selection
+    # Ea contribution to checkpoint selection. Rescaled from 0.5 when val_select
+    # switched from the geom loss (~0.019) to the raw distance MAE in Angstrom
+    # (~0.16): at 0.5 the Ea term (0.5 * ea_norm ~ 0.017) would be an 8x-smaller
+    # tiebreaker and selection would be geometry-only. 4.0 restores the ~50/50
+    # geometry/Ea balance the old selection metric had.
+    "ea_select_weight": 4.0,
     "ea_head_dropout": 0.15,        # dropout inside the Ea head MLP
     "ea_head_lr": 3e-4,             # LR for the Ea head
     "ea_head_weight_decay": 1e-3,
     "lr": 1.5e-4,
     "weight_decay": 1e-3,
     "warmup_epochs": 5,
+    # Cosine-decay horizon, decoupled from the run length. None keeps the historical
+    # behaviour (horizon = swa_start). This must be set explicitly for short
+    # diagnostic runs: otherwise shortening --epochs compresses the whole cosine, so
+    # a 30-epoch probe spends its final epochs near min_lr and cannot observe any
+    # behaviour that only appears at sustained high LR.
+    "lr_schedule_epochs": None,
     "grad_clip": 1.0,
     "batch_size": 48,
     "num_workers": 4,
@@ -920,7 +972,62 @@ CONFIG = {
     #     and revives the (currently unpopulated) uncertainty estimate. VERIFIED
     #     working (finite, nonzero gradient to the head).
     "mds_differentiable": True,
+    # --- Geometry representation -----------------------------------------
+    # "distance": the original chain, geometry head -> predicted D_TS -> MDS(eigh)
+    #             seed -> EGNN -> distances. Supervised in distance space.
+    # "coords":   coordinate-native. The EGNN is seeded with the real Kabsch-aligned
+    #             midpoint c_I = (c_R_aligned + c_P)/2 and predicts TS COORDINATES,
+    #             supervised against the DFT c_TS. Drops both the interpolation
+    #             prior and torch_mds_coords.
+    # Why: the geometry failure atlas attributes 45.9% of failing val reactions to
+    # `geom_head_interpolation_bound` and 20.4% to `geom_head_error` (66.3% combined)
+    # but only 0.2% to `mds_lossy` -- so MDS is a THROUGHPUT problem (measured: 83 ms
+    # of the 149 ms forward step, 58%) while the interpolation prior is the ACCURACY
+    # problem. Coordinate-native removes both at once.
+    # "coords" requires c_TS in the sample cache; see _sample_cache_meta. Now the
+    # DEFAULT: coordinate-native is the winning configuration, so a bare `train`
+    # uses it. Pass --geometry-mode distance to run the legacy interpolation+MDS
+    # path. The default sample_cache_path below points at the v4 (c_TS) cache so
+    # this works with no extra flags.
+    "geometry_mode": "coords",
+    # --- Reaction-centre / spectator source -------------------------------
+    # "distance": infer changed bonds from a binary covalent-radius cutoff.
+    # "xtb":      use cached GFN2-xTB Wiberg bond orders (build_bond_orders.py).
+    # Measured on all 39,994 cached reactions: the binary cutoff misses 8,754
+    # reactive atoms, giving a DIFFERENT reactive-atom set in 22.0% of reactions.
+    # In those, ~14% of pairs get the wrong role_weight -- median correction 12x,
+    # because a missed reactive atom drops its pairs from active/cross weight
+    # (2.0-3.0) to the spectator weight (0.25) and they are then under-trained.
+    "seed": None,                    # None = unseeded (historical behaviour)
+    # Now the DEFAULT: GFN2-xTB Wiberg bond orders. Requires the bond-order cache
+    # (build_bond_orders.py) next to the sample cache. Pass --rc-source distance
+    # for the legacy covalent-radius cutoff, which misses 8,754 reactive atoms.
+    "rc_source": "xtb",
+    "bond_order_cache_path": None,   # None -> save_dir/bond_orders_cache.pkl
+    "bo_change_threshold": 0.5,      # |bond order R - P| above this = reactive pair.
+                                     # Chosen from the plateau: 0.3/0.5/0.7 select
+                                     # 24.2/23.4/22.2% of pairs, so it is not a
+                                     # tuned knob -- the distribution is bimodal.
+    # Restrict the spectator PINN target (pull toward D_I) to pairs that are
+    # covalently bonded in BOTH R and P. Measured |D_TS - D_I| on the pairs each
+    # rule selects: current rule 0.1218 A over 39.2% of pairs; bonded-only
+    # 0.0143 A over 9.0% -- an 8.5x reduction in how wrong the target is.
+    "spectator_bonded_only": False,
+    # Weight on the Kabsch-aligned coordinate loss (coords mode only). The
+    # distance loss is kept alongside it rather than replaced: distances are what
+    # the Ea head and every existing metric consume, and dropping them would make
+    # coords-vs-distance runs incomparable. 1.0 = equal footing to start.
+    "coord_loss_weight": 1.0,
     "geom_uncertainty": True,
+    # Feed detached geometry-trust signals into the Ea head (FAILURE_ANALYSIS mode
+    # B). The Ea head reads DETACHED TS features and is otherwise blind to whether
+    # that geometry is trustworthy. This exposes, as extra physics-stream inputs,
+    # (i) the EGNN refinement displacement |x_ts - x_init| (mean/max/RC) -- a proxy
+    # for non-interpolative, asynchronous TSs, the hard structural class the report
+    # ties to Ea difficulty -- and (ii) the per-atom geometry log-variance
+    # (mean/RC) when geom_uncertainty is on. All detached: informs the Ea head, never
+    # reshapes geometry. Gated so it can be ablated against the no-trust baseline.
+    "ea_use_geom_trust": True,
     # Auto-write the ultra-detailed per-sector geometry failure atlas at the end of
     # every training run (geom_diagnostics/). Runs AFTER all primary outputs are
     # saved, so it can never cost a completed run; a diagnostic error only prints.
@@ -947,10 +1054,20 @@ CONFIG = {
     "risk_geom_loss_weight": 0.2,    # extra geometry loss on active/formed/broken risky pairs
     "steric_loss_weight": 1.0,       # weight on the steric-floor soft penalty in the loss
     "data_dir": None,                # RGD1 data dir; None -> default local path (see loader)
-    "sample_cache_path": None,       # explicit sample-cache path; None -> save_dir/samples_cache_rgd1.pkl
+    # None -> resolved by _samples_cache_path from geometry_mode: the v4 (c_TS)
+    # cache for coords (the default), the v3 pool for distance. An explicit path
+    # overrides both. Kept None so a distance-mode run never clobbers the v4 cache
+    # by rebuilding a v3 pool over it.
+    "sample_cache_path": None,
     "triangle_loss_weight": 0.05,
     "triangle_coarse_weight": 0.25,
-    "triangle_refined_weight": 1.0,
+    # 0.0, not 1.0. p_DTS is built by _coords_to_distance() from actual 3-D
+    # coordinates, and distances between points in Euclidean space satisfy the
+    # triangle inequality identically -- measured 0.000e+00 over 20 draws of 4096
+    # triplets. The term could never be non-zero, so this only stops paying for
+    # the triplet sampling. The COARSE term below is kept: D_TS_coarse is a freely
+    # predicted matrix and can genuinely violate it.
+    "triangle_refined_weight": 0.0,
     "triangle_tolerance": 0.02,
     "triangle_triplet_samples": 1024,
     "fragment_bond_scale": 1.45,
@@ -962,6 +1079,27 @@ CONFIG = {
     # speed for coordinate-noise augmentation (matrices then rebuilt each epoch).
     "coord_noise": 0.0,
 }
+
+def seed_everything(seed):
+    """Seed python/numpy/torch so two runs are comparable.
+
+    Nothing in this pipeline was seeded except the train/val split, so two runs of
+    IDENTICAL code already diverged (weight init, dropout, DataLoader shuffling, the
+    randperm in triangle_inequality_loss). That makes any A/B whose effect is small
+    -- e.g. rc_source distance vs xtb, which differ by ~0.002 A after one epoch --
+    unreadable. Off by default (seed=None) so existing behaviour is unchanged.
+    """
+    if seed is None:
+        return
+    import random as _random
+    _random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(f"Seeded python/numpy/torch with {seed} (run-to-run variance suppressed; "
+          f"cuDNN autotune and atomics can still introduce small nondeterminism).")
+
 
 def resolve_device(config):
     print("WARNING: Forcing CUDA device, CPU fallback removed.")
@@ -992,6 +1130,27 @@ def move_batch_to_device(batch, device):
         batch["risky_chem_flag"].to(device, non_blocking=True),
     )
 
+
+def coords_from_batch(batch, device):
+    """Coordinate-native tensors, fetched separately from move_batch_to_device.
+
+    Kept out of that function's return tuple on purpose: it is unpacked
+    positionally at every call site (run_epoch, evaluation, geom_diagnostics), so
+    appending to it would change a signature shared across the codebase for the
+    benefit of one mode. Returns (c_I, c_TS), each [B, N, 3].
+    """
+    missing = [k for k in ("c_I", "c_TS") if k not in batch]
+    if missing:
+        raise KeyError(
+            f"coords_from_batch: batch is missing {missing}. The loader was built "
+            f"with geometry_mode != 'coords', so the dataset never emitted them."
+        )
+    return (
+        batch["c_I"].to(device, non_blocking=True),
+        batch["c_TS"].to(device, non_blocking=True),
+    )
+
+
 def extract_raw_data(config):
     pass # Skipped for RGD1 dataset
 
@@ -1002,7 +1161,7 @@ def build_atom_vocab():
 
 def _sample_cache_meta(config):
     """Feature-affecting params. A change to any of these invalidates the cache."""
-    return {
+    meta = {
         "cache_version": 3,  # v3: drop reactions with empty reaction center (no changed bonds)
         "dataset": "rgd1",
         "max_atoms": config["max_atoms"],
@@ -1010,13 +1169,203 @@ def _sample_cache_meta(config):
         "spectator_threshold": config["spectator_threshold"],
         "skip_negative_ea": config["skip_negative_ea"],
     }
+    # `c_TS` was added to the sample dict without bumping cache_version, so a v3
+    # cache built before that change still validates and loads WITHOUT the true TS
+    # coordinates -- silently, which is how the geometry atlas ended up reporting
+    # chirality as NOT MEASURED. Coordinate-native training cannot run on such a
+    # cache at all.
+    #
+    # The extra keys are added ONLY in coords mode, deliberately: that keeps the
+    # existing (3.9 GB, multi-hour) v3 cache valid for distance-mode training while
+    # forcing a correct v4 build for coords mode. Bumping the version
+    # unconditionally would invalidate the existing cache for every run.
+    if config.get("geometry_mode") == "coords":
+        meta["cache_version"] = 4      # v4: c_TS (true DFT TS coordinates) guaranteed present
+        meta["requires_c_TS"] = True
+    return meta
 
 
 def _samples_cache_path(config):
     p = config["sample_cache_path"]
     if p:
         return p
-    return os.path.join(config["save_dir"], "samples_cache_rgd1.pkl")
+    # Resolve the default by geometry_mode so coords (the default) lands on the v4
+    # cache (which carries c_TS) and distance lands on the v3 pool. Keeping these
+    # as separate files is deliberate: their _sample_cache_meta differs
+    # (cache_version 4 vs 3), so sharing one path would make whichever mode ran
+    # second rebuild -- and overwrite -- the other's cache.
+    fname = ("samples_cache_rgd1_v4.pkl"
+             if config.get("geometry_mode") == "coords"
+             else "samples_cache_rgd1.pkl")
+    return os.path.join(config["save_dir"], fname)
+
+
+def _bond_order_cache_path(config):
+    """Default: next to the SAMPLE cache, not next to save_dir.
+
+    The bond orders are a dataset-level artifact paired one-to-one with a specific
+    sample cache -- not a per-run output. Defaulting to save_dir reproduced the
+    footgun the --sample-cache-path help already warns about: a side run with a
+    fresh --save-dir looks in an empty directory and fails.
+    """
+    p = config.get("bond_order_cache_path")
+    if p:
+        return p
+    return os.path.join(os.path.dirname(_samples_cache_path(config)) or ".",
+                        "bond_orders_cache.pkl")
+
+
+_BOND_ORDERS_MEMO = {}
+
+
+def load_bond_orders(config):
+    """Load the cached GFN2-xTB Wiberg bond orders, or raise saying how to build them.
+
+    Returns {rxn_id: {"n": int, "bo_R": [n,n], "bo_P": [n,n]}}. Raises rather than
+    silently reverting to the distance cutoff: mixing two different reaction-centre
+    definitions inside one training set would make the run uninterpretable.
+
+    Memoised by path: this is called once by the sample filter and once per
+    ReactionDataset (train / val / eval), which without the memo meant four 56 MB
+    unpickles and three redundant copies resident for the whole run.
+    """
+    path = _bond_order_cache_path(config)
+    if path in _BOND_ORDERS_MEMO:
+        return _BOND_ORDERS_MEMO[path]
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"rc_source='xtb' needs the bond-order cache at {path}, which does not "
+            f"exist. Build it with:\n"
+            f"    python build_bond_orders.py --sample-cache-path <your sample cache>\n"
+            f"(~3 min for 40k reactions). Refusing to fall back to the distance "
+            f"cutoff, which would silently use a different reaction-centre definition."
+        )
+    with open(path, "rb") as fh:
+        blob = pickle.load(fh)
+    orders = blob.get("orders", {})
+    n_fail = len(blob.get("failures", {}))
+    print(f"Loaded xTB bond orders for {len(orders)} reactions from {path}"
+          + (f" ({n_fail} reactions failed SCF and are absent)." if n_fail else "."))
+    _BOND_ORDERS_MEMO[path] = orders
+    return orders
+
+
+def bond_order_masks(bo_R, bo_P, n, max_atoms, threshold, bonded_min=0.5):
+    """Reactive-atom mask and bonded-spectator pair mask from a pair of BO matrices.
+
+    reactive pair : |bo_R - bo_P| > threshold
+    reactive atom : incident on any reactive pair
+    spectator pair: bonded in BOTH R and P and NOT reactive -- the only pairs whose
+                    true TS distance actually sits near the R/P midpoint (measured
+                    |D_TS - D_I| = 0.0143 A, versus 0.1218 A for the distance rule).
+
+    Both masks are returned as BOOL, not float32. ReactionDataset memoises every
+    built item in `self._cache`, once per persistent DataLoader worker, so the
+    [max_atoms, max_atoms] spectator mask is the largest new per-sample tensor on
+    the xTB path: float32 costs 3,600 B/sample (~123 MB per worker over 34k train
+    samples) against 900 B as bool. Every consumer already casts it
+    (`.to(dist_weights.dtype)` / `.to(p_DTS.dtype)`), so the dtype is free to
+    shrink. This box has OOM-killed a worker at 11 GB before.
+    """
+    d = np.abs(bo_R.astype(np.float32) - bo_P.astype(np.float32))
+    off = ~np.eye(n, dtype=bool)
+    reactive = (d > threshold) & off
+    rc_atom = np.zeros(max_atoms, dtype=bool)
+    rc_atom[:n] = reactive.any(axis=1)
+    bonded_both = (bo_R.astype(np.float32) > bonded_min) & (bo_P.astype(np.float32) > bonded_min) & off
+    spec = np.zeros((max_atoms, max_atoms), dtype=bool)
+    spec[:n, :n] = bonded_both & ~reactive
+    return rc_atom, spec
+
+
+def _filter_to_bond_orders(samples, atom_types_map, config):
+    """Drop reactions with no cached bond orders when rc_source='xtb'.
+
+    Two disjoint reasons to drop, both fatal later if left in:
+      * no cached bond orders at all -- GFN2-xTB fails to converge on a handful of
+        geometries (6 of 40,000).
+      * an EMPTY xTB reaction centre (76 of 39,994 at bo_change_threshold=0.5).
+
+    Excluding both here, loudly and once, beats raising mid-epoch -- and beats
+    silently using the distance rule for them, which would put two different
+    reaction-centre definitions inside one training set.
+
+    SPLIT CAVEAT: this runs BEFORE make_train_val_split, which is positional
+    (it strata-bins by list index and shuffles each bin). Removing even 6 samples
+    therefore re-deals the WHOLE split, not just those 6 -- so an rc_source='xtb'
+    run does not share a validation set with a distance-mode run at the same
+    split_seed, and their val D-MAEs are not exactly comparable. The dropped ids
+    are recorded in config["_dropped_rxn_ids"] and written to
+    split_diagnostics.json so two runs can be compared on the intersection
+    after the fact.
+    """
+    if config.get("rc_source") != "xtb":
+        return samples, atom_types_map
+    orders = load_bond_orders(config)
+    thr = config.get("bo_change_threshold", 0.5)
+
+    def _xtb_rc_empty(rec):
+        """True when no pair changes bond order by more than the threshold.
+
+        The sample cache's v3 rule already drops reactions with an empty reaction
+        centre, but it applies the DISTANCE rule. xTB is a different definition, so
+        that guarantee does not carry over: at the default threshold 0.5, 76 of the
+        39,994 cached reactions have no |bo_R - bo_P| > 0.5 pair at all. Those reach
+        EaHead's empty-RC guard, which raises rather than pooling over every atom --
+        i.e. a crash partway through epoch 1, not a silent degradation. Measured
+        counts by threshold: 0.3 -> 0, 0.5 -> 76, 0.7 -> 337.
+        """
+        n = rec["n"]
+        d = np.abs(rec["bo_R"].astype(np.float32) - rec["bo_P"].astype(np.float32))
+        return not ((d > thr) & ~np.eye(n, dtype=bool)).any()
+
+    no_orders = [s["rxn_id"] for s in samples if s["rxn_id"] not in orders]
+    empty_rc = [s["rxn_id"] for s in samples
+                if s["rxn_id"] in orders and _xtb_rc_empty(orders[s["rxn_id"]])]
+    drop_set = set(no_orders) | set(empty_rc)
+    keep = [s for s in samples if s["rxn_id"] not in drop_set]
+    dropped_ids = [s["rxn_id"] for s in samples if s["rxn_id"] in drop_set]
+    config["_dropped_rxn_ids"] = dropped_ids
+    dropped = len(dropped_ids)
+    if dropped:
+        print(f"rc_source='xtb': dropped {dropped} reaction(s); {len(keep)} remain.")
+        print(f"  {len(no_orders)} with no cached bond orders (xTB SCF "
+              f"non-convergence): {no_orders}")
+        print(f"  {len(empty_rc)} with an empty xTB reaction centre at "
+              f"bo_change_threshold={thr} (EaHead would raise on these mid-epoch)"
+              + (f": {empty_rc[:10]}{' ...' if len(empty_rc) > 10 else ''}"
+                 if empty_rc else ""))
+        print("  NOTE: the train/val split is positional, so this re-deals the "
+              "ENTIRE split -- this run's val set differs from a distance-mode run "
+              "at the same seed. Compare on the intersection, not run-to-run.")
+    if not keep:
+        raise RuntimeError(
+            "rc_source='xtb' left no usable reactions -- the bond-order cache does "
+            "not match this sample cache. Rebuild it with build_bond_orders.py "
+            "--sample-cache-path pointing at the same sample cache."
+        )
+    return keep, {s["rxn_id"]: s["atom_types"] for s in keep}
+
+
+def _assert_c_TS_present(samples, config, cache_path):
+    """Refuse to run coordinate-native training on a cache without true TS coords.
+
+    Raises rather than degrading to distance-space: a silent fallback here would
+    train the coordinate head against a target it does not have, and the failure
+    would surface only as inexplicably bad geometry many epochs later.
+    """
+    if config.get("geometry_mode") != "coords" or not samples:
+        return
+    if "c_TS" not in samples[0]:
+        raise RuntimeError(
+            f"geometry_mode='coords' requires the true DFT TS coordinates (c_TS), "
+            f"which are absent from the sample cache at {cache_path}. That cache "
+            f"predates the c_TS field. Build a v4 cache with:\n"
+            f"    python psi_full_pipeline.py build-cache --geometry-mode coords "
+            f"--sample-cache-path <new path>\n"
+            f"(the existing cache is left untouched and stays valid for "
+            f"geometry_mode='distance')."
+        )
 
 
 def build_reaction_samples(config):
@@ -1052,6 +1401,8 @@ def build_reaction_samples(config):
             print(f"Loaded {len(samples)} reaction samples from cache "
                   f"{cache_path} (built pool={len(pool)}"
                   f"{', dataset-exhausted' if cached.get('exhausted') else ''}).")
+            _assert_c_TS_present(samples, config, cache_path)
+            samples, atom_types_map = _filter_to_bond_orders(samples, atom_types_map, config)
             return samples, cached["atom_vocab"], atom_types_map
         if cached.get("meta") != meta:
             print("Sample cache present but feature params changed; rebuilding.")
@@ -1072,6 +1423,8 @@ def build_reaction_samples(config):
         )
     print(f"Cached {len(samples)} reaction samples to {cache_path}.")
 
+    _assert_c_TS_present(samples, config, cache_path)
+    samples, atom_types_map = _filter_to_bond_orders(samples, atom_types_map, config)
     return samples, atom_vocab, atom_types_map
 
 
@@ -1373,6 +1726,12 @@ def make_train_val_split(samples, config):
         "n_train": len(train_indices),
         "n_val": len(val_indices),
         "integrity": integrity,
+        # Reactions removed before this split by _filter_to_bond_orders
+        # (rc_source='xtb' SCF failures). Recorded because the split is positional:
+        # dropping them re-deals every assignment, so a run that dropped them does
+        # NOT share a val set with one that did not. Persisting the ids is what
+        # makes an intersection-based comparison possible afterwards.
+        "dropped_rxn_ids": list(config.get("_dropped_rxn_ids", [])),
         "profiles": {
             "all": _split_profile(samples, list(range(n_total))),
             "train": _split_profile(samples, train_indices),
@@ -1475,6 +1834,16 @@ class ReactionDataset(Dataset):
         self.efeat_std = stats["efeat_std"]
         self.is_train = is_train
         self._use_noise = is_train and config["coord_noise"] > 0.0
+        # Coordinate-native mode needs the R/P midpoint seed and the true TS
+        # coordinates. c_I is derived here rather than stored in the cache: it is
+        # one 3x3 SVD per sample, and with coord_noise off the built item is
+        # memoised in self._cache, so it costs one pass per run.
+        self._coords_mode = config.get("geometry_mode") == "coords"
+        # xTB reaction-centre / spectator masks. Loaded once per dataset (56 MB) and
+        # indexed by rxn_id, so no sample-cache rebuild is needed.
+        self._rc_source = config.get("rc_source", "distance")
+        self._bo = load_bond_orders(config) if self._rc_source == "xtb" else None
+        self._bo_thr = config.get("bo_change_threshold", 0.5)
         # Memoized items, keyed by index. Only populated when there is no
         # per-epoch coord-noise augmentation (otherwise every epoch differs).
         self._cache = {}
@@ -1543,6 +1912,40 @@ class ReactionDataset(Dataset):
             "complexity_flag": torch.tensor(s["complexity_flag"], dtype=torch.float32),
             "risky_chem_flag": torch.tensor(s["risky_chem_flag"], dtype=torch.float32),
         }
+        if self._bo is not None:
+            rec = self._bo.get(s["rxn_id"])
+            if rec is None:
+                # The 6 SCF-failed reactions have no bond orders. Raise instead of
+                # quietly using the distance rule for them: one training set must
+                # not contain two different reaction-centre definitions.
+                raise KeyError(
+                    f"rc_source='xtb' but reaction {s['rxn_id']} has no cached bond "
+                    f"orders (GFN2-xTB SCF failed). Exclude it from the split or "
+                    f"rebuild the bond-order cache."
+                )
+            rc_atom, spec = bond_order_masks(
+                rec["bo_R"], rec["bo_P"], n, self.config["max_atoms"], self._bo_thr)
+            item["rc_atom_xtb"] = torch.from_numpy(rc_atom)
+            item["spectator_pair_xtb"] = torch.from_numpy(spec)
+        if self._coords_mode:
+            if "c_TS" not in s:
+                raise KeyError(
+                    f"geometry_mode='coords' needs c_TS on sample {s['rxn_id']}, but "
+                    f"this sample cache predates the c_TS field. Rebuild with "
+                    f"`build-cache --geometry-mode coords --sample-cache-path <new>`."
+                )
+            # Seed uses the noise-augmented coords when augmentation is on, so the
+            # seed and the D_R/D_P above describe the same perturbed structure.
+            src_R = c_R if self._use_noise else s["c_R"]
+            src_P = c_P if self._use_noise else s["c_P"]
+            c_I, _c_R_aligned = coordinate_seed(src_R, src_P, n)
+            # Only the seed and the target are kept. c_R_aligned/c_P were also
+            # emitted at first and never read by run_epoch -- with _cache memoising
+            # every item in every persistent worker, those two extra [N,3] tensors
+            # per sample across 34k items were pure resident memory, and this box
+            # OOM-killed a DataLoader worker at 11 GB.
+            item["c_I"] = torch.from_numpy(c_I.astype(np.float32))
+            item["c_TS"] = torch.from_numpy(np.asarray(s["c_TS"], dtype=np.float32))
         if not self._use_noise:
             self._cache[idx] = item
         return item
@@ -1899,6 +2302,60 @@ class PhysicsEaCalculator:
         return float(feats @ self.coeffs)
 
 
+# Lorentzian broadening for the differentiable-MDS eigh backward. The standard
+# eigh backward carries F_ij = 1/(lambda_i - lambda_j) eigenvector-coupling
+# terms that diverge to inf/NaN when two eigenvalues (near-)collide -- exactly
+# the early-training regime where the predicted distances are not yet a valid
+# 3-D Euclidean matrix and the dim-th eigenvalue merges into the near-zero
+# cluster. We replace 1/(l_i - l_j) with (l_i - l_j)/((l_i - l_j)^2 + eps),
+# which equals the true value away from degeneracy and caps the magnitude at
+# 1/(2*sqrt(eps)). eps=1e-4 caps it at ~50 (finite in fp32 and safe after
+# GradScaler upscaling into the fp16 EGNN) while distorting well-separated
+# modes by only ~eps/diff^2 ~ 1e-4. This is a numerically correct gradient,
+# not a mask: verified against autograd eigh (matches to ~1e-9 at small eps).
+_MDS_EIGH_BACKWARD_EPS = 1e-4
+
+
+class _StableEigh(torch.autograd.Function):
+    """`torch.linalg.eigh` with a Lorentzian-broadened, degeneracy-safe backward.
+
+    Forward is identical to `torch.linalg.eigh` (symmetric input, ascending
+    eigenvalues). Backward reimplements the analytic gradient but replaces the
+    singular F_ij = 1/(lambda_j - lambda_i) coupling with the finite
+    (lambda_j - lambda_i)/((lambda_i - lambda_j)^2 + eps), so a collision of two
+    eigenvalues can no longer emit a NaN/inf gradient. See _MDS_EIGH_BACKWARD_EPS.
+    """
+
+    @staticmethod
+    def forward(ctx, A, eps):
+        evals, evecs = torch.linalg.eigh(A)
+        ctx.save_for_backward(evals, evecs)
+        ctx.eps = eps
+        return evals, evecs
+
+    @staticmethod
+    def backward(ctx, dval, dvec):
+        evals, evecs = ctx.saved_tensors
+        eps = ctx.eps
+        n = evals.shape[-1]
+        # diff_ij = lambda_i - lambda_j (row i, col j).
+        diff = evals.unsqueeze(-1) - evals.unsqueeze(-2)
+        # Broadened F_ij = 1/(lambda_j - lambda_i); finite at diff -> 0.
+        F = -diff / (diff * diff + eps)
+        # Zero the diagonal (self-coupling has no gradient contribution).
+        F = F * (1.0 - torch.eye(n, dtype=F.dtype, device=F.device))
+        if dvec is None:
+            inner = torch.zeros_like(F)
+        else:
+            inner = F * (evecs.transpose(-1, -2) @ dvec)
+        if dval is not None:
+            inner = inner + torch.diag_embed(dval)
+        dA = evecs @ inner @ evecs.transpose(-1, -2)
+        # A is symmetric: return the symmetric part of the cotangent.
+        dA = 0.5 * (dA + dA.transpose(-1, -2))
+        return dA, None
+
+
 def torch_mds_coords(D, mask, dim=3, on_gpu=False, compute_dtype=torch.float64,
                      differentiable=False):
     """Classical MDS: distance matrix -> 3D coordinates.
@@ -1943,7 +2400,14 @@ def torch_mds_coords(D, mask, dim=3, on_gpu=False, compute_dtype=torch.float64,
             Bmat = 0.5 * (Bmat + Bmat.transpose(0, 1))
             # Small jitter for numerical stability (no dummy-shift needed)
             Bmat = Bmat + 1e-6 * torch.eye(n, dtype=Bmat.dtype, device=Bmat.device)
-            evals, evecs = torch.linalg.eigh(Bmat)       # ascending
+            # Degeneracy-safe eigh: the 1e-6 jitter breaks exact degeneracy in
+            # the forward, but eigh's *backward* still carries 1/(l_i - l_j)
+            # eigenvector-coupling terms that blow up to inf/NaN when the dim-th
+            # eigenvalue collides with the near-zero cluster (predicted distances
+            # not yet a valid 3-D Euclidean matrix). _StableEigh broadens those
+            # denominators so the backward stays finite -- fixing the NaN at its
+            # source instead of detecting-and-skipping the poisoned step.
+            evals, evecs = _StableEigh.apply(Bmat, _MDS_EIGH_BACKWARD_EPS)  # ascending
             top_vals = evals[-dim:].flip(0).clamp(min=0.0)   # [dim]
             top_vecs = evecs[:, -dim:].flip(1)               # [n, dim]
             # sqrt(0) has an infinite backward gradient, and early in training the
@@ -2046,6 +2510,73 @@ def triangle_inequality_loss(
     return ((violation ** 2) * valid).sum() / valid.sum().clamp(min=1.0)
 
 
+def kabsch_align_torch(X, Y, mask, detach_rotation=True):
+    """Batched rigid superposition of X onto Y over real atoms only.
+
+    Returns X aligned into Y's frame, so a coordinate loss against Y measures
+    SHAPE error rather than an arbitrary global rotation/translation. The
+    predicted TS lives in whatever frame the seed defined; c_TS lives in the DFT
+    output frame. Without this the loss would punish a perfect structure for
+    being rotated.
+
+    detach_rotation: the optimal rotation is itself a function of X, and
+    backpropagating through SVD reintroduces exactly the degenerate-spectrum
+    instability that _StableEigh exists to contain (the 3x3 cross-covariance goes
+    degenerate for linear or near-planar fragments). Treating R as a constant is
+    the standard registration-loss choice: the gradient still points at the shape
+    error, just not through the frame estimate.
+
+    Args:
+        X, Y: [B, N, 3]   mask: [B, N] with 1 for real atoms.
+    """
+    # cuSOLVER has no fp16 batched SVD ("svd_cuda_gesvdjBatched" not implemented
+    # for 'Half'), and this is called from inside the AMP autocast region, so the
+    # inputs arrive as fp16. Force fp32 for the whole superposition -- the same
+    # guard the MDS seed uses. Orthogonalising a 3x3 in fp16 would be poorly
+    # conditioned even where it is supported.
+    with torch.amp.autocast(device_type=X.device.type, enabled=False):
+        X = X.float()
+        Y = Y.float()
+        m = mask.unsqueeze(-1).to(X.dtype)                       # [B, N, 1]
+        cnt = m.sum(dim=1, keepdim=True).clamp(min=1.0)          # [B, 1, 1]
+        Xc = (X - (X * m).sum(dim=1, keepdim=True) / cnt) * m
+        Yc = (Y - (Y * m).sum(dim=1, keepdim=True) / cnt) * m
+
+        src = (Xc.detach() if detach_rotation else Xc)
+        H = src.transpose(1, 2) @ Yc                             # [B, 3, 3]
+        U, _, Vt = torch.linalg.svd(H)                           # one batched 3x3 SVD
+        # Proper rotations only: a reflection would let an enantiomer score as a
+        # perfect match, which is precisely the chirality failure the atlas cannot
+        # currently measure.
+        d = torch.sign(torch.det(Vt.transpose(1, 2) @ U.transpose(1, 2)))
+        # sign() is 0 for an exactly singular cross-covariance (collinear atoms);
+        # that would zero the third row of R and collapse the rotation. Send it to
+        # +1, i.e. fall back to the non-reflecting branch.
+        d = torch.where(d == 0, torch.ones_like(d), d)
+        diag = torch.diag_embed(torch.stack(
+            [torch.ones_like(d), torch.ones_like(d), d], dim=-1))
+        R = Vt.transpose(1, 2) @ diag @ U.transpose(1, 2)        # [B, 3, 3]
+        if detach_rotation:
+            R = R.detach()
+        return (Xc @ R.transpose(1, 2)) * m, Yc
+
+
+def coordinate_loss(x_pred, c_true, mask, delta=1.0):
+    """Frame-invariant per-atom coordinate loss, plus the raw RMSD readout.
+
+    Returns (huber_loss, rmsd_A). The Huber term is what trains; rmsd_A is the
+    interpretable Angstrom number to compare against React-OT / OA-ReactDiff,
+    which report coordinate RMSD rather than a distance-matrix MAE.
+    """
+    x_al, y_c = kabsch_align_torch(x_pred, c_true, mask)
+    m = mask.unsqueeze(-1).to(x_al.dtype)
+    denom = m.sum().clamp(min=1.0) * 3.0
+    l_coord = (F.huber_loss(x_al, y_c, reduction="none", delta=delta) * m).sum() / denom
+    sq = ((x_al - y_c) ** 2).sum(dim=-1) * mask.to(x_al.dtype)   # [B, N]
+    rmsd = torch.sqrt((sq.sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)).clamp(min=1e-12))
+    return l_coord, rmsd.mean()
+
+
 class EGCL(nn.Module):
     """One E(n)-equivariant graph convolution layer (Satorras et al., 2021).
 
@@ -2054,8 +2585,9 @@ class EGCL(nn.Module):
     interatomic distances, so node features stay E(3)-invariant while the
     coordinate update is E(3)-equivariant.
     """
-    def __init__(self, hidden, coord_clamp=2.0, dropout=0.25):
+    def __init__(self, hidden, coord_clamp=2.0, dropout=0.25, zero_com=False):
         super().__init__()
+        self.zero_com = zero_com
         self.coord_clamp = coord_clamp
         self.edge_mlp = nn.Sequential(
             nn.Linear(hidden * 2 + 1, hidden),
@@ -2101,6 +2633,21 @@ class EGCL(nn.Module):
         deg = emask.sum(dim=2).clamp(min=1.0)                        # [B, N, 1]
         x = x + trans.sum(dim=2) / deg
         x = x * mask.unsqueeze(-1)
+        if self.zero_com:
+            # Project out centre-of-mass drift. m_ij is built from the ORDERED pair
+            # (h_i, h_j, d_ij), so w_ij != w_ji and sum_i sum_j (x_i - x_j) w_ij does
+            # not cancel -- the layer can translate the whole system.
+            #
+            # Masked mean, not x.mean(1): padded atoms are zeroed above, so a plain
+            # mean over N would divide by the padded count and drag real atoms toward
+            # the origin in proportion to how much padding a molecule has.
+            #
+            # Off in distance mode by construction: the output there is a distance
+            # matrix, which is translation-invariant, so this would cost kernels to
+            # change nothing.
+            msum = mask.sum(dim=1).clamp(min=1.0).view(-1, 1, 1)
+            com = (x * mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / msum
+            x = (x - com) * mask.unsqueeze(-1)
         # Invariant node update from aggregated messages.
         agg = m_ij.sum(dim=2)                                        # [B, N, H]
         h = h + self.node_mlp(torch.cat([h, agg], dim=-1))
@@ -2116,7 +2663,7 @@ class EGNN(nn.Module):
     of the geometry head's predicted TS distance matrix. Stacked EGCL layers nudge
     the coordinates into a refined transition-state geometry.
     """
-    def __init__(self, node_in_dim, hidden, n_layers, coord_clamp=2.0, dropout=0.25):
+    def __init__(self, node_in_dim, hidden, n_layers, coord_clamp=2.0, dropout=0.25, zero_com=False):
         super().__init__()
         self.embed_in = nn.Sequential(
             nn.Linear(node_in_dim, hidden),
@@ -2124,7 +2671,7 @@ class EGNN(nn.Module):
             nn.LayerNorm(hidden),
         )
         self.layers = nn.ModuleList([
-            EGCL(hidden, coord_clamp, dropout) for _ in range(n_layers)
+            EGCL(hidden, coord_clamp, dropout, zero_com=zero_com) for _ in range(n_layers)
         ])
 
     def forward(self, node_feats, x, mask):
@@ -2155,10 +2702,13 @@ class EaHead(nn.Module):
     Output is a scalar normalized Ea.
     """
     def __init__(
-        self, node_dim, hidden, energy_feat_dim=0, dropout=0.25,
+        self, node_dim, hidden, energy_feat_dim=0, dropout=0.25, geom_trust_dim=0,
     ):
         super().__init__()
         self.energy_feat_dim = int(energy_feat_dim)
+        # Geometry-trust descriptors (detached) appended to the physics stream: a
+        # confidence/asynchronicity signal about the predicted TS. 0 disables.
+        self.geom_trust_dim = int(geom_trust_dim)
         self.attn = nn.Sequential(
             nn.Linear(node_dim, hidden // 2),
             nn.GELU(),
@@ -2190,6 +2740,32 @@ class EaHead(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
+        # Geometry-trust stream. Kept OUT of the shared phys_enc concat and given
+        # its own encoder for two reasons observed in training:
+        #   (1) Scale: the trust features are raw model-derived quantities on very
+        #       different scales (displacement in Angstrom vs clamped log-variance),
+        #       so concatenated into one linear they swamped the z-scored energy
+        #       descriptors and the dominant de_rxn/BEP signal -> Ea regressed.
+        #       A per-channel running normalization (BatchNorm-style buffers, but
+        #       robust to a size-1 tail batch) puts every channel on unit scale.
+        #   (2) Early noise: the last layer is ZERO-INIT, so the trust stream
+        #       contributes EXACTLY ZERO at init. The Ea head starts identical to
+        #       the no-trust baseline and only grows its use of trust as gradients
+        #       confirm it helps -- i.e. once geometry stabilizes and displacement
+        #       becomes meaningful, not while it is large-and-random early on. It
+        #       self-gates, so it can help but not hurt.
+        if self.geom_trust_dim > 0:
+            self.register_buffer("trust_running_mean", torch.zeros(self.geom_trust_dim))
+            self.register_buffer("trust_running_var", torch.ones(self.geom_trust_dim))
+            self.trust_norm_momentum = 0.1
+            self.trust_enc = nn.Sequential(
+                nn.Linear(self.geom_trust_dim, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, hidden),
+            )
+            nn.init.zeros_(self.trust_enc[-1].weight)
+            nn.init.zeros_(self.trust_enc[-1].bias)
         # FiLM: the energetics modulate the TS representation (Hammond/BEP -- the
         # TS position along the reaction coordinate depends on the reaction
         # energy). Zero-init keeps it an identity modulation at the start.
@@ -2215,7 +2791,7 @@ class EaHead(nn.Module):
         nn.init.constant_(self.bep.weight, 0.5)
         nn.init.zeros_(self.bep.bias)
 
-    def forward(self, h_ts, mask, de_rxn, energy_feats, rc_mask):
+    def forward(self, h_ts, mask, de_rxn, energy_feats, rc_mask, geom_trust=None):
         if self.energy_feat_dim > 0:
             if energy_feats is None:
                 raise ValueError("energy_feats is required when energy_feat_dim > 0.")
@@ -2227,6 +2803,18 @@ class EaHead(nn.Module):
                 raise ValueError(
                     f"energy_feats must have shape [{h_ts.size(0)}, {self.energy_feat_dim}], "
                     f"got {tuple(energy_feats.shape)}"
+                )
+        if self.geom_trust_dim > 0:
+            if geom_trust is None:
+                raise ValueError("geom_trust is required when geom_trust_dim > 0.")
+            if (
+                geom_trust.dim() != 2
+                or geom_trust.size(0) != h_ts.size(0)
+                or geom_trust.size(-1) != self.geom_trust_dim
+            ):
+                raise ValueError(
+                    f"geom_trust must have shape [{h_ts.size(0)}, {self.geom_trust_dim}], "
+                    f"got {tuple(geom_trust.shape)}"
                 )
         valid = mask <= 0                                        # [B, N] padding
         m = mask.unsqueeze(-1).to(h_ts.dtype)                    # [B, N, 1]
@@ -2257,6 +2845,19 @@ class EaHead(nn.Module):
         if self.energy_feat_dim > 0:
             phys_parts.append(energy_feats.to(dtype=h_ts.dtype))
         phys = self.phys_enc(torch.cat(phys_parts, dim=-1))
+        if self.geom_trust_dim > 0:
+            # Per-channel running normalization (fp32; skips the stats update on a
+            # size-1 batch so it never asserts) + zero-init residual: at init this
+            # adds exactly 0, so the physics embedding is unchanged and the head
+            # matches the no-trust baseline.
+            gt = geom_trust.float()
+            if self.training and gt.size(0) > 1:
+                with torch.no_grad():
+                    m = self.trust_norm_momentum
+                    self.trust_running_mean.mul_(1 - m).add_(m * gt.mean(dim=0))
+                    self.trust_running_var.mul_(1 - m).add_(m * gt.var(dim=0, unbiased=False))
+            gt_n = (gt - self.trust_running_mean) / (self.trust_running_var + 1e-5).sqrt()
+            phys = phys + self.trust_enc(gt_n).to(phys.dtype)
         gamma, beta = self.film(phys).chunk(2, dim=-1)
         ts_mod = ts * (1.0 + gamma) + beta
         out = self.net(torch.cat([ts_mod, phys], dim=-1))
@@ -2280,23 +2881,57 @@ class PSI(nn.Module):
         self.mds_on_gpu = config["mds_on_gpu"]
         self.mds_dtype = torch.float32 if config["mds_dtype"] == "float32" else torch.float64
         self.mds_differentiable = config.get("mds_differentiable", False)
+        # Coordinate-native: the EGNN is seeded with the real R/P midpoint instead
+        # of an MDS embedding of a predicted distance matrix, so neither the
+        # GeometryHead's interpolation prior nor torch_mds_coords runs at all.
+        self.geometry_mode = config.get("geometry_mode", "distance")
         self.geom_uncertainty = config.get("geom_uncertainty", False)
+        self.ea_use_geom_trust = config.get("ea_use_geom_trust", False)
+        # Geometry-trust vector width the Ea head expects: 3 displacement scalars
+        # (mean/max/RC) always, + 2 log-variance scalars (mean/RC) when the
+        # uncertainty head is active. Fixed here so the head's input dim is defined.
+        self._geom_trust_dim = (
+            (3 + (2 if self.geom_uncertainty else 0)) if self.ea_use_geom_trust else 0
+        )
         d_model = config["gru_hidden"] * 2
         atom_dim = config["atom_embed_dim"]
         drop = config["dropout"]
         delta_clamp = config["delta_clamp"]
         self.core = PSICore(config, num_atom_types)
-        self.geom_head = GeometryHead(d_model, atom_dim, ATOM_PHYS_DIM, drop, delta_clamp)
+        # Not constructed at all in coords mode: it is never called there, and
+        # building it anyway would allocate 183,170 parameters (2.6% of the model)
+        # that receive no gradient yet are written into every checkpoint.
+        self.geom_head = (
+            None if self.geometry_mode == "coords"
+            else GeometryHead(d_model, atom_dim, ATOM_PHYS_DIM, drop, delta_clamp)
+        )
         # EGNN coordinate refiner. Node features = chemical-property vector
         # (learned atom embedding + physical descriptors); coordinates come from
         # the MDS embedding of the geometry head's predicted TS distance matrix.
         node_in_dim = atom_dim + ATOM_PHYS_DIM
+        # In coords mode the encoder output `f` is appended to the node features.
+        # Without this the ONLY consumer of self.core is the geometry head, which
+        # coords mode does not build -- so PSICore (2,300,096 params, 33% of the
+        # model) would run every forward, receive zero gradient, and be discarded.
+        # Worse, the EGNN would then see no reaction context at all: its node
+        # features would be just [atom_embed, atom_phys], with D_R/D_I/D_P reaching
+        # it only implicitly through the midpoint seed, so nothing would tell it
+        # which bonds are forming or breaking. Distance mode is left untouched
+        # (there `f` already reaches the EGNN through geom_head -> MDS -> x_init),
+        # so its architecture and checkpoints stay bit-identical.
+        self._egnn_uses_core = self.geometry_mode == "coords"
+        if self._egnn_uses_core:
+            node_in_dim += d_model
         self.egnn = EGNN(
             node_in_dim,
             hidden=config["egnn_hidden"],
             n_layers=config["egnn_layers"],
             coord_clamp=config["egnn_coord_clamp"],
             dropout=drop,
+            # Only meaningful once the output is coordinates; a distance matrix is
+            # translation-invariant, so in distance mode this stays off and that
+            # path remains bit-identical to before.
+            zero_com=(config.get("geometry_mode") == "coords"),
         )
         # Learned Ea head on the EGNN's refined per-atom features (h_ts)
         # plus 28D energy descriptor (composition, bond-angle stats, RC angles).
@@ -2305,6 +2940,7 @@ class PSI(nn.Module):
             hidden=config["egnn_hidden"],
             energy_feat_dim=ENERGY_FEAT_DIM,
             dropout=config["ea_head_dropout"],
+            geom_trust_dim=self._geom_trust_dim,
         )
         # Heteroscedastic geometry-uncertainty head: predicts a per-atom log
         # variance from the EGNN's refined features. Used for Kendall-Gal loss
@@ -2331,12 +2967,63 @@ class PSI(nn.Module):
         valid = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         return dist * (1.0 - eye) * valid
 
-    def _reaction_center_mask(self, D_R, D_P, atom_ids, mask):
+    def _reaction_center_mask(self, D_R, D_P, atom_ids, mask, rc_atom=None):
+        """Reactive-atom mask for the Ea head / geom-trust features.
+
+        `rc_atom` is the precomputed per-atom mask from the xTB Wiberg bond orders
+        (rc_source='xtb'), supplied by the caller. When it is absent this falls back
+        to the binary covalent-radius cutoff. Threading it through matters: without
+        it, rc_source='xtb' would fix the geometry loss's role weights while the Ea
+        head kept using the distance rule -- two different reaction-centre
+        definitions inside one run, which is exactly what load_bond_orders() and
+        _filter_to_bond_orders() raise rather than allow.
+        """
+        if rc_atom is not None:
+            # Same [B, N] bool contract as reaction_center_atom_mask: EaHead's
+            # empty-RC guard tests it directly, and a float mask would change how
+            # every downstream consumer of rc_mask behaves. .to(torch.bool) rather
+            # than a `> 0.5` compare so this holds whether the caller hands over
+            # the bool mask bond_order_masks now builds or a float one.
+            return rc_atom.to(torch.bool) & (mask > 0)
         return reaction_center_atom_mask(D_R, D_P, atom_ids, mask, self.rc_bond_scale)
+
+    def _geom_trust_features(self, x_init, x_ts, geom_logvar, mask, rc_mask):
+        """Detached geometry-trust descriptors for the Ea head — [B, _geom_trust_dim].
+
+        Tells the (detached-input) Ea head how much to trust the predicted TS and
+        how asynchronous it is, WITHOUT letting the Ea gradient reshape geometry
+        (every term is detached). Returns None when the feature is disabled.
+        """
+        if not self.ea_use_geom_trust:
+            return None
+        m = mask.to(x_ts.dtype)                                  # [B, N]
+        cnt = m.sum(dim=1).clamp(min=1.0)                        # [B]
+        rc = rc_mask.to(x_ts.dtype) * m                         # [B, N] reactive atoms
+        rc_cnt = rc.sum(dim=1).clamp(min=1.0)
+        # EGNN refinement displacement from the interpolation/MDS seed: large or
+        # concentrated movement => non-interpolative, asynchronous TS.
+        disp = ((x_ts - x_init).detach() ** 2).sum(dim=-1).clamp(min=0.0).sqrt()  # [B, N]
+        disp = disp * m
+        parts = [
+            (disp.sum(dim=1) / cnt).unsqueeze(-1),               # mean displacement
+            disp.max(dim=1).values.unsqueeze(-1),               # max (most-moved atom)
+            ((disp * rc).sum(dim=1) / rc_cnt).unsqueeze(-1),    # reaction-center mean
+        ]
+        if self.geom_uncertainty:
+            if geom_logvar is None:
+                raise RuntimeError(
+                    "ea_use_geom_trust with geom_uncertainty expects geom_logvar, "
+                    "but it was not computed."
+                )
+            lv = geom_logvar.detach() * m                        # [B, N], padded=0
+            parts.append((lv.sum(dim=1) / cnt).unsqueeze(-1))    # mean log-var
+            parts.append(((lv * rc).sum(dim=1) / rc_cnt).unsqueeze(-1))  # RC log-var
+        return torch.cat(parts, dim=-1)                          # [B, _geom_trust_dim]
 
     def forward(
         self, D_R, D_I, D_P, mask, atom_ids, atom_phys,
         de_rxn=None, energy_feats=None, return_uncertainty=False, return_debug=False,
+        c_seed=None, return_coords=False, rc_atom=None,
     ):
         """Predict TS distance matrix and (optionally) the learned Ea.
 
@@ -2353,8 +3040,13 @@ class PSI(nn.Module):
         """
         f = self.core(D_R, D_I, D_P, mask, atom_ids, atom_phys)
         atom_emb = self.core.atom_embed(atom_ids)
-        # Coarse TS distance matrix from the geometry head.
-        D_TS_coarse = self.geom_head(f, atom_emb, atom_phys, D_R, D_I, D_P, mask)
+        coords_mode = self.geometry_mode == "coords"
+        # Coarse TS distance matrix from the geometry head. Skipped entirely in
+        # coordinate-native mode: the interpolation prior it encodes is the single
+        # largest accuracy failure (45.9% of failing val reactions), and the seed
+        # comes from real R/P coordinates instead.
+        D_TS_coarse = None if coords_mode else self.geom_head(
+            f, atom_emb, atom_phys, D_R, D_I, D_P, mask)
         ea_pred_norm = None
         # Chemical properties in one vector; predicted TS coordinates in the
         # other -- both fed to the EGNN. The MDS seed is detached so the
@@ -2362,19 +3054,36 @@ class PSI(nn.Module):
         # (keeping eigh's unstable backward out of the graph) while the EGNN
         # learns the coordinate refinement under the main geometry loss.
         node_feats = torch.cat([atom_emb, atom_phys], dim=-1)
+        if self._egnn_uses_core:
+            # Coordinate-native: the encoder's reaction representation reaches the
+            # EGNN here instead of via geom_head -> MDS. Attached, so the geometry
+            # loss trains PSICore.
+            node_feats = torch.cat([node_feats, f], dim=-1)
         # Coordinate-space MDS (eigh) seed for the EGNN. Device/precision are
         # config-controlled (mds_on_gpu / mds_dtype): CPU-float64 by default,
         # or on-GPU to remove the per-forward sync + host<->device transfers.
-        with torch.amp.autocast(device_type=D_R.device.type, enabled=False):
-            # Differentiable seed lets the geometry head learn through the 3D
-            # reconstruction; the detached path keeps eigh's backward out of the
-            # graph (original behavior). Controlled by config mds_differentiable.
-            seed_in = D_TS_coarse.float() if self.mds_differentiable else D_TS_coarse.detach().float()
-            x_init = torch_mds_coords(
-                seed_in, mask,
-                on_gpu=self.mds_on_gpu, compute_dtype=self.mds_dtype,
-                differentiable=self.mds_differentiable,
-            )
+        if coords_mode:
+            # Real Kabsch-aligned R/P midpoint. No eigh, no interpolation prior --
+            # this also removes the measured 83 ms/step (58% of forward) that
+            # torch_mds_coords costs, since it is never called.
+            if c_seed is None:
+                raise ValueError(
+                    "geometry_mode='coords' requires c_seed (the R/P midpoint from "
+                    "coords_from_batch); refusing to fall back to an MDS seed, which "
+                    "would silently reintroduce the interpolation prior."
+                )
+            x_init = c_seed.to(dtype=torch.float32) * mask.unsqueeze(-1)
+        else:
+            with torch.amp.autocast(device_type=D_R.device.type, enabled=False):
+                # Differentiable seed lets the geometry head learn through the 3D
+                # reconstruction; the detached path keeps eigh's backward out of the
+                # graph (original behavior). Controlled by config mds_differentiable.
+                seed_in = D_TS_coarse.float() if self.mds_differentiable else D_TS_coarse.detach().float()
+                x_init = torch_mds_coords(
+                    seed_in, mask,
+                    on_gpu=self.mds_on_gpu, compute_dtype=self.mds_dtype,
+                    differentiable=self.mds_differentiable,
+                )
 
         # --- Coordinate Noise Data Augmentation ---
         # Prevents late-stage EGNN geometry memorization (train-val gap)
@@ -2385,7 +3094,7 @@ class PSI(nn.Module):
         h_ts, x_ts = self.egnn(node_feats, x_init, mask)
         D_TS_pred = self._coords_to_distance(x_ts, mask)
         geom_logvar = None
-        if (return_uncertainty or return_debug) and self.geom_uncertainty:
+        if self.geom_uncertainty and (return_uncertainty or return_debug or self.ea_use_geom_trust):
             # Per-atom geometry log-variance from the refined features (attached:
             # this is part of the geometry objective, unlike the Ea head).
             geom_logvar = self.geom_logvar_head(h_ts).squeeze(-1)   # [B, N]
@@ -2402,26 +3111,36 @@ class PSI(nn.Module):
                     "energy_feats is required when de_rxn is supplied to the Ea head; "
                     "refusing to run the Ea head on a missing energy descriptor."
                 )
-            rc_mask = self._reaction_center_mask(D_R, D_P, atom_ids, mask)
+            rc_mask = self._reaction_center_mask(D_R, D_P, atom_ids, mask, rc_atom)
+            geom_trust = self._geom_trust_features(x_init, x_ts, geom_logvar, mask, rc_mask)
             ea_pred_norm = self.ea_head(
-                h_ts.detach(), mask, de_rxn.float(), energy_feats.float(), rc_mask
+                h_ts.detach(), mask, de_rxn.float(), energy_feats.float(), rc_mask,
+                geom_trust=geom_trust,
             )
         if return_debug:
             # Per-sector intermediates for the geometry failure atlas
             # (geom_diagnostics.py). All tensors are detached & on-device; this
             # path is off in training so it adds zero hot-loop overhead.
             debug = {
-                "D_coarse": D_TS_coarse.detach(),   # geometry-head (interpolation) output
-                "x_init": x_init.detach(),          # MDS seed coordinates
+                # None in coords mode: there is no geometry head, so the atlas's
+                # geom_head/MDS sectors are genuinely inapplicable rather than zero.
+                "D_coarse": None if D_TS_coarse is None else D_TS_coarse.detach(),
+                "x_init": x_init.detach(),          # seed coords (MDS, or R/P midpoint)
                 "x_ts": x_ts.detach(),              # EGNN-refined coordinates
                 "h_ts": h_ts.detach(),              # EGNN node features
                 "D_pred": D_TS_pred.detach(),       # final predicted distances
                 "geom_logvar": None if geom_logvar is None else geom_logvar.detach(),
             }
-            return D_TS_pred, D_TS_coarse, ea_pred_norm, geom_logvar, debug
-        if return_uncertainty:
-            return D_TS_pred, D_TS_coarse, ea_pred_norm, geom_logvar
-        return D_TS_pred, D_TS_coarse, ea_pred_norm
+            out = (D_TS_pred, D_TS_coarse, ea_pred_norm, geom_logvar, debug)
+        elif return_uncertainty:
+            out = (D_TS_pred, D_TS_coarse, ea_pred_norm, geom_logvar)
+        else:
+            out = (D_TS_pred, D_TS_coarse, ea_pred_norm)
+        # Appended last so every existing positional call site is unaffected; only
+        # coordinate-native training asks for it.
+        if return_coords:
+            out = out + (x_ts,)
+        return out
 
 class CosineWarmupScheduler:
     """Short linear warmup followed by cosine annealing to min_lr.
@@ -2475,7 +3194,10 @@ def freeze_backbone(model):
     """
     if not hasattr(model, "ea_head"):
         raise AttributeError("freeze_backbone requires a model with an ea_head.")
+    # geom_head is None in coords mode (never constructed): nothing to freeze.
     for module in (model.core, model.geom_head, model.egnn):
+        if module is None:
+            continue
         for p in module.parameters():
             p.requires_grad_(False)
         module.eval()
@@ -2522,6 +3244,48 @@ def build_optimizer(model, config):
     )
 
 
+# --- Phase-1 diagnostics: geometry log-variance distribution -----------------
+# The Kendall-Gal attenuation term exp(-logvar) spans exp(-7)..exp(7) (~9e-4 to
+# ~1097), so where the log-variance head actually sits determines the effective
+# gradient scale on the geometry path. Nothing logged that, which left both the
+# val-NLL volatility and the LR sensitivity undiagnosable. Accumulate a fixed-bin
+# GPU histogram (O(1) memory, one host sync per epoch) rather than raw values:
+# 0.1-wide bins resolve "pinned at the clamp" far beyond what's needed.
+LOGVAR_HIST_MIN, LOGVAR_HIST_MAX, LOGVAR_HIST_BINS = -7.0, 7.0, 140
+LOGVAR_HIST_WIDTH = (LOGVAR_HIST_MAX - LOGVAR_HIST_MIN) / LOGVAR_HIST_BINS
+
+
+def _hist_percentile(hist, total, q):
+    """Percentile q (0..1) from a fixed-bin histogram, at bin-centre resolution."""
+    if total <= 0:
+        return None
+    target = q * total
+    cum = 0.0
+    for i, c in enumerate(hist):
+        cum += c
+        if cum >= target:
+            return LOGVAR_HIST_MIN + (i + 0.5) * LOGVAR_HIST_WIDTH
+    return LOGVAR_HIST_MAX
+
+
+def _logvar_summary(hist, total):
+    """Percentiles + clamp-saturation fractions from the accumulated histogram."""
+    if total <= 0:
+        return None
+    return {
+        "p1": _hist_percentile(hist, total, 0.01),
+        "p50": _hist_percentile(hist, total, 0.50),
+        "p99": _hist_percentile(hist, total, 0.99),
+        # Bin 0 is [-7.0, -6.9) and bin -1 is [6.9, 7.0]: the clamp boundaries in
+        # psi_full_pipeline's geom_logvar_head. A high pinned_lo fraction means the
+        # head has saturated and every such pair carries the full ~1097x gradient
+        # amplification.
+        "pinned_lo": hist[0] / total,
+        "pinned_hi": hist[-1] / total,
+        "n": int(total),
+    }
+
+
 def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, stats, is_train=True):
     """Joint geometry + Ea training loop.
 
@@ -2540,8 +3304,11 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         model.train()
     else:
         model.eval()
+    coords_mode = config.get("geometry_mode") == "coords"
+    rc_xtb = config.get("rc_source", "distance") == "xtb"
     total_loss, total_geom, total_triangle = 0.0, 0.0, 0.0
     total_geom_mae_A = 0.0
+    total_coord, total_rmsd_A = 0.0, 0.0
     total_ea_mae, total_ea_norm, n_batches = 0.0, 0.0, 0
     # Non-finite guards: count (and loudly report) batches skipped because the
     # loss or the gradients went NaN/inf, rather than silently masking them. The
@@ -2549,6 +3316,12 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
     # backward; surfacing the count makes an unstable geometry path visible
     # instead of quietly zeroed. See CONFIG["mds_differentiable"].
     nonfinite_loss_skips, nonfinite_grad_skips = 0, 0
+    # Phase-1 diagnostics (see _logvar_summary): log-variance distribution and the
+    # pre-clip gradient-norm distribution. grad_norms is one float per optimizer
+    # step, so it stays small (<= n_batches).
+    logvar_hist = torch.zeros(LOGVAR_HIST_BINS, device=device, dtype=torch.float64)
+    logvar_total = 0
+    grad_norms = []
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
     if ea_only:
         # Stage 2: Ea head is the sole objective; the loss is unweighted.
@@ -2583,15 +3356,42 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             
+            if coords_mode:
+                c_I, c_TS = coords_from_batch(batch, device)
+            else:
+                c_I, c_TS = None, None
+            if rc_xtb:
+                rc_atom_b = batch["rc_atom_xtb"].to(device, non_blocking=True)
+                spec_pair_b = batch["spectator_pair_xtb"].to(device, non_blocking=True)
+            else:
+                rc_atom_b = spec_pair_b = None
+
             t0 = time.perf_counter()
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, p_DTS_coarse, ea_pred_norm, geom_logvar = model(
+                model_out = model(
                     DR, DI, DP, mask, atom_ids, atom_phys,
                     None if geom_only else de_rxn, energy_feats,
                     return_uncertainty=True,
+                    c_seed=c_I, return_coords=coords_mode, rc_atom=rc_atom_b,
                 )
+            if coords_mode:
+                p_DTS, p_DTS_coarse, ea_pred_norm, geom_logvar, x_ts_pred = model_out
+            else:
+                p_DTS, p_DTS_coarse, ea_pred_norm, geom_logvar = model_out
+                x_ts_pred = None
             _sync()
             t_forward += time.perf_counter() - t0
+
+            if geom_logvar is not None:
+                # Real atoms only: geom_logvar is masked_fill(0.0) on padding, which
+                # would otherwise pile a spurious spike at the 0.0 bin.
+                lv_valid = geom_logvar.detach()[mask > 0].float()
+                if lv_valid.numel():
+                    logvar_hist += torch.histc(
+                        lv_valid, bins=LOGVAR_HIST_BINS,
+                        min=LOGVAR_HIST_MIN, max=LOGVAR_HIST_MAX,
+                    ).double()
+                    logvar_total += lv_valid.numel()
 
             t0 = time.perf_counter()
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
@@ -2611,9 +3411,16 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # the long-range active<->spectator cross-distances that encode
                 # global fragment orientation. Boost those cross pairs and the
                 # reactive pairs, and damp the static spectator backbone.
-                active = reaction_center_atom_mask(
-                    DR, DP, atom_ids, mask, config["fragment_bond_scale"]
-                ).to(dist_weights.dtype)                     # [B, N]
+                # xTB Wiberg bond orders when available: the binary cutoff below
+                # misses 8,754 reactive atoms across the dataset (22.0% of
+                # reactions get a different reactive-atom set), and each missed
+                # atom drops its pairs from 2.0-3.0 to the 0.25 spectator weight.
+                if rc_atom_b is not None:
+                    active = rc_atom_b.to(dist_weights.dtype)          # [B, N]
+                else:
+                    active = reaction_center_atom_mask(
+                        DR, DP, atom_ids, mask, config["fragment_bond_scale"]
+                    ).to(dist_weights.dtype)                           # [B, N]
                 a_i = active.unsqueeze(2)                    # [B, N, 1]
                 a_j = active.unsqueeze(1)                    # [B, 1, N]
                 role_weight = (
@@ -2659,10 +3466,25 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 l_geom = (per_pair_geom * m2d_weighted).sum() / denom_weighted
                 # Auxiliary loss on the coarse (pre-EGNN) distances trains the
                 # geometry head directly, giving the EGNN a stable MDS seed.
-                l_geom_coarse = (
-                    F.huber_loss(p_DTS_coarse, DTS, reduction='none', delta=huber_delta)
-                    * m2d_weighted
-                ).sum() / denom_weighted
+                # No coarse matrix in coords mode: the geometry head does not run,
+                # so there is nothing to pre-train. Zero, not a masked stand-in.
+                if p_DTS_coarse is None:
+                    l_geom_coarse = p_DTS.new_zeros(())
+                else:
+                    l_geom_coarse = (
+                        F.huber_loss(p_DTS_coarse, DTS, reduction='none', delta=huber_delta)
+                        * m2d_weighted
+                    ).sum() / denom_weighted
+                # Coordinate-native supervision: Kabsch-aligned per-atom error
+                # against the true DFT TS. This is the objective that replaces the
+                # interpolation prior -- it constrains chirality and absolute
+                # geometry, which a distance matrix alone cannot.
+                if coords_mode:
+                    l_coord, rmsd_A = coordinate_loss(
+                        x_ts_pred, c_TS, mask, delta=huber_delta)
+                else:
+                    l_coord = p_DTS.new_zeros(())
+                    rmsd_A = p_DTS.new_zeros(())
                 # Physical, unweighted interatomic-distance MAE (Angstrom): an
                 # interpretable readout of geometry quality, independent of the
                 # role/inverse-distance weighting used for the gradient.
@@ -2671,7 +3493,25 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 # --- PINN Matrix-wise Cross Check ---
                 # Physics constraint 1: Spectator bonds (abs(DR - DP) < threshold) shouldn't change.
                 # Target them towards the reactant/product midpoint (DI).
-                spectator_mask = (torch.abs(DR - DP) < config["spectator_threshold"]).float() * m2d
+                # Which pairs are pulled toward the R/P midpoint D_I. The original
+                # rule (|D_R - D_P| < 0.15 A, any pair) selects 39.2% of pairs whose
+                # true |D_TS - D_I| averages 0.1218 A -- it imposes a systematic
+                # 0.041 A bias toward the midpoint, on the same failure axis as the
+                # 0.688 under-shoot ratio. Restricting to genuinely bonded pairs
+                # drops that target error to 0.0143 A.
+                if spec_pair_b is not None:
+                    spectator_mask = spec_pair_b.to(p_DTS.dtype) * m2d
+                elif config.get("spectator_bonded_only", False):
+                    radii_s = covalent_radius_lookup(atom_ids.device)[atom_ids]   # [B, N]
+                    bond_cut = config["fragment_bond_scale"] * (
+                        radii_s.unsqueeze(2) + radii_s.unsqueeze(1))
+                    bonded_both = ((DR < bond_cut) & (DP < bond_cut)).to(p_DTS.dtype)
+                    spectator_mask = (
+                        (torch.abs(DR - DP) < config["spectator_threshold"]).to(p_DTS.dtype)
+                        * bonded_both * m2d
+                    )
+                else:
+                    spectator_mask = (torch.abs(DR - DP) < config["spectator_threshold"]).float() * m2d
                 spectator_denom = spectator_mask.sum().clamp(min=1.0)
                 l_pinn_spectator = (
                     F.mse_loss(p_DTS * spectator_mask, DI * spectator_mask, reduction='sum')
@@ -2690,22 +3530,33 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
 
                 l_pinn = l_pinn_spectator + config["steric_loss_weight"] * l_pinn_steric
 
-                l_triangle_refined = triangle_inequality_loss(
-                    p_DTS,
-                    mask,
-                    geom_mask,
-                    tol=config["triangle_tolerance"],
-                    triplet_samples=config["triangle_triplet_samples"],
-                    stochastic=is_train,
-                )
-                l_triangle_coarse = triangle_inequality_loss(
-                    p_DTS_coarse,
-                    mask,
-                    geom_mask,
-                    tol=config["triangle_tolerance"],
-                    triplet_samples=config["triangle_triplet_samples"],
-                    stochastic=is_train,
-                )
+                # Skipped entirely at weight 0 (the default): p_DTS comes from
+                # _coords_to_distance, so this is identically zero and the triplet
+                # sampling would be pure cost. Still computed if re-enabled.
+                if config["triangle_refined_weight"] > 0.0:
+                    l_triangle_refined = triangle_inequality_loss(
+                        p_DTS,
+                        mask,
+                        geom_mask,
+                        tol=config["triangle_tolerance"],
+                        triplet_samples=config["triangle_triplet_samples"],
+                        stochastic=is_train,
+                    )
+                else:
+                    l_triangle_refined = p_DTS.new_zeros(())
+                # Same reason as l_geom_coarse: no geometry head in coords mode, so
+                # there is no coarse matrix to enforce the triangle inequality on.
+                if p_DTS_coarse is None:
+                    l_triangle_coarse = p_DTS.new_zeros(())
+                else:
+                    l_triangle_coarse = triangle_inequality_loss(
+                        p_DTS_coarse,
+                        mask,
+                        geom_mask,
+                        tol=config["triangle_tolerance"],
+                        triplet_samples=config["triangle_triplet_samples"],
+                        stochastic=is_train,
+                    )
                 l_triangle = (
                     config["triangle_refined_weight"] * l_triangle_refined
                     + config["triangle_coarse_weight"] * l_triangle_coarse
@@ -2718,6 +3569,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                 else:
                     loss = (
                         l_geom
+                        + config["coord_loss_weight"] * l_coord
                         + config["geom_coarse_weight"] * l_geom_coarse
                         + 0.2 * l_pinn
                         + config["triangle_loss_weight"] * l_triangle
@@ -2796,7 +3648,13 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
                     t_opt += time.perf_counter() - t0
                     t_batch_start = time.perf_counter()
                     continue
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
+                # clip_grad_norm_ returns the PRE-clip total norm: capture it as the
+                # direct measure of gradient-scale spread. A heavy p99/p50 tail is
+                # what makes a nominal LR unsafe, since the global-norm clip rescales
+                # every parameter's step when any one pair blows up.
+                grad_norms.append(
+                    float(torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"]))
+                )
                 scaler.step(optimizer)
                 scaler.update()
                 _sync()
@@ -2806,6 +3664,9 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
             total_geom += l_geom.item()
             total_geom_mae_A += geom_mae_A.item()
             total_triangle += l_triangle.item()
+            if coords_mode:
+                total_coord += l_coord.item()
+                total_rmsd_A += rmsd_A.item()
             if l_ea is not None:
                 total_ea_norm += l_ea.item()
                 # Denormalized Ea MAE (kcal/mol) for human-readable tracking.
@@ -2821,13 +3682,35 @@ def run_epoch(model, loader, optimizer, scaler, device, config, use_amp, epoch, 
         print(f"[nonfinite] epoch {epoch}: skipped {nonfinite_grad_skips} step(s) "
               f"on non-finite gradients and {nonfinite_loss_skips} on non-finite "
               f"loss (out of {n_batches} batches)")
+    # Single host sync for the whole epoch's log-variance distribution.
+    logvar_stats = _logvar_summary(logvar_hist.cpu().tolist(), logvar_total)
+    if grad_norms:
+        gn_sorted = sorted(grad_norms)
+        ngn = len(gn_sorted)
+        grad_norm_stats = {
+            "p50": gn_sorted[int(0.50 * (ngn - 1))],
+            "p99": gn_sorted[int(0.99 * (ngn - 1))],
+            "max": gn_sorted[-1],
+            # Fraction of steps the global-norm clip actually bit on.
+            "clip_rate": sum(1 for g in gn_sorted if g > config["grad_clip"]) / ngn,
+            "n_steps": ngn,
+        }
+    else:
+        grad_norm_stats = None
     return {
         "loss": total_loss / nb,
         "geom": total_geom / nb,
         "geom_mae_A": total_geom_mae_A / nb,
+        # Coordinate RMSD (A) -- the metric React-OT / OA-ReactDiff report, so this
+        # is the number that makes PSI comparable to them. None in distance mode,
+        # where no coordinate target is supervised.
+        "coord": (total_coord / nb) if coords_mode else None,
+        "rmsd_A": (total_rmsd_A / nb) if coords_mode else None,
         "triangle": total_triangle / nb,
         "ea_mae": total_ea_mae / nb,
         "ea_norm": total_ea_norm / nb,
+        "logvar": logvar_stats,
+        "grad_norm": grad_norm_stats,
         "nonfinite_loss_skips": nonfinite_loss_skips,
         "nonfinite_grad_skips": nonfinite_grad_skips,
         "timing": {
@@ -2951,6 +3834,9 @@ def train_pipeline(config):
     """Thin wrapper that guarantees a verbose saved transcript and a structured
     run report even if training is stopped mid-way (Ctrl-C) or errors out."""
     run_ctx = _begin_run_logging(config)
+    # Before anything constructs a model or a loader, so weight init and shuffling
+    # are covered. No-op when seed is None.
+    seed_everything(config.get("seed"))
     try:
         _train_run(config, run_ctx)
         if run_ctx["status"] == "running":
@@ -3022,10 +3908,17 @@ def _train_run(config, run_ctx):
     optimizer = build_ea_only_optimizer(model, config) if ea_only else build_optimizer(model, config)
     if hasattr(model, "ea_head"):
         print(f"Learning rates: base={config['lr']:.2e}, ea_head={config['ea_head_lr']:.2e}")
+    lr_horizon = config.get("lr_schedule_epochs") or config.get("swa_start", config["epochs"])
+    if lr_horizon <= config["warmup_epochs"]:
+        raise ValueError(
+            f"lr_schedule_epochs ({lr_horizon}) must exceed warmup_epochs "
+            f"({config['warmup_epochs']}): the cosine phase would be empty."
+        )
+    print(f"LR schedule: warmup {config['warmup_epochs']} ep, cosine horizon {lr_horizon} ep")
     scheduler = CosineWarmupScheduler(
         optimizer,
         warmup_epochs=config["warmup_epochs"],
-        total_epochs=config.get("swa_start", config["epochs"]),
+        total_epochs=lr_horizon,
         min_lr=1e-6,
     )
     use_amp = config["amp"] and device.type == "cuda"
@@ -3121,9 +4014,15 @@ def _train_run(config, run_ctx):
                 val_select = val_metrics["ea_mae"]
             elif geom_only:
                 # Stage 1: geometry only.
-                val_select = val_metrics["geom"]
+                val_select = val_metrics["geom_mae_A"]
             else:
-                val_select = val_metrics["geom"] + config["ea_select_weight"] * val_metrics["ea_norm"]
+                # Select on the raw distance MAE (Angstrom), never on val_metrics["geom"]:
+                # with geom_uncertainty the latter is the Kendall-Gal NLL, whose
+                # exp(-logvar) precision term grows without bound as the model gets
+                # confident. That makes it rise on val even while the MAE falls, so
+                # selecting on it freezes best_epoch early and early-stops a run that
+                # is still improving. MAE is calibration-free and monotone in quality.
+                val_select = val_metrics["geom_mae_A"] + config["ea_select_weight"] * val_metrics["ea_norm"]
 
             if swa_enabled and epoch >= swa_start:
                 swa_scheduler.step()
@@ -3149,6 +4048,24 @@ def _train_run(config, run_ctx):
                 "val_ea_norm": val_metrics["ea_norm"],
                 "lr": current_lr,
                 "ea_lr": current_ea_lr,
+                # Phase-1 diagnostics. None when geom_uncertainty is off (logvar) or
+                # on a no-step epoch (grad_norm); consumers must not assume presence.
+                "train_logvar": train_metrics["logvar"],
+                "val_logvar": val_metrics["logvar"],
+                "train_grad_norm": train_metrics["grad_norm"],
+                "train_nonfinite_grad_skips": train_metrics["nonfinite_grad_skips"],
+                # None outside coords mode. rmsd_A is the Kabsch-aligned coordinate
+                # RMSD -- the metric coordinate-native training actually optimizes
+                # and the one comparable to React-OT / OA-ReactDiff. run_epoch has
+                # always computed it; without these two keys it was discarded every
+                # epoch, leaving a coords run with no readout of its own objective.
+                # It is also the ONLY logged quantity sensitive to chirality:
+                # val_select is distance-based, and a distance matrix cannot tell an
+                # enantiomer from the real structure.
+                "train_coord": train_metrics["coord"],
+                "val_coord": val_metrics["coord"],
+                "train_rmsd_A": train_metrics["rmsd_A"],
+                "val_rmsd_A": val_metrics["rmsd_A"],
             })
             improved = val_select < best_val_loss
             if improved:
@@ -3178,11 +4095,16 @@ def _train_run(config, run_ctx):
             epoch_time = time.time() - epoch_t0
             eta_min = (config["epochs"] - epoch) * epoch_time / 60.0
             marker = " *" if improved else ""
+            # Coordinate RMSD is the coords-mode objective's own readout; without it
+            # the per-epoch line would show only distance metrics for a run that is
+            # not training in distance space.
+            rmsd_col = (f" | RMSD {val_metrics['rmsd_A']:6.3f}A"
+                        if val_metrics.get("rmsd_A") is not None else "")
             print(f"{epoch:6d} | {train_metrics['loss']:11.4f} | {val_metrics['loss']:11.4f} | "
                   f"{train_metrics['geom']:8.5f} | {val_metrics['geom']:8.5f} | "
                   f"{val_metrics['geom_mae_A']:9.4f} | "
                   f"{train_metrics['ea_mae']:8.3f} | {val_metrics['ea_mae']:8.3f} | "
-                  f"{current_lr:10.2e} | {epoch_time:6.1f}s | ETA {eta_min:6.1f}m{marker}")
+                  f"{current_lr:10.2e}{rmsd_col} | {epoch_time:6.1f}s | ETA {eta_min:6.1f}m{marker}")
             with open(run_ctx["history_path"], "w") as f:
                 json.dump(history, f, indent=2)
             if improved:
@@ -3225,10 +4147,28 @@ def _train_run(config, run_ctx):
     # =========================================================================
     # Post-training: predict TS geometries, then compute Ea via physics
     # =========================================================================
+    # Sweep runs read training_history.json only, and this tail costs ~18 min per
+    # run (full-set inference + a 130 MB detailed_analysis.json + dashboard + the
+    # all-val geometry atlas) at a peak RSS that has crashed runs on a 12 GB host.
+    # Skipping it is for diagnostic sweeps only -- a production run must keep it,
+    # so this is opt-in and announced rather than a silent default.
+    if config.get("skip_final_eval", False):
+        print("\n[skip-final-eval] Training complete. Skipping evaluation, "
+              "detailed_analysis.json, dashboard and geometry atlas.")
+        print(f"[skip-final-eval] training_history.json and checkpoints are in "
+              f"{config['save_dir']}")
+        return
     print("\n" + "="*70); print(" EVALUATION (geometry + learned Ea + physics baseline) "); print("="*70)
     model.eval()
     # Step 1: collect predicted TS distance matrices + learned Ea for all reactions.
     pred_dists_map = {}   # rxn_id -> (n, n) numpy pred dist
+    eval_coords_mode = config.get("geometry_mode") == "coords"
+    # rxn_id -> (n, 3) coords straight from the model. In coords mode these must
+    # NOT be re-derived from pred_dist via MDS: a distance matrix does not encode
+    # handedness, so the MDS embedding can come back as the enantiomer of what the
+    # model actually predicted -- silently destroying the one property that
+    # coordinate-native geometry exists to get right.
+    pred_coords_map = {}
     ea_neural_map = {}    # rxn_id -> learned Ea (kcal/mol, denormalized)
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
     geom_results = []
@@ -3240,8 +4180,22 @@ def _train_run(config, run_ctx):
                 de_rxn, energy_feats, _risk_pair_mask,
                 _risk_score, _risk_penalty, _complexity_flag, _risky_chem_flag,
             ) = move_batch_to_device(batch, device)
+            c_I_eval = coords_from_batch(batch, device)[0] if eval_coords_mode else None
+            # Same reaction-centre source the loss used, so the Ea head sees at eval
+            # exactly the rc_mask it was trained against.
+            rc_atom_eval = (
+                batch["rc_atom_xtb"].to(device, non_blocking=True)
+                if config.get("rc_source", "distance") == "xtb" else None
+            )
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                p_DTS, _, ea_pred_norm = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats)
+                _out = model(DR, DI, DP, mask, atom_ids, atom_phys, de_rxn, energy_feats,
+                             c_seed=c_I_eval, return_coords=eval_coords_mode,
+                             rc_atom=rc_atom_eval)
+            if eval_coords_mode:
+                p_DTS, _, ea_pred_norm, x_ts_eval = _out
+            else:
+                p_DTS, _, ea_pred_norm = _out
+                x_ts_eval = None
             ea_pred_kcal = None
             if ea_pred_norm is not None:
                 ea_pred_kcal = (ea_pred_norm.float().cpu().numpy() * ea_std + ea_mean)
@@ -3257,6 +4211,8 @@ def _train_run(config, run_ctx):
                 d_mae_all = d_abs.mean().item()
                 split = "val" if rxn_id in val_rxn_ids else "train"
                 pred_dists_map[rxn_id] = dp
+                if x_ts_eval is not None:
+                    pred_coords_map[rxn_id] = x_ts_eval[i, :n].float().cpu().numpy().astype(np.float64)
                 if ea_pred_kcal is not None:
                     ea_neural_map[rxn_id] = float(ea_pred_kcal[i])
                 geom_results.append({
@@ -3290,8 +4246,20 @@ def _train_run(config, run_ctx):
         # predictions are preserved.
         c_R = np.asarray(s["c_R"][:n], dtype=np.float64)
         c_P = np.asarray(s["c_P"][:n], dtype=np.float64)
-        c_I = (kabsch_align_reactant_fragments(c_R, c_P, atom_types, n, config["fragment_bond_scale"])[:n] + c_P[:n]) / 2.0
-        pred_coords = mds_aligned(pred_dist, reference_coords=c_I)
+        if eval_coords_mode:
+            # Keyed on the MODE, not on dict membership. A missing entry here used
+            # to fall through to the MDS branch below, which reconstructs coords
+            # from a distance matrix and is chirality-blind -- it can return the
+            # enantiomer. Silently mirroring a structure is worse than stopping.
+            if rxn_id not in pred_coords_map:
+                raise RuntimeError(
+                    f"coords mode: no predicted coordinates for {rxn_id}. Refusing to "
+                    f"rebuild them via MDS, which cannot recover handedness."
+                )
+            pred_coords = pred_coords_map[rxn_id]
+        else:
+            c_I = (kabsch_align_reactant_fragments(c_R, c_P, atom_types, n, config["fragment_bond_scale"])[:n] + c_P[:n]) / 2.0
+            pred_coords = mds_aligned(pred_dist, reference_coords=c_I)
         all_coords_ts[rxn_id] = pred_coords
     # Compute physics features for train split, fit OLS
     train_samples_ordered = [samples[i] for i in train_indices]
@@ -3465,11 +4433,21 @@ def predict_transition_state(config, reactant_path, product_path, model_path, ou
         t_DI = torch.from_numpy(D_I).unsqueeze(0).to(device)
         t_DP = torch.from_numpy(D_P).unsqueeze(0).to(device)
         t_mask = torch.from_numpy(mask).unsqueeze(0).to(device)
+        # Coordinate-native checkpoints need the same seed the DATASET builds, which
+        # is coordinate_seed()'s global Kabsch alignment -- not the per-fragment
+        # c_I computed above for the physics baseline. Feeding the wrong one would
+        # hand the EGNN a seed from a different frame than it ever trained on.
+        t_c_seed = None
+        if model_config.get("geometry_mode") == "coords":
+            c_seed_np, _ = coordinate_seed(c_R, c_P, n)
+            t_c_seed = torch.from_numpy(
+                c_seed_np.astype(np.float32)).unsqueeze(0).to(device)
         t_atom_ids = torch.from_numpy(atom_ids).unsqueeze(0).to(device)
         t_aphys = torch.from_numpy(atom_phys_norm).unsqueeze(0).to(device)
         t_de_rxn = torch.tensor([de_rxn_norm], dtype=torch.float32, device=device)
         t_efeats = torch.from_numpy(energy_feats_norm.astype(np.float32)).unsqueeze(0).to(device)
-        p_DTS, _, ea_pred_norm = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_aphys, t_de_rxn, t_efeats)
+        p_DTS, _, ea_pred_norm = model(t_DR, t_DI, t_DP, t_mask, t_atom_ids, t_aphys,
+                                       t_de_rxn, t_efeats, c_seed=t_c_seed)
     # Learned Ea (denormalized). Normalization stats are validated above, so the
     # only way this is None is if the head produced nothing, which we reject below.
     ea_neural = None
@@ -4351,6 +5329,10 @@ if __name__ == "__main__":
     compile_group.add_argument("--compile", action="store_true", help="Enable torch.compile when the CUDA/Triton runtime supports Inductor")
     compile_group.add_argument("--no-compile", action="store_true", help="Explicitly use eager execution (default)")
     train_parser.add_argument("--patience", type=int, default=CONFIG["patience"], help="Early stopping patience")
+    train_parser.add_argument("--warmup-epochs", type=int, default=CONFIG["warmup_epochs"], help="Linear LR warmup length in epochs")
+    train_parser.add_argument("--grad-clip", type=float, default=CONFIG["grad_clip"], help="Global grad-norm clip threshold. Pass inf to disable clipping while still recording gradient norms")
+    train_parser.add_argument("--skip-final-eval", action="store_true", help="Stop after training: no evaluation, detailed_analysis.json, dashboard or geometry atlas. For diagnostic sweeps that read only training_history.json")
+    train_parser.add_argument("--lr-schedule-epochs", type=int, default=None, help="Cosine decay horizon in epochs, decoupled from --epochs (default: swa_start)")
     train_parser.add_argument("--lr", type=float, default=CONFIG["lr"], help="Learning rate")
     train_parser.add_argument("--ea-head-lr", type=float, default=CONFIG["ea_head_lr"], help="Learning rate for the Ea head")
     train_parser.add_argument("--ea-loss-weight", type=float, default=CONFIG["ea_loss_weight"], help="Full joint Ea objective weight")
@@ -4360,6 +5342,14 @@ if __name__ == "__main__":
     train_parser.add_argument("--swa-start", type=int, default=CONFIG["swa_start"], help="Epoch to start SWA")
     train_parser.add_argument("--no-swa", action="store_true", help="Disable SWA")
     train_parser.add_argument("--save-dir", default=CONFIG["save_dir"], help="Directory to save checkpoints (e.g. runs/phase1_warm_start)")
+    train_parser.add_argument("--sample-cache-path", default=None, help="Explicit sample-cache path. Default None -> resolved from geometry-mode: the v4 (c_TS) cache for coords, the v3 pool for distance. Only set this for a side run with a non-standard cache location.")
+    train_parser.add_argument("--geometry-mode", choices=["distance", "coords"], default=CONFIG["geometry_mode"], help="'coords' (DEFAULT): coordinate-native, EGNN seeded with the real Kabsch-aligned R/P midpoint and supervised against c_TS -- no interpolation prior, no eigh; needs the v4 cache (the default). 'distance': legacy geometry head -> predicted D_TS -> MDS seed -> EGNN; pass --sample-cache-path samples_cache_rgd1.pkl with it.")
+    train_parser.add_argument("--coord-loss-weight", type=float, default=CONFIG["coord_loss_weight"], help="Weight on the Kabsch-aligned coordinate loss (coords mode only)")
+    train_parser.add_argument("--seed", type=int, default=None, help="Seed python/numpy/torch. Required for a meaningful A/B: nothing but the train/val split is seeded otherwise, so two runs of identical code diverge")
+    train_parser.add_argument("--rc-source", choices=["distance","xtb"], default=CONFIG["rc_source"], help="Reaction-centre source. 'xtb' uses cached GFN2-xTB Wiberg bond orders (build_bond_orders.py); the binary distance cutoff misses 8,754 reactive atoms across the dataset")
+    train_parser.add_argument("--bond-order-cache-path", default=None, help="Path to bond_orders_cache.pkl (default: save_dir/bond_orders_cache.pkl)")
+    train_parser.add_argument("--bo-change-threshold", type=float, default=CONFIG["bo_change_threshold"], help="|bond order R-P| above which a pair counts as reactive")
+    train_parser.add_argument("--spectator-bonded-only", action="store_true", help="Restrict the spectator midpoint target to pairs covalently bonded in both R and P (8.5x lower target error)")
     train_parser.add_argument("--geom-only", action="store_true", help="Stage 1: train the geometry backbone only (no Ea head/loss); select on validation geometry error")
     train_parser.add_argument("--ea-only", action="store_true", help="Stage 2: freeze a loaded backbone (--backbone-ckpt) and train only the Ea head on its frozen predicted TS")
     train_parser.add_argument("--backbone-ckpt", default=None, help="Stage 2: path to the frozen Stage-1 backbone checkpoint (required with --ea-only)")
@@ -4374,6 +5364,17 @@ if __name__ == "__main__":
     dash_parser = subparsers.add_parser("dashboard", help="Generate the results dashboard from a detailed_analysis.json")
     dash_parser.add_argument("--data", default="detailed_analysis.json", help="Path to detailed_analysis.json")
     dash_parser.add_argument("--save-dir", default=".", help="Directory to save the HTML dashboard")
+    # Building the sample cache is a multi-hour, one-time job. Without its own
+    # subcommand the only way to trigger it was `train`, which then ran the full
+    # epoch schedule behind it.
+    cache_parser = subparsers.add_parser(
+        "build-cache",
+        help="Build (and cache) the reaction samples, then exit. No training.")
+    cache_parser.add_argument("--sample-cache-path", default=None, help="Where to write the cache. Use a NEW path to leave the existing cache untouched")
+    cache_parser.add_argument("--geometry-mode", choices=["distance", "coords"], default=CONFIG["geometry_mode"], help="'coords' builds a v4 cache that includes the true DFT TS coordinates (c_TS)")
+    cache_parser.add_argument("--data-dir", default=CONFIG.get("data_dir"), help="Directory holding RGD1_CHNO.h5 + DFT_reaction_info.csv")
+    cache_parser.add_argument("--target-reactions", type=int, default=CONFIG["target_reactions"], help="Number of reactions to build")
+    cache_parser.add_argument("--force-extract", action="store_true", help="Rebuild even if a valid cache already exists at that path")
     if len(sys.argv) == 1:
         args = parser.parse_args(["train"])
     else:
@@ -4383,6 +5384,25 @@ if __name__ == "__main__":
         predict_transition_state(CONFIG, args.reactant, args.product, args.model, args.output, args.xyz)
     elif args.command == "dashboard":
         create_dashboard(args.data, args.save_dir)
+    elif args.command == "build-cache":
+        CONFIG["geometry_mode"] = args.geometry_mode
+        CONFIG["target_reactions"] = args.target_reactions
+        CONFIG["force_extract"] = args.force_extract
+        if args.data_dir:
+            CONFIG["data_dir"] = args.data_dir
+        if args.sample_cache_path:
+            CONFIG["sample_cache_path"] = args.sample_cache_path
+        path = _samples_cache_path(CONFIG)
+        print(f"Building sample cache -> {path}")
+        print(f"  geometry_mode={CONFIG['geometry_mode']}  "
+              f"target_reactions={CONFIG['target_reactions']}  "
+              f"cache_meta={_sample_cache_meta(CONFIG)}")
+        t0 = time.time()
+        extract_raw_data(CONFIG)
+        samples, atom_vocab, _ = build_reaction_samples(CONFIG)
+        print(f"Built {len(samples)} samples, vocab={len(atom_vocab)}, "
+              f"in {(time.time()-t0)/60:.1f} min.")
+        print(f"  c_TS present: {'c_TS' in samples[0] if samples else 'n/a'}")
     else:
         if args.command == "train":
             CONFIG["dataset"] = args.dataset
@@ -4418,11 +5438,39 @@ if __name__ == "__main__":
             CONFIG["ea_loss_weight"] = args.ea_loss_weight
             CONFIG["ea_loss_start_epoch"] = args.ea_loss_start_epoch
             CONFIG["ea_select_weight"] = args.ea_select_weight
+            CONFIG["warmup_epochs"] = args.warmup_epochs
+            CONFIG["grad_clip"] = args.grad_clip
+            CONFIG["skip_final_eval"] = args.skip_final_eval
+            CONFIG["lr_schedule_epochs"] = args.lr_schedule_epochs
             CONFIG["ea_head_dropout"] = args.ea_head_dropout
             CONFIG["swa_start"] = args.swa_start
             if args.no_swa:
                 CONFIG["swa_enabled"] = False
             CONFIG["save_dir"] = args.save_dir
+            CONFIG["sample_cache_path"] = args.sample_cache_path
+            CONFIG["geometry_mode"] = args.geometry_mode
+            CONFIG["seed"] = args.seed
+            CONFIG["rc_source"] = args.rc_source
+            CONFIG["bo_change_threshold"] = args.bo_change_threshold
+            if args.bond_order_cache_path:
+                CONFIG["bond_order_cache_path"] = args.bond_order_cache_path
+            if args.spectator_bonded_only:
+                CONFIG["spectator_bonded_only"] = True
+            CONFIG["coord_loss_weight"] = args.coord_loss_weight
+            if args.geometry_mode == "coords":
+                # coords resolves to the v4 (c_TS) cache by default. Fail fast with
+                # the build command if it is absent, rather than several minutes
+                # into a load -- but only when it was NOT explicitly provided (an
+                # explicit path may legitimately not exist yet and get built).
+                resolved = _samples_cache_path(CONFIG)
+                if not args.sample_cache_path and not os.path.exists(resolved):
+                    raise SystemExit(
+                        f"geometry_mode=coords needs the v4 (c_TS) cache at {resolved}, "
+                        f"which is absent. Build it once with:\n"
+                        f"    python psi_full_pipeline.py build-cache --geometry-mode "
+                        f"coords --sample-cache-path {resolved}\n"
+                        f"or run with --geometry-mode distance for the legacy path."
+                    )
             if args.geom_only:
                 CONFIG["geom_only"] = True
             if args.ea_only:
