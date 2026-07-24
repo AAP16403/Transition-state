@@ -16,6 +16,18 @@ exactly one code path and nothing to configure:
   uncertainty         heteroscedastic per-atom log-variance + Kendall-Gal loss
                       attenuation, feeding detached geometry-trust features to the
                       Ea head.
+  Ea head             physics prior (linear BEP on dE_rxn + FiLM over the 28D R/P
+                      descriptor and the continuous GFN2-xTB reaction-centre
+                      descriptor) fused with 13 detached descriptors of the
+                      PREDICTED TS -- where it sits along the reaction coordinate,
+                      how asynchronous it is, how far the non-reacting scaffold is
+                      strained off the R/P midpoint. Held out of the loss for the
+                      first EA_START_EPOCH epochs, because none of those channels
+                      means anything until the geometry is worth reading.
+  batching            batches are length-bucketed and every atom axis is trimmed to
+                      the batch's largest molecule. The EGNN is the forward cost and
+                      it is quadratic in atom count; RGD1 averages 17.7 atoms
+                      against MAX_ATOMS = 30, so ~64% of that work was padding.
   precision           fp16 AMP + GradScaler. Neither P100 (Pascal) nor T4 (Turing)
                       supports bf16, so fp16 is not a choice, it is the only
                       option. torch.compile is enabled only on sm_70+: Triton
@@ -32,8 +44,8 @@ exactly one code path and nothing to configure:
 Deleted because coordinate-native makes them dead weight, not because they were
 turned off: the coarse-distance aux loss and both triangle-inequality losses (a
 distance matrix read off real coordinates satisfies the triangle inequality by
-construction), the delta-clamp, MDS, coord-noise augmentation, the geom-only /
-ea-only staging, and the distance-rule spectator mask.
+construction), the delta-clamp, MDS, coord-noise augmentation, the ea-only staging,
+and the distance-rule spectator mask.
 
 No config dict, no mode flags, no fallback branches, no try/except. Hyperparameters
 are module constants below. Anything that cannot proceed correctly raises.
@@ -41,9 +53,24 @@ are module constants below. Anything that cannot proceed correctly raises.
 --------------------------------------------------------------------------------
 RUNNING ON KAGGLE
 --------------------------------------------------------------------------------
-Run each stage with `!python` from a notebook cell, as shown. `%run` works too --
-IPython injects its own argv ("-f /root/.../kernel-abc.json"), which resolve_stage
-ignores rather than mistaking for a stage name.
+There are two ways to run this, and the stage commands differ between them.
+
+  AS A FILE -- upload it, or attach it as a Dataset, then from a cell:
+
+      !python psi_cloud_pipeline.py <stage>
+
+    `%run` works too. IPython injects its own argv ("-f /root/.../kernel-abc.json"),
+    which resolve_stage ignores rather than mistaking for a stage name.
+
+  PASTED INTO A CELL -- no upload, no Dataset, no path. Run the cell; with no stage
+    name to read, resolve_stage picks DEFAULT_STAGE and it trains. There is no file
+    on disk, so `!python ...` has nothing to point at: run any OTHER stage by
+    calling its function from a new cell, which the paste has already defined.
+
+      stage_eval()        stage_bond_orders()
+
+    Error messages work this out for themselves -- see how_to_run -- so whichever
+    way you are running, what they print is what you can actually type.
 
 Turn Internet ON: the first run streams RGD1_CHNO.h5 (~1.34 GB) and
 DFT_reaction_info.csv from Figshare into /kaggle/working/RGD1_Dataset, then parses
@@ -79,10 +106,13 @@ straight to training. Two facts make the auto-build worth understanding:
     training on purpose -- a Kaggle session is cut long before the epoch budget
     runs out, so an evaluation that only fired after the last epoch would never run.
 
-Kaggle sessions are capped at ~9-12 h, which is far short of a full run, so every
-epoch checkpoints to /kaggle/working/psi_latest.pt and training RESUMES from it
-automatically. Save the output as a Dataset, attach it to the next session, and
-re-run the same command until the epoch budget is exhausted.
+There is NO resume. `train` always starts from initialisation, and the only weights
+written are /kaggle/working/psi_best.pt, re-saved whenever val_select improves.
+Kaggle caps a session at ~9-12 h, so a run cut short keeps whatever psi_best.pt held
+at that point and nothing else -- the epochs themselves are not recoverable and a
+later session repeats them. `eval` scores psi_best.pt, so a cut run is still
+measurable; it is just not continuable. (The data caches are unaffected: those are
+separate files and every session reuses them.)
 
 Per-epoch telemetry covers the two failure modes the legacy runs actually hit:
 `lvFloor` is the fraction of atoms pinned at the log-variance floor (it reached
@@ -122,8 +152,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader, Subset
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import Dataset, DataLoader, Subset, Sampler
 
 # =============================================================================
 # Hyperparameters. Module constants, deliberately not a config dict: every value
@@ -152,20 +181,45 @@ EGNN_COORD_CLAMP = 3.5
 EA_LOSS_WEIGHT = 0.5
 EA_SELECT_WEIGHT = 4.0              # Ea contribution to checkpoint selection
 EA_HEAD_DROPOUT = 0.15
-EA_HEAD_LR = 3e-4
+EA_HEAD_LR = 6e-4                   # sqrt-scaled with BATCH_SIZE, same as LR
 EA_HEAD_WEIGHT_DECAY = 1e-3
+# Epoch the Ea head enters the loss. Before it the run is geometry-only: the head
+# reads where the PREDICTED TS sits along the reaction coordinate, and until the
+# EGNN has moved off its R/P-midpoint seed that descriptor says "midpoint" for
+# every reaction in the set. Fitting Ea to it first teaches a mapping that has to
+# be unlearned once the geometry becomes real.
+EA_START_EPOCH = 150
 
 # Optimisation
-LR = 1.5e-4
+# LR and BATCH_SIZE move together. 48 -> 192 was chosen for the P100, where
+# torch.compile is unavailable (sm_60) and an eager step at 48 is dominated by
+# kernel-launch and Python overhead rather than by the GPU: measured on the sweep
+# below, an N=2 step costs the same as an N=30 one, so the batch is the only lever
+# that amortises it. 334 -> 1031 samples/s, at 2.5 GB of the P100's 16 GB.
+# LR is sqrt-scaled, not linearly: sqrt(192/48) * 1.5e-4.
+LR = 3.0e-4
 WEIGHT_DECAY = 1e-3
-WARMUP_EPOCHS = 5
+# In EPOCHS, and an epoch is now 177 steps rather than 708 -- so this is 1,770
+# warmup steps against the 3,540 the old 5 epochs bought. Raise to 20 if the first
+# epochs show grad_skips or a clip_rate pinned at 1.00.
+WARMUP_EPOCHS = 10
 GRAD_CLIP = 1.0
-BATCH_SIZE = 48                     # PER RANK; global batch is 2x this on T4 x2
+BATCH_SIZE = 192                    # PER RANK; global batch is 2x this on T4 x2
 EPOCHS = 800
 SWA_START = 450                     # also the cosine horizon
 PATIENCE = 120
-NUM_WORKERS = 2
+# 4 fits Kaggle's 4 vCPU on a single P100, where no second rank competes for them.
+# On T4 x2 this is 4 per rank on the same 4 cores; drop it to 2 there.
+NUM_WORKERS = 4
 PREFETCH_FACTOR = 4
+# Length bucketing: how many batches are drawn from one shuffled pool before it is
+# sorted by atom count and cut up. Counted in BATCHES, not reactions, so the pool
+# is always a whole number of batches -- a pool that did not divide evenly would
+# leave a short batch at the end of EVERY pool for drop_last to discard, silently
+# losing thousands of reactions per epoch. 8 x 192 keeps the pool at ~1,536
+# reactions: wide enough that a batch's membership is redrawn every epoch, narrow
+# enough that its members are still close in size.
+BUCKET_POOL_BATCHES = 8
 
 # Geometry loss: reaction-role reweighting
 GEOM_HINGE_CROSS_WEIGHT = 3.0       # active <-> spectator cross pairs
@@ -211,14 +265,25 @@ WORK_DIR = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.getcwd(
 SAMPLE_CACHE = os.path.join(WORK_DIR, "samples_cache.pkl")
 BOND_ORDER_CACHE = os.path.join(WORK_DIR, "bond_orders_cache.pkl")
 BEST_CKPT = os.path.join(WORK_DIR, "psi_best.pt")
-LATEST_CKPT = os.path.join(WORK_DIR, "psi_latest.pt")
 HISTORY_PATH = os.path.join(WORK_DIR, "training_history.json")
 RESULTS_PATH = os.path.join(WORK_DIR, "results.json")
 SPLIT_PATH = os.path.join(WORK_DIR, "split.json")
-# `__file__` is undefined in a notebook kernel (the code runs from a cell, not a
-# file), so it cannot be used to name the script in help text. Fall back to the
-# fixed name the instructions already use everywhere else.
+# `__file__` is undefined when this code runs from a notebook CELL rather than a
+# file -- which is the common Kaggle case, because pasting the script into a cell
+# needs no dataset, no upload and no path. Help text has to know which it is: with
+# no file on disk there is nothing for `!python` to point at, and telling the user
+# to run one is telling them to run something that cannot work. Every def has
+# already executed into the notebook's globals by then, so the stage function IS
+# the instruction, and `how_to_run` emits whichever form actually applies.
 SCRIPT_NAME = os.path.basename(globals().get("__file__", "psi_cloud_pipeline.py"))
+IS_SCRIPT = "__file__" in globals()
+
+
+def how_to_run(stage):
+    """The literal text to type in order to run `stage`, however this file loaded."""
+    if IS_SCRIPT:
+        return f"!python {SCRIPT_NAME} {stage}"
+    return f"{STAGES[stage].__name__}()   # in a new cell; already defined by the paste"
 
 # =============================================================================
 # Chemistry tables
@@ -240,6 +305,7 @@ RISK_BOND_TYPES = {tuple(sorted(p)) for p in
 
 ATOM_PHYS_DIM = 3                   # electronegativity, Z, mass
 ENERGY_FEAT_DIM = 28                # energetics + composition + angles + RC angles
+BO_FEAT_DIM = 12                    # continuous Wiberg reaction-centre descriptors
 
 
 def covalent_radius(a):
@@ -312,15 +378,6 @@ def connected_components(adj):
 def find_fragments(coords, atom_types, n, scale=FRAGMENT_BOND_SCALE):
     return connected_components(bond_adjacency(coords, atom_types, n, scale))
 
-
-def geometry_pair_mask(fragments, max_atoms):
-    """1 for intra-fragment pairs. Marks which distances are chemically bonded-ish."""
-    gm = np.zeros((max_atoms, max_atoms), dtype=np.float32)
-    for frag in fragments:
-        idx = np.array(frag, dtype=np.int64)
-        gm[np.ix_(idx, idx)] = 1.0
-    np.fill_diagonal(gm, 0.0)
-    return gm
 
 
 def kabsch(P, Q):
@@ -705,8 +762,6 @@ def build_samples():
                 "c_I": coordinate_seed(c_R, c_P, n),
                 "atom_ids": atom_ids, "mask": mask,
                 "D_R": D_R, "D_P": D_P, "D_TS": compute_distance_matrix(c_TS),
-                "geom_mask": geometry_pair_mask(
-                    find_fragments(c_TS, atom_types, n), MAX_ATOMS),
                 "Ea_raw": ea, "de_rxn_raw": dh,
                 "energy_feats_raw": build_energy_features(
                     atom_types, n, c_R_frag, c_P, 0.0, dh),
@@ -860,7 +915,7 @@ def load_bond_orders():
             f"No bond-order cache found (looked under /kaggle/input and at "
             f"{BOND_ORDER_CACHE}). Build it with:\n"
             f"    !pip install tblite\n"
-            f"    !python {SCRIPT_NAME} bond-orders\n"
+            f"    {how_to_run('bond-orders')}\n"
             "or just run `train`, which builds it automatically on first use. "
             "Refusing to substitute the covalent-radius cutoff, which is a "
             "different reaction-centre definition."
@@ -872,13 +927,18 @@ def load_bond_orders():
 
 
 def bond_order_masks(bo_R, bo_P, n):
-    """(reactive_atom [MAX_ATOMS], spectator_pair [MAX_ATOMS, MAX_ATOMS]), both bool.
+    """(reactive_atom [MAX_ATOMS], spectator_pair [N, N], reactive_pair [N, N]), bool.
 
     reactive pair : |bo_R - bo_P| > BO_CHANGE_THRESHOLD
     reactive atom : incident on any reactive pair
     spectator pair: bonded in BOTH R and P and not reactive — the only pairs whose
                     true TS distance actually sits near the R/P midpoint (measured
                     |D_TS - D_I| = 0.0143 A, against 0.1218 A for the distance rule).
+
+    The reactive pair mask used to be a local of this function. It is returned now
+    because the Ea head measures reaction-coordinate progress ON those pairs (see
+    PSI.geom_trust): the atom-level mask cannot say WHICH bond a reactive atom is
+    forming, and a reactive atom in a three-centre TS is on two of them.
 
     Bool, not float32: these are memoised per sample in every persistent worker,
     where the [30, 30] spectator mask costs 3,600 B/sample as float32 (~123 MB per
@@ -893,7 +953,45 @@ def bond_order_masks(bo_R, bo_P, n):
                    & (bo_P.astype(np.float32) > BO_BONDED_MIN) & off)
     spec = np.zeros((MAX_ATOMS, MAX_ATOMS), dtype=bool)
     spec[:n, :n] = bonded_both & ~reactive
-    return rc_atom, spec
+    react = np.zeros((MAX_ATOMS, MAX_ATOMS), dtype=bool)
+    react[:n, :n] = reactive
+    return rc_atom, spec, react
+
+
+def bond_order_features(bo_R, bo_P, n):
+    """Continuous GFN2-xTB reaction-centre descriptors -> [BO_FEAT_DIM] float32.
+
+    bond_order_masks throws the MAGNITUDES away: every pair over the 0.5 threshold
+    becomes one identical bit. A half-shifted pi bond and a fully severed sigma
+    bond are the same reaction centre to that mask and are not the same barrier, so
+    the Ea head gets the numbers themselves — total bond reorganisation, how it
+    splits between formation and cleavage, how evenly it is spread over the
+    reacting bonds, and how strong the bonds being broken were to begin with.
+
+    R and P only. TS bond orders are never computed at all (see _bond_orders_one),
+    so there is nothing here that could leak the target.
+
+    Upper triangle, not the full matrix: a Wiberg matrix is symmetric, and counting
+    both halves would double every sum and report twice the chemical pair count.
+    """
+    r = bo_R.astype(np.float32)
+    p = bo_P.astype(np.float32)
+    off = ~np.eye(n, dtype=bool)
+    delta = (p - r) * off
+    # filter_to_bond_orders drops every reaction with an empty reaction centre, so
+    # `tri` always has at least one entry and the reductions below are defined.
+    tri = np.triu((np.abs(delta) > BO_CHANGE_THRESHOLD) & off, 1)
+    mag = np.abs(delta)[tri]
+    signed = delta[tri]
+    valence = np.abs(r.sum(axis=1) - p.sum(axis=1))[:n]
+    return np.array([
+        float(tri.sum()),
+        float(mag.sum()), float(mag.mean()), float(mag.std()),
+        float(mag.max()), float(mag.min()),
+        float(signed[signed > 0.0].sum()), float(-signed[signed < 0.0].sum()),
+        float(r[tri].mean()), float(p[tri].mean()),
+        float(valence.max()), float(valence.mean()),
+    ], dtype=np.float32)
 
 
 def filter_to_bond_orders(samples, orders):
@@ -956,7 +1054,7 @@ def make_split(samples):
     return train_idx, val_idx
 
 
-def compute_normalization(samples, indices):
+def compute_normalization(samples, indices, orders):
     """z-score statistics from the TRAIN split only."""
     aphys = np.stack([samples[i]["atom_phys_raw"] for i in indices])
     real = aphys.reshape(-1, ATOM_PHYS_DIM)
@@ -968,11 +1066,17 @@ def compute_normalization(samples, indices):
     ef = np.stack([samples[i]["energy_feats_raw"] for i in indices]).astype(np.float32)
     ef_std = ef.std(0)
     ef_std[ef_std < 1e-6] = 1.0
+    bo = np.stack([bond_order_features(orders[samples[i]["rxn_id"]]["bo_R"],
+                                       orders[samples[i]["rxn_id"]]["bo_P"],
+                                       samples[i]["n_atoms"]) for i in indices])
+    bo_std = bo.std(0)
+    bo_std[bo_std < 1e-6] = 1.0
     stats = {
         "aphys_mean": aphys_mean.astype(np.float32), "aphys_std": aphys_std.astype(np.float32),
         "ea_mean": float(ea.mean()), "ea_std": max(float(ea.std()), 1e-6),
         "de_rxn_mean": float(de.mean()), "de_rxn_std": max(float(de.std()), 1e-6),
         "efeat_mean": ef.mean(0), "efeat_std": ef_std,
+        "bo_mean": bo.mean(0), "bo_std": bo_std,
     }
     print(f"[norm] Ea {stats['ea_mean']:.2f} +/- {stats['ea_std']:.2f} kcal/mol")
     return stats
@@ -1004,18 +1108,22 @@ class ReactionDataset(Dataset):
         s = self.samples[idx]
         n = s["n_atoms"]
         st = self.stats
+        rec = self.orders[s["rxn_id"]]
         D_R = torch.from_numpy(s["D_R"])
         D_P = torch.from_numpy(s["D_P"])
-        rc_atom, spec = bond_order_masks(
-            self.orders[s["rxn_id"]]["bo_R"], self.orders[s["rxn_id"]]["bo_P"], n)
+        rc_atom, spec, react = bond_order_masks(rec["bo_R"], rec["bo_P"], n)
+        bo = (bond_order_features(rec["bo_R"], rec["bo_P"], n)
+              - st["bo_mean"]) / st["bo_std"]
         item = {
             "rxn_id": s["rxn_id"],
+            # Plain int, never a tensor: collate_dynamic_padding reads it to size
+            # the batch and then drops it, so it must not reach the GPU.
+            "n_atoms": n,
             "D_R": D_R, "D_P": D_P, "D_I": (D_R + D_P) / 2.0,
             "D_TS": torch.from_numpy(s["D_TS"]),
             "c_I": torch.from_numpy(s["c_I"].astype(np.float32)),
             "c_TS": torch.from_numpy(s["c_TS"].astype(np.float32)),
             "mask": torch.from_numpy(s["mask"]),
-            "geom_mask": torch.from_numpy(s["geom_mask"]),
             "atom_ids": torch.from_numpy(s["atom_ids"]),
             "atom_phys": torch.from_numpy(
                 ((s["atom_phys_raw"] - st["aphys_mean"]) / st["aphys_std"]).astype(np.float32)),
@@ -1024,13 +1132,108 @@ class ReactionDataset(Dataset):
                 (s["de_rxn_raw"] - st["de_rxn_mean"]) / st["de_rxn_std"], dtype=torch.float32),
             "energy_feats": torch.from_numpy(
                 ((s["energy_feats_raw"] - st["efeat_mean"]) / st["efeat_std"]).astype(np.float32)),
+            "bo_feats": torch.from_numpy(bo.astype(np.float32)),
             "risk_pair_mask": torch.from_numpy(s["risk_pair_mask"]),
             "risk_penalty": torch.tensor(s["risk_penalty"], dtype=torch.float32),
             "rc_atom": torch.from_numpy(rc_atom),
             "spectator_pair": torch.from_numpy(spec),
+            "reactive_pair": torch.from_numpy(react),
         }
         self.cache[idx] = item
         return item
+
+
+# Which axes of each field are indexed by atom. An explicit table rather than
+# inspecting shapes: a [30, 30] pair matrix and a [30, 3] coordinate array are both
+# "two-dimensional with 30 in front", and trimming the wrong one of those produces
+# a batch that is silently wrong rather than one that raises.
+COLLATE_ATOM_AXES = {
+    "D_R": (0, 1), "D_P": (0, 1), "D_I": (0, 1), "D_TS": (0, 1),
+    "risk_pair_mask": (0, 1), "spectator_pair": (0, 1), "reactive_pair": (0, 1),
+    "c_I": (0,), "c_TS": (0,), "atom_phys": (0,),
+    "mask": (0,), "atom_ids": (0,), "rc_atom": (0,),
+    "Ea": (), "de_rxn": (), "risk_penalty": (), "energy_feats": (), "bo_feats": (),
+}
+
+
+def collate_dynamic_padding(items):
+    """Stack a batch, trimming every atom axis to the batch's largest molecule.
+
+    The EGNN is essentially the entire forward cost and it is quadratic in atom
+    count: each EGCL materialises a [B, N, N, 2*EGNN_HIDDEN+1] edge tensor. Padding
+    every batch to MAX_ATOMS = 30 when the mean RGD1 molecule has 17.7 atoms means
+    most of that tensor is masked-out zeros. Trimming to max(n_atoms) removes
+    nothing but padding, so it is exact, not an approximation.
+
+    It only pays alongside LengthBucketedBatchSampler. Measured over the 39,964
+    reactions: batches of 48 drawn uniformly have E[max n_atoms] = 26.7 and cut the
+    quadratic work by 20%; length-bucketed batches cut it by 64%.
+
+    PSICore's input projection still expects a fixed MAX_ATOMS-wide neighbour row
+    per atom and pads its own argument back (see PSICore.forward), which is why the
+    encoder weights are unaffected by this.
+    """
+    n = max(it["n_atoms"] for it in items)
+    out = {"rxn_id": [it["rxn_id"] for it in items]}
+    for key, axes in COLLATE_ATOM_AXES.items():
+        column = [it[key] for it in items]
+        for axis in axes:
+            column = [t.narrow(axis, 0, n) for t in column]
+        out[key] = torch.stack(column)
+    return out
+
+
+class LengthBucketedBatchSampler(Sampler):
+    """Batches of similarly-sized molecules, sharded across ranks.
+
+    Replaces DistributedSampler outright, on one GPU as well (num_replicas=1), so
+    there is a single sampler path rather than a distributed one and a plain one.
+
+    A global sort by atom count would make every batch a fixed set of molecules of
+    one size — a permanent correlation between batch composition and molecule size,
+    and the same 48 reactions in the same batch for 800 epochs. Instead each epoch
+    reshuffles, cuts the stream into pools of BUCKET_POOL_BATCHES batches, sorts
+    within a pool, and shuffles the resulting batch order: batches stay size
+    homogeneous while their membership is redrawn every epoch.
+    """
+
+    def __init__(self, n_atoms, batch_size, num_replicas, rank, drop_last):
+        self.n_atoms = np.asarray(n_atoms)
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.drop_last = drop_last
+        self.epoch = 0
+        full, remainder = divmod(len(self.n_atoms), batch_size)
+        total = full if drop_last else full + int(remainder > 0)
+        # Every rank must run the same number of steps or DDP's gradient all-reduce
+        # blocks forever on whichever rank still has batches left, so the shared
+        # batch list is truncated to a whole multiple of the world size.
+        self.num_batches = total // num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        return self.num_batches
+
+    def __iter__(self):
+        # Seeded by epoch, so every rank builds the IDENTICAL batch list and then
+        # takes its own stride through it. Validation never calls set_epoch, which
+        # makes its batching deterministic across the whole run.
+        rng = np.random.default_rng(SPLIT_SEED + self.epoch)
+        order = rng.permutation(len(self.n_atoms))
+        pool = self.batch_size * BUCKET_POOL_BATCHES
+        batches = []
+        for start in range(0, len(order), pool):
+            chunk = order[start:start + pool]
+            chunk = chunk[np.argsort(self.n_atoms[chunk], kind="stable")]
+            batches.extend(chunk[i:i + self.batch_size].tolist()
+                           for i in range(0, len(chunk), self.batch_size))
+        if self.drop_last:
+            batches = [b for b in batches if len(b) == self.batch_size]
+        batches = [batches[i] for i in rng.permutation(len(batches))]
+        return iter(batches[self.rank::self.num_replicas][:self.num_batches])
 
 
 def to_device(batch, device):
@@ -1097,8 +1300,17 @@ class PSICore(nn.Module):
 
     def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys):
         B, N, _ = D_R.shape
+        # input_proj reads a FIXED MAX_ATOMS-wide neighbour row per atom, so the
+        # dynamic collate's trim is undone here and only here. The zeros go onto the
+        # DISTANCES, before the radial expansion, not onto the expansion afterwards:
+        # a padded distance of 0 expands to a small non-zero radial basis, and
+        # zero-padding the basis instead would be a different input for the same
+        # molecule. This way the activations are identical to static padding and an
+        # existing checkpoint stays valid.
+        pad = MAX_ATOMS - N
         atom_feat = torch.cat([self.atom_embed(atom_ids), atom_phys], dim=-1)
-        embs = [self.input_proj(torch.cat([self.gaussian(D).view(B, N, -1), atom_feat], -1))
+        embs = [self.input_proj(torch.cat(
+                    [self.gaussian(F.pad(D, (0, pad))).view(B, N, -1), atom_feat], -1))
                 for D in (D_R, D_I, D_P)]
         seq = torch.stack(embs, dim=2).view(B * N, 3, -1)
         # The midpoint step carries both directions of the bidirectional pass.
@@ -1191,6 +1403,11 @@ class EaHead(nn.Module):
     reaction energy), plus a direct linear BEP term so the dominant near-linear
     driver is not rederived inside the MLP.
 
+    The physics stream is dE_rxn, the 28D R/P descriptor, and the continuous
+    GFN2-xTB reaction-centre descriptor (bond_order_features) — the last of which
+    is how much bond order actually moves and how it splits between formation and
+    cleavage, rather than the thresholded bit the reaction-centre mask keeps.
+
     `h_ts` is detached by the caller, so this gradient never reshapes geometry.
     """
 
@@ -1204,7 +1421,8 @@ class EaHead(nn.Module):
         self.rc_attn_bias = nn.Parameter(torch.tensor(4.0))
         self.ts_proj = nn.Sequential(nn.Linear(3 * h, h), nn.GELU(), nn.Dropout(EA_HEAD_DROPOUT))
         self.phys_enc = nn.Sequential(
-            nn.Linear(1 + ENERGY_FEAT_DIM, h), nn.GELU(), nn.Dropout(EA_HEAD_DROPOUT))
+            nn.Linear(1 + ENERGY_FEAT_DIM + BO_FEAT_DIM, h), nn.GELU(),
+            nn.Dropout(EA_HEAD_DROPOUT))
         # Trust stream gets its own encoder and running normalisation: its channels
         # are raw model quantities on wildly different scales (Angstrom displacement
         # vs clamped log-variance) and in a flat concat they swamped the z-scored
@@ -1231,7 +1449,7 @@ class EaHead(nn.Module):
         nn.init.constant_(self.bep.weight, 0.5)
         nn.init.zeros_(self.bep.bias)
 
-    def forward(self, h_ts, mask, de_rxn, energy_feats, rc_mask, geom_trust):
+    def forward(self, h_ts, mask, de_rxn, energy_feats, bo_feats, rc_mask, geom_trust):
         pad = mask <= 0
         m = mask.unsqueeze(-1).to(h_ts.dtype)
         mean_pooled = (h_ts * m).sum(1) / m.sum(1).clamp(min=1.0)
@@ -1255,9 +1473,21 @@ class EaHead(nn.Module):
         ts = self.ts_proj(torch.cat([attn_pooled, mean_pooled, rc_pooled], -1))
 
         de_col = de_rxn.to(h_ts.dtype).unsqueeze(-1)
-        phys = self.phys_enc(torch.cat([de_col, energy_feats.to(h_ts.dtype)], -1))
+        phys = self.phys_enc(torch.cat(
+            [de_col, energy_feats.to(h_ts.dtype), bo_feats.to(h_ts.dtype)], -1))
         gt = geom_trust.float()
-        if self.training and gt.size(0) > 1:
+        # The finiteness test is what makes a geometry blow-up SURVIVABLE. These are
+        # buffers, not parameters: nothing downstream can ever repair them, so a
+        # single non-finite gt would write NaN into the running statistics and every
+        # forward from then on would return NaN Ea -- with the weights themselves
+        # untouched, because clip_grad_norm_ correctly skipped the step. The run
+        # then burns its remaining epochs skipping every batch of every epoch.
+        # Observed exactly that on the first P100 run. Holding the last good
+        # statistics for one step is the same trade the optimiser already makes when
+        # it skips a non-finite gradient, and it is visible in the same place: a
+        # non-finite gt implies a non-finite loss, so the step is counted in
+        # grad_skips.
+        if self.training and gt.size(0) > 1 and bool(torch.isfinite(gt).all()):
             with torch.no_grad():
                 self.trust_mean.mul_(0.9).add_(0.1 * gt.mean(0))
                 self.trust_var.mul_(0.9).add_(0.1 * gt.var(0, unbiased=False))
@@ -1286,8 +1516,9 @@ class PSI(nn.Module):
         # while the EGNN saw no reaction context at all: nothing would tell it
         # which bonds are forming or breaking.
         self.egnn = EGNN(ATOM_EMBED_DIM + ATOM_PHYS_DIM + d_model)
-        # 3 displacement scalars (mean/max/reaction-centre) + 2 log-variance scalars.
-        self.geom_trust_dim = 5
+        # 3 displacement scalars (mean/max/reaction-centre) + 2 log-variance scalars
+        # + 8 reaction-coordinate scalars read off the predicted TS. See geom_trust.
+        self.geom_trust_dim = 13
         self.ea_head = EaHead(self.geom_trust_dim)
         self.geom_logvar_head = nn.Sequential(
             nn.Linear(EGNN_HIDDEN, EGNN_HIDDEN // 2), nn.GELU(),
@@ -1304,25 +1535,83 @@ class PSI(nn.Module):
         eye = torch.eye(N, device=x.device, dtype=x.dtype).unsqueeze(0)
         return d * (1.0 - eye) * (mask.unsqueeze(-1) * mask.unsqueeze(-2))
 
-    def geom_trust(self, x_init, x_ts, logvar, mask, rc_mask):
-        """Detached confidence/asynchronicity descriptors for the Ea head.
+    def geom_trust(self, x_init, x_ts, D_pred, logvar, mask, rc_mask,
+                   D_R, D_I, D_P, reactive_pair):
+        """Detached descriptors of the PREDICTED TS for the Ea head — [B, 13].
 
-        Large or reaction-centre-concentrated displacement off the midpoint seed
-        marks a non-interpolative, asynchronous TS — the hard structural class.
-        Every term is detached: this informs the Ea head, never geometry.
+          [0:5]  confidence and displacement off the seed. Large or
+                 reaction-centre-concentrated movement away from the R/P midpoint
+                 marks a non-interpolative TS: the hard structural class.
+          [5:13] where the predicted TS actually SITS along the reaction
+                 coordinate. Progress on a reactive pair is
+
+                     f = |d_TS - d_R| / (|d_TS - d_R| + |d_TS - d_P|)
+
+                 which is 0 at the reactant's bond length and 1 at the product's.
+                 Written as a ratio of absolute deviations rather than the obvious
+                 (d_TS - d_R) / (d_P - d_R) because that denominator vanishes on
+                 any pair whose bond ORDER changes while its LENGTH barely does —
+                 a pi bond — and f is then unbounded on exactly the pairs that
+                 matter most. This form lands in [0, 1] for every input with no
+                 clamp anywhere.
+
+                 The MEAN of f over the reactive pairs is the Hammond position
+                 measured instead of inferred from dE_rxn, its SPREAD is
+                 asynchronicity, and the deviation of the non-reacting scaffold
+                 from the midpoint is the ring/steric strain no linear BEP term
+                 can see. These are the three things the Marcus/BEP relations get
+                 wrong on RGD1, and they only become readable once the geometry is
+                 good — which is what EA_START_EPOCH is for.
+
+        Everything is detached and computed in fp32. Detached because this informs
+        the Ea head and must never reshape geometry; fp32 because the variance of f
+        is O(1e-3) squared and would flush to zero as fp16.
         """
-        m = mask.to(x_ts.dtype)
+        m = mask.float()
         cnt = m.sum(1).clamp(min=1.0)
-        rc = rc_mask.to(x_ts.dtype) * m
+        rc = rc_mask.float() * m
         rc_cnt = rc.sum(1).clamp(min=1.0)
-        disp = ((x_ts - x_init).detach() ** 2).sum(-1).clamp(min=0.0).sqrt() * m
-        lv = logvar.detach() * m
+        disp = ((x_ts - x_init).detach().float() ** 2).sum(-1).add(1e-12).sqrt() * m
+        lv = logvar.detach().float() * m
+
+        d = D_pred.detach().float()
+        eye = torch.eye(d.shape[1], device=d.device, dtype=d.dtype).unsqueeze(0)
+        pair = m.unsqueeze(-1) * m.unsqueeze(-2) * (1.0 - eye)
+        react = reactive_pair.float() * pair
+        react_bool = react > 0.0
+        # The clamps on this and on `scaffold` below are unreachable, not defensive:
+        # measured over the whole bond-order cache, 0 of 39,994 reactions have an
+        # empty scaffold (the smallest has 4 pairs; the smallest RGD1 molecule has 6
+        # atoms) and the 76 with an empty reaction centre are removed by
+        # filter_to_bond_orders before they reach a loader. They are kept because
+        # the alternative to a division guard here is not a raise -- it is a silent
+        # NaN entering the Ea head. The loud check for the same invariant already
+        # exists one frame up, in EaHead.forward.
+        n_react = react.sum((1, 2)).clamp(min=1.0)
+        to_R = (d - D_R.float()).abs()
+        to_P = (d - D_P.float()).abs()
+        f = to_R / (to_R + to_P + 1e-6)
+        f_mean = (f * react).sum((1, 2)) / n_react
+        f_var = ((f - f_mean.view(-1, 1, 1)) ** 2 * react).sum((1, 2)) / n_react
+        # f is in [0, 1] by construction, so 1.0 and 0.0 are exact identities for a
+        # masked min and a masked max -- no sentinel large enough to matter is
+        # needed, and none can leak into the result.
+        f_min = f.masked_fill(~react_bool, 1.0).amin((1, 2))
+        f_max = f.masked_fill(~react_bool, 0.0).amax((1, 2))
+
+        off_mid = (d - D_I.float()).abs()
+        scaffold = pair - react
         return torch.stack([
             disp.sum(1) / cnt, disp.max(1).values, (disp * rc).sum(1) / rc_cnt,
-            lv.sum(1) / cnt, (lv * rc).sum(1) / rc_cnt], dim=-1)
+            lv.sum(1) / cnt, (lv * rc).sum(1) / rc_cnt,
+            f_mean, f_var.add(1e-12).sqrt(), f_min, f_max,
+            (d * react).sum((1, 2)) / n_react,
+            to_R.masked_fill(~react_bool, 0.0).amax((1, 2)),
+            (off_mid * scaffold).sum((1, 2)) / scaffold.sum((1, 2)).clamp(min=1.0),
+            (off_mid * react).sum((1, 2)) / n_react], dim=-1)
 
     def forward(self, D_R, D_I, D_P, mask, atom_ids, atom_phys, de_rxn,
-                energy_feats, c_seed, rc_atom):
+                energy_feats, bo_feats, c_seed, rc_atom, reactive_pair):
         f = self.core(D_R, D_I, D_P, mask, atom_ids, atom_phys)
         atom_emb = self.core.atom_embed(atom_ids)
         node_feats = torch.cat([atom_emb, atom_phys, f], dim=-1)
@@ -1334,8 +1623,10 @@ class PSI(nn.Module):
         logvar = self.geom_logvar_head(h_ts).squeeze(-1)
         logvar = logvar.clamp(-LOGVAR_CLAMP, LOGVAR_CLAMP).masked_fill(mask <= 0, 0.0)
         rc_mask = rc_atom.to(torch.bool) & (mask > 0)
-        ea = self.ea_head(h_ts.detach(), mask, de_rxn, energy_feats, rc_mask,
-                          self.geom_trust(x_init, x_ts, logvar, mask, rc_mask))
+        ea = self.ea_head(
+            h_ts.detach(), mask, de_rxn, energy_feats, bo_feats, rc_mask,
+            self.geom_trust(x_init, x_ts, D_pred, logvar, mask, rc_mask,
+                            D_R, D_I, D_P, reactive_pair))
         return D_pred, x_ts, logvar, ea
 
 
@@ -1437,8 +1728,24 @@ def geometry_pair_weights(D_R, D_P, D_TS, mask, rc_atom):
     return m2d, w * torch.maximum(role, GEOM_MOVE_WEIGHT * move)
 
 
-def compute_loss(batch, out, ea_mean, ea_std):
-    """Total loss plus the metrics worth logging."""
+def compute_loss(batch, out, ea_mean, ea_std, ea_scale):
+    """Total loss plus the metrics worth logging.
+
+    `ea_scale` is 0.0 before EA_START_EPOCH and 1.0 from it onward. A multiplier
+    rather than an `if`, because dropping the Ea terms from the graph outright
+    would leave every Ea-head parameter without a gradient, and DDP raises on that
+    unless find_unused_parameters is set — which costs a full autograd-graph
+    traversal on every step of the run, to buy nothing after epoch 150. Multiplying
+    by zero gives them a zero gradient instead: the head does not move, and the
+    reported ea_mae stays honest and unweighted throughout.
+
+    It isolates GRADIENTS, not values: 0.0 * nan is nan, so a non-finite Ea still
+    reaches the total loss during the geometry-only stage. That is deliberate. The
+    only way the Ea branch goes non-finite is a non-finite predicted geometry, and
+    then the geometry loss is non-finite in the same step anyway — so there is
+    nothing to salvage and the step gets skipped either way. What must NOT happen is
+    the state surviving the step; see the finiteness guard in EaHead.forward.
+    """
     D_TS, mask = batch["D_TS"], batch["mask"]
     D_pred, x_ts, logvar, ea_pred = out
     m2d, weights = geometry_pair_weights(
@@ -1480,8 +1787,8 @@ def compute_loss(batch, out, ea_mean, ea_std):
     ea_target = (batch["Ea"] - ea_mean) / ea_std
     ea_per = F.smooth_l1_loss(ea_pred, ea_target, reduction="none")
     risk_w = risk_scale * (batch["risk_penalty"] > 0.0).float()
-    loss = loss + EA_LOSS_WEIGHT * ea_per.mean() + RISK_EA_LOSS_WEIGHT * (
-        (ea_per * risk_w).sum() / risk_w.sum().clamp(min=1.0))
+    loss = loss + ea_scale * (EA_LOSS_WEIGHT * ea_per.mean() + RISK_EA_LOSS_WEIGHT * (
+        (ea_per * risk_w).sum() / risk_w.sum().clamp(min=1.0)))
 
     # Unweighted physical readouts, independent of the training weighting.
     geom_mae = (torch.abs(D_pred - D_TS) * m2d).sum() / m2d.sum().clamp(min=1.0)
@@ -1580,7 +1887,7 @@ def percentiles(values):
             "max": t.max().item()}
 
 
-def run_epoch(model, loader, optimizer, scaler, device, ea_mean, ea_std, train):
+def run_epoch(model, loader, optimizer, scaler, device, ea_mean, ea_std, ea_scale, train):
     model.train(train)
     sums, count = {}, 0
     grad_skips, clipped, grad_norms = 0, 0, []
@@ -1594,8 +1901,9 @@ def run_epoch(model, loader, optimizer, scaler, device, ea_mean, ea_std, train):
             with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                 out = model(batch["D_R"], batch["D_I"], batch["D_P"], batch["mask"],
                             batch["atom_ids"], batch["atom_phys"], batch["de_rxn"],
-                            batch["energy_feats"], batch["c_I"], batch["rc_atom"])
-                loss, metrics = compute_loss(batch, out, ea_mean, ea_std)
+                            batch["energy_feats"], batch["bo_feats"], batch["c_I"],
+                            batch["rc_atom"], batch["reactive_pair"])
+                loss, metrics = compute_loss(batch, out, ea_mean, ea_std, ea_scale)
             # Real atoms only: logvar is masked_fill(0) on padding, which would
             # otherwise pile a spurious spike in the middle of the distribution.
             lv = out[2].detach()[batch["mask"] > 0].float()
@@ -1623,8 +1931,26 @@ def run_epoch(model, loader, optimizer, scaler, device, ea_mean, ea_std, train):
                 sums[k] = sums.get(k, 0.0) + v.item() * bs
     all_reduce_sum(logvar_hist)
     reduced = reduce_metrics(sums, count, device)
-    reduced["logvar"] = logvar_summary(logvar_hist)
     reduced["grad_skips"] = grad_skips
+    # Checked BEFORE logvar_summary, which cannot survive this case either: a model
+    # emitting NaN emits a NaN log-variance too, torch.histc drops every NaN outside
+    # its bins, and summarising the resulting all-zero histogram indexes an empty
+    # tensor. Ordering the fatal check first is the difference between this message
+    # and an IndexError three frames down in a percentile helper.
+    # An epoch in which EVERY step was skipped is not instability, it is a dead run:
+    # the weights are byte-identical to where they started and no further epoch can
+    # differ, so the remaining budget would be spent recomputing the same NaN. Raise
+    # here rather than let it reach the log line, which used to subscript the None
+    # below and die with a bare TypeError several frames away from the cause.
+    if train and not grad_norms:
+        raise RuntimeError(
+            f"Every one of {grad_skips} training steps this epoch produced a "
+            f"non-finite gradient norm, so no weight was updated. The usual cause "
+            f"is a NaN that has become STICKY rather than a transient one -- check "
+            f"ea_head.trust_mean / trust_var in the checkpoint, and the loss "
+            f"metrics for this epoch: {dict(reduced)}"
+        )
+    reduced["logvar"] = logvar_summary(logvar_hist)
     # clip_rate pinned at 1.00 means the clip, not the schedule, is setting every
     # step size. Measured and dismissed as a lever on the legacy pipeline (a
     # 1/5/15 sweep moved val MAE by 0.0024 A, under the 0.0141 A noise floor),
@@ -1647,9 +1973,10 @@ def prepare_data(verbose):
     starts. Loading from the on-disk cache in each worker skips both copies.
     """
     samples, atom_vocab = build_samples()
-    samples, dropped = filter_to_bond_orders(samples, load_bond_orders())
+    orders = load_bond_orders()
+    samples, dropped = filter_to_bond_orders(samples, orders)
     train_idx, val_idx = make_split(samples)
-    stats = compute_normalization(samples, train_idx)
+    stats = compute_normalization(samples, train_idx, orders)
     if verbose:
         # The dropped ids are recorded because make_split is POSITIONAL: it bins by
         # list index and shuffles each bin, so removing any reaction re-deals every
@@ -1663,7 +1990,7 @@ def prepare_data(verbose):
                        "ea_mean": stats["ea_mean"], "ea_std": stats["ea_std"],
                        "val_rxn_ids": [samples[i]["rxn_id"] for i in val_idx]}, fh)
         print(f"[split] recorded to {SPLIT_PATH} ({len(dropped)} dropped)")
-    return samples, atom_vocab, train_idx, val_idx, stats
+    return samples, atom_vocab, train_idx, val_idx, stats, orders
 
 
 def train_worker(rank, world_size):
@@ -1685,8 +2012,7 @@ def train_worker(rank, world_size):
     # is identical and deterministic on all of them.
     stdout = sys.stdout
     sys.stdout = stdout if is_main else open(os.devnull, "w")
-    samples, atom_vocab, train_idx, val_idx, stats = prepare_data(is_main)
-    orders = load_bond_orders()
+    samples, atom_vocab, train_idx, val_idx, stats, orders = prepare_data(is_main)
     sys.stdout = stdout
 
     # Kaggle GPU setup. TF32 and cudnn autotuning cost nothing on Turing and pay
@@ -1697,22 +2023,29 @@ def train_worker(rank, world_size):
     torch.set_float32_matmul_precision("high")
 
     dataset = ReactionDataset(samples, stats, orders)
-    # With one GPU there is nothing to sample across: use plain shuffling. The
-    # DistributedSampler path is only taken when it has real shards to build.
-    train_sampler = (DistributedSampler(train_idx, num_replicas=world_size, rank=rank,
-                                        shuffle=True, drop_last=True)
-                     if distributed else None)
+    # One sampler on one and two GPUs alike: LengthBucketedBatchSampler shards
+    # across ranks itself, so there is no separate single-GPU path to diverge.
+    train_sampler = LengthBucketedBatchSampler(
+        [samples[i]["n_atoms"] for i in train_idx], BATCH_SIZE,
+        num_replicas=world_size, rank=rank, drop_last=True)
     train_loader = DataLoader(
-        Subset(dataset, train_idx), batch_size=BATCH_SIZE,
-        sampler=train_sampler, shuffle=train_sampler is None,
+        Subset(dataset, train_idx), batch_sampler=train_sampler,
+        collate_fn=collate_dynamic_padding,
         num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True,
-        prefetch_factor=PREFETCH_FACTOR, drop_last=True)
-    # Validation is sharded by slicing, not by DistributedSampler: the sampler pads
+        prefetch_factor=PREFETCH_FACTOR)
+    # Validation is sharded by slicing, never by a distributed sampler: those pad
     # the last shard with duplicates to equalise rank sizes, which would silently
-    # double-count a few reactions in the metric this run is selected on.
+    # double-count a few reactions in the metric this run is selected on. Its
+    # sampler therefore sees a single replica and keeps the short final batch --
+    # dropping it would throw up to 47 reactions out of the validation set.
+    val_shard = val_idx[rank::world_size]
     val_loader = DataLoader(
-        Subset(dataset, val_idx[rank::world_size]), batch_size=BATCH_SIZE,
-        shuffle=False, num_workers=NUM_WORKERS, pin_memory=True,
+        Subset(dataset, val_shard),
+        batch_sampler=LengthBucketedBatchSampler(
+            [samples[i]["n_atoms"] for i in val_shard], BATCH_SIZE,
+            num_replicas=1, rank=0, drop_last=False),
+        collate_fn=collate_dynamic_padding,
+        num_workers=NUM_WORKERS, pin_memory=True,
         persistent_workers=True, prefetch_factor=PREFETCH_FACTOR)
 
     model = PSI(len(atom_vocab)).to(device)
@@ -1727,11 +2060,20 @@ def train_worker(rank, world_size):
     # first kernel; T4 is Turing (7.5) and compiles fine. Checked rather than
     # attempted-and-caught: this is a capability fact, not an error condition.
     capability = torch.cuda.get_device_capability(rank)
-    compiled = torch.compile(net) if capability >= (7, 0) else net
+    # dynamic=True is REQUIRED now, not a tuning choice: collate_dynamic_padding
+    # hands the model a different atom count almost every batch. On the default
+    # (dynamic=None) inductor specialises on the first shape, recompiles on the
+    # second, and once it has seen cache_size_limit (8) distinct shapes it stops
+    # compiling and silently runs eager for the rest of the run -- about 15
+    # distinct N occur here, so that fallback is certain rather than possible.
+    compiled = torch.compile(net, dynamic=True) if capability >= (7, 0) else net
     if is_main:
         print(f"[gpu] {torch.cuda.get_device_name(rank)} sm_{capability[0]}{capability[1]} "
               f"| torch.compile {'on' if capability >= (7, 0) else 'OFF (needs sm_70+)'} "
               f"| fp16 AMP | TF32 {'on' if capability >= (8, 0) else 'n/a'}")
+        print(f"[batch] dynamic padding, length-bucketed | "
+              f"{len(train_sampler)} train steps/epoch/rank | "
+              f"Ea head enters the loss at epoch {EA_START_EPOCH}")
 
     # The Ea head gets its own group: it reads detached features, so it is a
     # separate regression problem that tolerates a faster rate.
@@ -1747,29 +2089,20 @@ def train_worker(rank, world_size):
     swa_model = torch.optim.swa_utils.AveragedModel(model)
     swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=LR * 0.5)
 
-    start_epoch, best, patience, history = 1, float("inf"), 0, []
-    if os.path.exists(LATEST_CKPT):
-        ck = torch.load(LATEST_CKPT, map_location=device, weights_only=False)
-        model.load_state_dict(ck["model"])
-        optimizer.load_state_dict(ck["optimizer"])
-        scheduler.load_state_dict(ck["scheduler"])
-        scaler.load_state_dict(ck["scaler"])
-        swa_model.load_state_dict(ck["swa_model"])
-        swa_scheduler.load_state_dict(ck["swa_scheduler"])
-        start_epoch, best = ck["epoch"] + 1, ck["best"]
-        patience, history = ck["patience"], ck["history"]
-        if is_main:
-            print(f"[resume] epoch {start_epoch}, best val_select {best:.4f}")
+    # No resume. Every `train` starts from initialisation, so there is no optimiser,
+    # scheduler, scaler or SWA state to reload and no epoch to continue from -- and
+    # therefore no way for a checkpoint written by a diverged run to be read back
+    # into a fresh one. What a session does not finish, it does not keep.
+    best, patience, history = float("inf"), 0, []
 
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
-    for epoch in range(start_epoch, EPOCHS + 1):
+    for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
-        # Only a DistributedSampler needs its epoch set (it seeds the per-rank
-        # shuffle). Plain shuffling on one GPU reshuffles itself each epoch.
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
+        # Geometry-only until EA_START_EPOCH; see the constant for why.
+        ea_scale = float(epoch >= EA_START_EPOCH)
+        train_sampler.set_epoch(epoch)
         tr = run_epoch(compiled, train_loader, optimizer, scaler, device,
-                       ea_mean, ea_std, True)
+                       ea_mean, ea_std, ea_scale, True)
         # The averaged weights MUST be updated before they are validated. Reading
         # swa_model.module first would, on the very first SWA epoch, evaluate the
         # copy AveragedModel took at construction time -- i.e. the untrained
@@ -1782,12 +2115,24 @@ def train_worker(rank, world_size):
         # Past SWA_START the averaged weights are what gets selected and saved, so
         # they are what must be measured.
         eval_model = swa_model.module if epoch >= SWA_START else compiled
-        va = run_epoch(eval_model, val_loader, None, scaler, device, ea_mean, ea_std, False)
+        va = run_epoch(eval_model, val_loader, None, scaler, device,
+                       ea_mean, ea_std, ea_scale, False)
 
+        # The selection metric CHANGES DEFINITION at EA_START_EPOCH, so nothing from
+        # the geometry-only stage is comparable with anything after it. Left alone,
+        # `best` would hold a geometry-only score that no later epoch can beat: the
+        # Ea term only ever adds to it. psi_best.pt would freeze at a checkpoint
+        # whose Ea head is untrained and the run would burn its whole patience
+        # budget in the 120 epochs after the switch. Both are reset instead.
+        if epoch == EA_START_EPOCH:
+            best, patience = float("inf"), 0
+            if is_main:
+                print(f"[stage] epoch {epoch}: Ea head enters the loss; selection "
+                      f"metric and patience reset", flush=True)
         # Selected on raw distance MAE, never on the loss: with the uncertainty head
         # the loss is an NLL whose precision term grows without bound as the model
         # gets confident, so it rises on validation even while accuracy improves.
-        val_select = va["geom_mae_A"] + EA_SELECT_WEIGHT * va["ea_mae"] / ea_std
+        val_select = va["geom_mae_A"] + ea_scale * EA_SELECT_WEIGHT * va["ea_mae"] / ea_std
         improved = val_select < best
         best = min(best, val_select)
         patience = 0 if improved else patience + 1
@@ -1805,15 +2150,10 @@ def train_worker(rank, world_size):
                   f"| clip {tr['grad_norm']['clip_rate']*100:3.0f}% "
                   f"| lr {optimizer.param_groups[0]['lr']:.2e} "
                   f"| {time.time()-t0:5.1f}s{' *' if improved else ''}", flush=True)
-            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
-                        "swa_model": swa_model.state_dict(),
-                        # Without this, resuming inside the SWA phase restarts
-                        # SWALR's anneal from scratch and re-raises the LR that
-                        # weight averaging is supposed to be holding steady.
-                        "swa_scheduler": swa_scheduler.state_dict(), "epoch": epoch,
-                        "best": best, "patience": patience, "history": history,
-                        "stats": stats, "atom_vocab": atom_vocab}, LATEST_CKPT)
+            # Only the best model is written. The full training state -- optimiser,
+            # scheduler, scaler, SWA weights and averager -- existed to make a run
+            # resumable, and with no resume it is several hundred MB serialised every
+            # epoch that nothing will ever read.
             if improved:
                 torch.save({"model": (swa_model.module if epoch >= SWA_START else model).state_dict(),
                             "stats": stats, "atom_vocab": atom_vocab, "epoch": epoch,
@@ -1824,9 +2164,9 @@ def train_worker(rank, world_size):
             break
 
     if is_main:
-        print(f"[done] best val_select {best:.4f}; checkpoints in {WORK_DIR}")
-        print("[done] Save this notebook's output as a Dataset and re-run to "
-              "continue from psi_latest.pt.")
+        print(f"[done] best val_select {best:.4f}; {BEST_CKPT} holds the selected "
+              f"model, {HISTORY_PATH} the per-epoch log")
+        print("[done] There is no resume: a later session re-runs this from scratch.")
     if distributed:
         dist.destroy_process_group()
 
@@ -1883,19 +2223,24 @@ def stage_eval():
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ck = torch.load(BEST_CKPT, map_location=device, weights_only=False)
-    samples, atom_vocab, train_idx, val_idx, stats = prepare_data(True)
-    orders = load_bond_orders()
+    samples, atom_vocab, train_idx, val_idx, stats, orders = prepare_data(True)
     model = PSI(len(atom_vocab)).to(device)
     model.load_state_dict(ck["model"])
     model.eval()
     print(f"[eval] checkpoint from epoch {ck['epoch']} "
           f"(val_select {ck['val_select']:.4f})")
 
-    val_set = set(val_idx)
-    loader = DataLoader(ReactionDataset(samples, stats, orders), batch_size=BATCH_SIZE,
-                        shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    # Keyed by reaction id, not by position: the bucketed sampler does not walk the
+    # dataset in order, so a running counter would label the wrong split.
+    val_ids = {samples[i]["rxn_id"] for i in val_idx}
+    loader = DataLoader(
+        ReactionDataset(samples, stats, orders),
+        batch_sampler=LengthBucketedBatchSampler(
+            [s["n_atoms"] for s in samples], BATCH_SIZE,
+            num_replicas=1, rank=0, drop_last=False),
+        collate_fn=collate_dynamic_padding, num_workers=NUM_WORKERS, pin_memory=True)
     ea_mean, ea_std = stats["ea_mean"], stats["ea_std"]
-    records, index = [], 0
+    records = []
     with torch.no_grad():
         for batch in loader:
             batch = to_device(batch, device)
@@ -1903,7 +2248,8 @@ def stage_eval():
                 D_pred, x_ts, logvar, ea = model(
                     batch["D_R"], batch["D_I"], batch["D_P"], batch["mask"],
                     batch["atom_ids"], batch["atom_phys"], batch["de_rxn"],
-                    batch["energy_feats"], batch["c_I"], batch["rc_atom"])
+                    batch["energy_feats"], batch["bo_feats"], batch["c_I"],
+                    batch["rc_atom"], batch["reactive_pair"])
             mask = batch["mask"]
             N = mask.shape[1]
             eye = torch.eye(N, device=device).unsqueeze(0)
@@ -1920,7 +2266,7 @@ def stage_eval():
             for i in range(mask.shape[0]):
                 records.append({
                     "rxn_id": batch["rxn_id"][i],
-                    "split": "val" if index in val_set else "train",
+                    "split": "val" if batch["rxn_id"][i] in val_ids else "train",
                     "n_atoms": int(mask[i].sum().item()),
                     "dist_MAE": mae[i].item(), "rmsd": proper[i].item(),
                     "rmsd_reflected": reflected[i].item(),
@@ -1929,7 +2275,6 @@ def stage_eval():
                     "Ea_true": batch["Ea"][i].item(), "Ea_pred": ea_kcal[i].item(),
                     "Ea_error": abs(ea_kcal[i].item() - batch["Ea"][i].item()),
                 })
-                index += 1
 
     def summarise(rows):
         d = np.array([r["dist_MAE"] for r in rows])
@@ -1960,7 +2305,8 @@ def stage_eval():
     print(f"[eval] overfitting gap {gap:.2f}x    -> {RESULTS_PATH}")
 
 
-STAGES = {"bond-orders": stage_bond_orders, "train": stage_train, "eval": stage_eval}
+STAGES = {"bond-orders": stage_bond_orders, "train": stage_train,
+          "eval": stage_eval}
 DEFAULT_STAGE = "train"
 
 

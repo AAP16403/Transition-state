@@ -48,3 +48,15 @@ geom_diagnostics/
 
 # Keep specific tracked files if needed
 !/extracted_b97d3.json
+# ORCA Batch Directories
+orca_worst_30/
+orca_200_batch/
+
+# Temporary Scripts & Text Logs
+run_orca*.bat
+run_orca*.ps1
+*.txt
+!requirements*.txt
+
+# CSV Files
+*.csv
